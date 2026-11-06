@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.IL\Larva.IL.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Native backends reuse the IR analyses (moves, liveness) without making them public API. -->
+    <InternalsVisibleTo Include="Larva.Llvm" />
+    <InternalsVisibleTo Include="Larva.X64" />
+    <InternalsVisibleTo Include="Larva.Wasm" />
+  </ItemGroup>
+
+</Project>

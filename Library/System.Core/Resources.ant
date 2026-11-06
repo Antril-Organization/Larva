@@ -1,0 +1,211 @@
+// Files built into the program: a project's `chunk RESOURCES` (`embed: data/**`, `logo: assets/app.cfg`). The build
+// puts each file's bytes in the assembly (binary in the .lva, static data in the program); the names and bytes come
+// from there through the compiler's `$resources.*` services, with no code run at start. `Install` adds more at run time.
+// `$resource("name")` in code gives a resource's bytes directly, with the name checked when compiling.
+
+into namespace System
+{
+	/// `loop (u8 b in data)` over a ResourceData.
+	public value ResourceIterator
+	{
+		u8* data;
+		i32 length;
+		i32 index;
+
+		public:
+			new(u8* data, i32 length)
+			{
+				this.data = data;
+				this.length = length;
+				index = -1;
+			}
+
+			Next() : bool
+			{
+				index++;
+				return index < length;
+			}
+
+			u8 Current
+			{
+				get
+				{
+					unsafe
+					{
+						return data[index];
+					}
+				}
+			}
+	}
+
+	/// Read-only bytes of a resource, read in place from the program's static data (no copy): indexed, iterated, sliced.
+	public final class ResourceData
+	{
+		u8* data;
+		i32 length;
+
+		internal new(u8* data, i32 length)
+		{
+			this.data = data;
+			this.length = length;
+		}
+
+		public:
+			/// How many bytes.
+			i32 Length { get => length; }
+
+			/// The byte at `index` (`data[index]`).
+			At(i32 index) : u8
+			{
+				if ((u32)index >= (u32)length)
+					Fail.Index();
+				unsafe
+				{
+					return data[index];
+				}
+			}
+
+			/// A copy of the bytes.
+			ToArray() : u8[]
+			{
+				u8[] copy = new u8[length];
+				if (length > 0)
+				{
+					unsafe
+					{
+						System.Runtime.InteropServices.Memory.Copy(&copy[0], data, length);
+					}
+				}
+				return copy;
+			}
+
+			/// The bytes as UTF-8 text.
+			Text() : str => new String<u8>(ToArray());
+
+			/// The bytes in order (`loop (u8 b in data)`).
+			Iterator() : ResourceIterator => new ResourceIterator(data, length);
+
+			/// `count` bytes from `start`, in place (no copy).
+			Slice(i32 start, i32 count) : ResourceData
+			{
+				if ((u32)start > (u32)length || (u32)count > (u32)(length - start))
+					Fail.Index();
+				unsafe
+				{
+					return new ResourceData(data + start, count);
+				}
+			}
+
+			/// The bytes from `start` on, in place.
+			Slice(i32 start) : ResourceData => Slice(start, length - start);
+
+			/// Whether these are the same bytes as `bytes` (one comparison in memory).
+			Equals(u8[] bytes) : bool
+			{
+				if (bytes.Length != length)
+					return false;
+				if (length == 0)
+					return true;
+				unsafe
+				{
+					return System.Runtime.InteropServices.Memory.Compare(data, &bytes[0], length) == 0;
+				}
+			}
+
+			op ==(ResourceData a, u8[] b) : bool => a.Equals(b);
+			op !=(ResourceData a, u8[] b) : bool => !a.Equals(b);
+			op ==(u8[] a, ResourceData b) : bool => b.Equals(a);
+			op !=(u8[] a, ResourceData b) : bool => !b.Equals(a);
+	}
+
+	public static class Resources
+	{
+		// What the program was built with: the compiler writes these from the assembly's resources.
+		extern("$resources.count") static Count() : i32;
+		extern("$resources.name") static NameOf(i32 index) : u8[];
+		extern("$resources.bytes") static BytesOf(i32 index) : u8[];
+		extern("$resources.length") static LengthOf(i32 index) : i32;
+		unsafe extern("$resources.data") static DataOf(i32 index) : u8*;
+
+		static Dictionary<str, i32> builtIn = BuiltIn();
+		static Dictionary<str, u8[]> installed = new Dictionary<str, u8[]>();
+		static List<str> installedNames = new List<str>();
+
+		static BuiltIn() : Dictionary<str, i32>
+		{
+			Dictionary<str, i32> map = new Dictionary<str, i32>();
+			loop (i32 i = 0..Count())
+				map[new String<u8>(NameOf(i))] = i;
+			return map;
+		}
+
+		public:
+			/// Adds a resource at run time (a later one with the same name replaces it, and hides a built-in one).
+			static Install(str name, u8[] bytes)
+			{
+				if (!installed.ContainsKey(name))
+					installedNames.Add(name);
+				installed[name] = bytes;
+			}
+
+			/// Whether the program has resource `name`.
+			static Has(str name) : bool => installed.ContainsKey(name) || builtIn.ContainsKey(name);
+
+			/// The bytes of resource `name` (a copy), or null when there is none.
+			static Read(str name) : u8[]?
+			{
+				if (installed.ContainsKey(name))
+					return installed[name];
+				if (builtIn.ContainsKey(name))
+					return BytesOf(builtIn[name]);
+				return null;
+			}
+
+			/// The text (UTF-8) of resource `name`, or null when there is none.
+			static ReadText(str name) : str?
+			{
+				if (Read(name) is u8[] bytes)
+					return new String<u8>(bytes);
+				return null;
+			}
+
+			/// Resource `name` read in place (no copy), or null when there is none.
+			static View(str name) : ResourceData?
+			{
+				if (installed.ContainsKey(name))
+				{
+					u8[] bytes = installed[name];
+					i32 length = bytes.Length;
+					unsafe
+					{
+						// Pointers are never null: an empty array's view points at the filler byte (never read: length 0).
+						u8* first = length == 0 ? DataOf(-1) : &bytes[0];
+						return new ResourceData(first, length);
+					}
+				}
+				if (builtIn.ContainsKey(name))
+				{
+					i32 index = builtIn[name];
+					unsafe
+					{
+						return new ResourceData(DataOf(index), LengthOf(index));
+					}
+				}
+				return null;
+			}
+
+			/// The names of every resource: the built-in ones in build order, then the installed ones.
+			static Names() : str[]
+			{
+				List<str> names = new List<str>();
+				loop (i32 i = 0..Count())
+					names.Add(new String<u8>(NameOf(i)));
+				loop (i32 i = 0..installedNames.Count)
+				{
+					if (!builtIn.ContainsKey(installedNames[i]))
+						names.Add(installedNames[i]);
+				}
+				return names.ToArray();
+			}
+	}
+}

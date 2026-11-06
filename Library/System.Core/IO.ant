@@ -1,0 +1,201 @@
+// Files, folders and paths (System.IO), on the runtime's services: a file is read whole into the runtime and copied out,
+// written whole (or appended). Streams are in Stream.ant, text and binary readers and writers in TextIO.ant and
+// BinaryIO.ant. Text in files is UTF-8.
+
+import System.Text;
+
+into namespace System.IO
+{
+	/// A file or folder that could not be read, written, made or found.
+	public class IOError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	public static class File
+	{
+		extern("file.read") ReadInto(u16[] path) : i64;
+		extern("file.take") TakeInto(u8[] bytes);
+		extern("file.write") WriteFrom(u16[] path, u8[] bytes, i64 append) : i64;
+		extern("file.kind") KindOf(u16[] path) : i64;
+		extern("file.delete") DeleteAt(u16[] path) : i64;
+		extern("file.time") TimeOf(u16[] path) : i64;
+
+		public:
+			Exists(str path) : bool => KindOf(Unicode.ToUtf16(path)) == 1;
+
+			ReadAllBytes(str path) : u8[]
+			{
+				i64 size = ReadInto(Unicode.ToUtf16(path));
+				if (size < 0)
+					throw new IOError("cannot read " + path);
+				u8[] bytes = new u8[(i32)size];
+				TakeInto(bytes);
+				return bytes;
+			}
+
+			ReadAllText(str path) : str => Encoding.UTF8.GetString(ReadAllBytes(path));
+
+			ReadAllLines(str path) : List<str> => ReadAllText(path).Lines();
+
+			WriteAllBytes(str path, u8[] bytes)
+			{
+				if (WriteFrom(Unicode.ToUtf16(path), bytes, 0) != 0)
+					throw new IOError("cannot write " + path);
+			}
+
+			WriteAllText(str path, str text) { WriteAllBytes(path, Encoding.UTF8.GetBytes(text)); }
+
+			AppendAllText(str path, str text)
+			{
+				if (WriteFrom(Unicode.ToUtf16(path), Encoding.UTF8.GetBytes(text), 1) != 0)
+					throw new IOError("cannot write " + path);
+			}
+
+			WriteAllLines(str path, List<str> lines)
+			{
+				StringBuilder text = new StringBuilder();
+				loop (str line in lines)
+					text.AppendLine(line);
+				WriteAllText(path, text.ToString());
+			}
+
+			Delete(str path)
+			{
+				if (DeleteAt(Unicode.ToUtf16(path)) != 0 && KindOf(Unicode.ToUtf16(path)) != 0)
+					throw new IOError("cannot delete " + path);
+			}
+
+			/// When the file was last written, in milliseconds since 1970 (UTC).
+			GetLastWriteTime(str path) : i64
+			{
+				i64 time = TimeOf(Unicode.ToUtf16(path));
+				if (time < 0)
+					throw new IOError("no file " + path);
+				return time;
+			}
+	}
+
+	public static class Directory
+	{
+		extern("dir.create") CreateAt(u16[] path) : i64;
+		extern("dir.list") ListInto(u16[] path) : i64;
+		extern("dir.length") EntryLength(i64 index) : i64;
+		extern("dir.unit") EntryUnit(i64 index, i64 at) : i64;
+		extern("file.kind") KindOf(u16[] path) : i64;
+		extern("file.delete") DeleteAt(u16[] path) : i64;
+
+		public:
+			Exists(str path) : bool => KindOf(Unicode.ToUtf16(path)) == 2;
+
+			/// Makes the folder (and the folders above it that are missing).
+			CreateDirectory(str path)
+			{
+				if (CreateAt(Unicode.ToUtf16(path)) != 0 && KindOf(Unicode.ToUtf16(path)) != 2)
+					throw new IOError("cannot make the folder " + path);
+			}
+
+			/// The names of the folder's entries (files and folders), sorted.
+			GetEntries(str path) : List<str>
+			{
+				i64 count = ListInto(Unicode.ToUtf16(path));
+				if (count < 0)
+					throw new IOError("cannot list " + path);
+				List<str> names = new List<str>((i32)count);
+				loop (i64 i = 0..count)
+				{
+					u16[] units = new u16[(i32)EntryLength(i)];
+					loop (i32 j = 0..units.Length)
+						units[j] = (u16)EntryUnit(i, j);
+					names.Add(Unicode.FromUtf16(units));
+				}
+				return names;
+			}
+
+			/// The full paths of the files in the folder.
+			GetFiles(str path) : List<str>
+			{
+				List<str> files = new List<str>();
+				loop (str name in GetEntries(path))
+				{
+					str full = Path.Combine(path, name);
+					if (KindOf(Unicode.ToUtf16(full)) == 1)
+						files.Add(full);
+				}
+				return files;
+			}
+
+			/// Takes out an empty folder.
+			Delete(str path)
+			{
+				if (DeleteAt(Unicode.ToUtf16(path)) != 0)
+					throw new IOError("cannot delete the folder " + path);
+			}
+	}
+
+	/// Paths as text: '/' and '\' both separate folders.
+	public static class Path
+	{
+		static IsSeparator(u8 c) : bool => c == '/' || c == '\\';
+
+		/// Where the file name starts.
+		static NameStart(str path) : i32
+		{
+			i32 i = path.Length - 1;
+			loop (i >= 0 && !IsSeparator(path[i]) && path[i] != ':')
+				i--;
+			return i + 1;
+		}
+
+		public:
+			static u8 DirectorySeparatorChar { get => '/'; }
+
+			Combine(str first, str second) : str
+			{
+				if (first.Length == 0 || second.Length > 0 && (IsSeparator(second[0]) || second.Length > 1 && second[1] == ':'))
+					return second;
+				return IsSeparator(first[first.Length - 1]) ? first + second : first + "/" + second;
+			}
+
+			Combine(str first, str second, str third) : str => Combine(Combine(first, second), third);
+
+			GetFileName(str path) : str => path.Substring(NameStart(path));
+
+			/// The extension with its point ("" when there is none).
+			GetExtension(str path) : str
+			{
+				str name = GetFileName(path);
+				i32 dot = name.LastIndexOf('.');
+				return dot <= 0 ? "" : name.Substring(dot);
+			}
+
+			GetFileNameWithoutExtension(str path) : str
+			{
+				str name = GetFileName(path);
+				i32 dot = name.LastIndexOf('.');
+				return dot <= 0 ? name : name.Substring(0, dot);
+			}
+
+			/// The folder part ("" when there is none).
+			GetDirectoryName(str path) : str
+			{
+				i32 start = NameStart(path);
+				if (start == 0)
+					return "";
+				return start == 1 ? path.Substring(0, 1) : path.Substring(0, start - 1);
+			}
+
+			ChangeExtension(str path, str extension) : str
+			{
+				i32 start = NameStart(path);
+				i32 dot = GetFileName(path).LastIndexOf('.');
+				str stem = dot <= 0 ? path : path.Substring(0, start + dot);
+				if (extension.Length == 0)
+					return stem;
+				return extension[0] == '.' ? stem + extension : stem + "." + extension;
+			}
+
+			HasExtension(str path) : bool => GetExtension(path).Length > 0;
+	}
+}

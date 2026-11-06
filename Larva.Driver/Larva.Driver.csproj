@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.IR\Larva.IR.csproj" />
+    <ProjectReference Include="..\Larva.Native\Larva.Native.csproj" />
+    <ProjectReference Include="..\Larva.Llvm\Larva.Llvm.csproj" />
+    <ProjectReference Include="..\Larva.X64\Larva.X64.csproj" />
+    <ProjectReference Include="..\Larva.Wasm\Larva.Wasm.csproj" />
+  </ItemGroup>
+
+</Project>

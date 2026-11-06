@@ -1,0 +1,417 @@
+// A binding profile: a class that decides, declaration by declaration, what a binding of a C library has and how it is
+// named and placed. `larva bind --profile Profile.ant [libraries] [headers]` reads the headers, gives the profile what it
+// read, and writes the Larva library (and its source) from what the profile left.
+
+import System;
+import System.IO;
+
+into namespace System.Bindings
+{
+	/// What `larva bind --profile` asks a profile, in this order: `Configure` (once, before the headers are read), `Start`
+	/// (with everything read), `Enum`, `Struct`, `Constant` and `Function` for each declaration (false leaves it out),
+	/// `Name` for each name not set by those hooks, then `Finish`. `BindingProfile` answers each one as the settings say.
+	public interface IBindingProfile
+	{
+		/// The binding's settings: what is read, where it goes, the rules names follow.
+		Configure(BindingSettings settings);
+
+		/// Everything the headers declare, before each declaration is asked about: make enums from constants, rename in bulk.
+		Start(BindingModel model);
+
+		/// A C enum (or one `Start` made); false leaves it out (its values become constants).
+		Enum(CEnum e) : bool;
+
+		/// A struct or union; false leaves it out.
+		Struct(CStruct s) : bool;
+
+		/// A constant; false leaves it out.
+		Constant(CConstant c) : bool;
+
+		/// A function; false leaves it out.
+		Function(CFunction f) : bool;
+
+		/// The name `cName` (of that kind) gets: `proposed` is what the settings make of it.
+		Name(NameKind kind, str cName, str proposed) : str;
+
+		/// The whole binding, named and placed, before it is written: last changes.
+		Finish(BindingModel model);
+	}
+
+	/// A profile that does what the settings say: derive from it and override what you decide yourself.
+	public class BindingProfile : IBindingProfile
+	{
+		public:
+			virtual Configure(BindingSettings settings) { }
+			virtual Start(BindingModel model) { }
+			virtual Enum(CEnum e) : bool => true;
+			virtual Struct(CStruct s) : bool => true;
+			virtual Constant(CConstant c) : bool => true;
+			virtual Function(CFunction f) : bool => true;
+			virtual Name(NameKind kind, str cName, str proposed) : str => proposed;
+			virtual Finish(BindingModel model) { }
+	}
+
+	/// Runs a profile for `larva bind` (larva calls it; a profile does not).
+	public static class BindingRunner
+	{
+		public:
+			/// The settings `Configure` gives, written to `output` for larva (one `key=value` a line; lists repeat the key).
+			WriteSettings(BindingSettings s, str output)
+			{
+				StringBuilder text = new StringBuilder();
+				loop (str library in s.Libraries)
+					Line(text, "library", library);
+				loop (str header in s.Headers)
+					Line(text, "header", header);
+				loop (str include in s.Includes)
+					Line(text, "include", include);
+				Line(text, "namespace", s.Namespace);
+				Line(text, "class", s.Class);
+				Line(text, "assembly", s.Assembly);
+				Line(text, "output", s.Output);
+				Line(text, "source", s.Source);
+				Line(text, "split", s.Split == SplitBy.Header ? "header" : s.Split == SplitBy.Namespace ? "namespace" : s.Split == SplitBy.Kind ? "kind" : "none");
+				Line(text, "exports", s.Exports == ExportCheck.Check ? "check" : "keep");
+				Line(text, "long", s.LongBits.ToString());
+				Line(text, "all", s.AllHeaders ? "true" : "false");
+				Line(text, "enums", s.EnumsFromC ? "true" : "false");
+				Line(text, "flags", s.AutoFlags ? "true" : "false");
+				File.WriteAllText(output, text.ToString());
+			}
+
+			/// The profile asked about every declaration of `model`, the names and places settled, and the binding written to
+			/// `output` as a description larva reads (`library`, `namespace`, `class`, `file`, enums, structs, constants, functions).
+			Run(IBindingProfile profile, BindingModel model, str output)
+			{
+				BindingSettings s = model.Settings;
+				profile.Start(model);
+
+				// 1. What stays: a dropped enum's values become constants (asked about like the others).
+				List<CEnum> enums = new List<CEnum>();
+				loop (CEnum e in model.Enums)
+				{
+					if (profile.Enum(e))
+						enums.Add(e);
+					else
+					{
+						loop (CEnumMember m in e.Members)
+							model.Constants.Add(new CConstant(m.CName, e.Header, m.Value));
+					}
+				}
+				model.Enums = enums;
+				model.Structs = model.Structs.Where(x => profile.Struct(x));
+				model.Constants = model.Constants.Where(c => profile.Constant(c));
+				model.Functions = model.Functions.Where(f => profile.Function(f));
+
+				// 2. What C wrote with an enum's typedef takes the enum (`u32 flags` of `SDL_InitFlags` → `InitFlags flags`).
+				Dictionary<str, str> typedefs = new Dictionary<str, str>();
+				loop (CEnum e in model.Enums)
+				{
+					loop (str typedef in e.Typedefs)
+						typedefs.Set(typedef, e.CName);
+				}
+				loop (CFunction f in model.Functions)
+				{
+					Retype(f.Result, typedefs);
+					loop (CParameter p in f.Parameters)
+						Retype(p.Type, typedefs);
+				}
+				loop (CStruct x in model.Structs)
+				{
+					loop (CField field in x.Fields)
+						Retype(field.Type, typedefs);
+				}
+
+				// 3. Names: what a hook set stays; the rest is the settings' proposal, as `Name` answers it.
+				Dictionary<str, str> typeNames = new Dictionary<str, str>();
+				List<str> typePrefixes = Both(s.StripTypes, s.Strip);
+				loop (CEnum e in model.Enums)
+				{
+					if (e.Name == e.CName)
+						e.Name = Names.Writable(profile.Name(NameKind.Type, e.CName, Names.Shape(Names.Strip(e.CName, typePrefixes), s.TypeCase)));
+					typeNames.Set(e.CName, e.Name);
+					List<str> memberNames = new List<str>();
+					loop (CEnumMember m in e.Members)
+						memberNames.Add(m.CName);
+					str prefix = e.MemberPrefix.Length > 0 ? e.MemberPrefix : s.StripMemberPrefix ? Names.CommonPrefix(memberNames) : "";
+					loop (CEnumMember m in e.Members)
+					{
+						if (m.Name == m.CName)
+							m.Name = Names.Writable(profile.Name(NameKind.EnumMember, m.CName, Names.Shape(Names.Strip(m.CName, prefix), s.MemberCase)));
+					}
+				}
+				loop (CStruct x in model.Structs)
+				{
+					if (x.Name == x.CName)
+						x.Name = Names.Writable(profile.Name(NameKind.Type, x.CName, Names.Shape(Names.Strip(x.CName, typePrefixes), s.TypeCase)));
+					typeNames.Set(x.CName, x.Name);
+					loop (CField field in x.Fields)
+					{
+						if (field.Name == field.CName)
+							field.Name = Names.Writable(profile.Name(NameKind.Field, field.CName, Names.Shape(field.CName, s.FieldCase)));
+					}
+				}
+				List<str> constantPrefixes = Both(s.StripConstants, s.Strip);
+				loop (CConstant c in model.Constants)
+				{
+					if (c.Name == c.CName)
+						c.Name = Names.Writable(profile.Name(NameKind.Constant, c.CName, Names.Shape(Names.Strip(c.CName, constantPrefixes), s.ConstantCase)));
+				}
+				List<str> functionPrefixes = Both(s.StripFunctions, s.Strip);
+				loop (CFunction f in model.Functions)
+				{
+					if (f.Name == f.Entry)
+						f.Name = Names.Writable(profile.Name(NameKind.Function, f.Entry, Names.Shape(Names.Strip(f.Entry, functionPrefixes), s.FunctionCase)));
+					loop (CParameter p in f.Parameters)
+					{
+						if (p.Name == p.CName)
+							p.Name = Names.Writable(profile.Name(NameKind.Parameter, p.CName, Names.Shape(p.CName, s.ParameterCase)));
+					}
+				}
+
+				// 4. Places: what a hook set stays; the rest by the settings (the header's namespace, class or file when they say so).
+				loop (CEnum e in model.Enums)
+				{
+					e.Namespace = NamespaceOf(s, e.Namespace, e.Header);
+					e.File = FileOf(s, e.File, "Enums", e.Namespace, "", e.Header);
+				}
+				loop (CStruct x in model.Structs)
+				{
+					x.Namespace = NamespaceOf(s, x.Namespace, x.Header);
+					x.File = FileOf(s, x.File, "Structs", x.Namespace, "", x.Header);
+				}
+				loop (CConstant c in model.Constants)
+				{
+					c.Namespace = NamespaceOf(s, c.Namespace, c.Header);
+					c.Class = ClassOf(model, c.Class, c.Namespace, c.Header);
+					c.File = FileOf(s, c.File, "", c.Namespace, c.Class, c.Header);
+				}
+				loop (CFunction f in model.Functions)
+				{
+					f.Namespace = NamespaceOf(s, f.Namespace, f.Header);
+					f.Class = ClassOf(model, f.Class, f.Namespace, f.Header);
+					f.File = FileOf(s, f.File, "", f.Namespace, f.Class, f.Header);
+				}
+
+				profile.Finish(model);
+
+				// 5. Two names in one place: the later keeps its C name (and the profile is told).
+				Dictionary<str, str> taken = new Dictionary<str, str>();
+				loop (CEnum e in model.Enums)
+				{
+					e.Name = Unique(taken, e.Namespace, e.Name, e.CName, "the enum");
+					typeNames.Set(e.CName, e.Name);
+				}
+				loop (CStruct x in model.Structs)
+				{
+					x.Name = Unique(taken, x.Namespace, x.Name, x.CName, "the struct");
+					typeNames.Set(x.CName, x.Name);
+				}
+				loop (CConstant c in model.Constants)
+					c.Name = Unique(taken, c.Namespace + "." + c.Class, c.Name, c.CName, "the constant");
+				loop (CFunction f in model.Functions)
+					f.Name = Unique(taken, f.Namespace + "." + f.Class, f.Name, f.Entry, "the function");
+
+				// 6. Written, the types renamed (structs and enums by their binding names).
+				File.WriteAllText(output, Describe(model, typeNames));
+			}
+
+		/// `name` in `place` when nothing else has it there, else the C name (and a warning).
+		static Unique(Dictionary<str, str> taken, str place, str name, str cName, str what) : str
+		{
+			str key = place + "." + name;
+			if (taken.ContainsKey(key) && taken.Get(key) != cName)
+			{
+				Console.WriteLine("warning: " + what + " `" + cName + "` and `" + taken.Get(key) + "` would both be `" + key + "`: `" + cName + "` keeps its C name");
+				key = place + "." + cName;
+				name = cName;
+			}
+			taken.Set(key, cName);
+			return name;
+		}
+
+		static Line(StringBuilder text, str key, str value)
+		{
+			text.Append(key).Append("=").Append(value).Append("\n");
+		}
+
+		static Both(List<str> first, List<str> second) : List<str>
+		{
+			List<str> all = new List<str>();
+			all.AddRange(first);
+			all.AddRange(second);
+			return all;
+		}
+
+		/// A number type written with `typedefs`' enum takes it (pointers keep their stars).
+		static Retype(CType type, Dictionary<str, str> typedefs)
+		{
+			if (type.Typedef.Length == 0 || !typedefs.ContainsKey(type.Typedef))
+				return;
+			i32 end = type.Text.Length;
+			loop (end > 0 && type.Text.At(end - 1) == '*')
+				end--;
+			CType plain = new CType(type.Text.Substring(0, end), "");
+			if (plain.IsNumber() && plain.Text.At(0) != 'f')
+				type.Text = typedefs.Get(type.Typedef) + type.Text.Substring(end);
+		}
+
+		/// The name a header gives its namespace, class or file: its stem without the settings' prefixes, in Pascal case.
+		static HeaderName(BindingSettings s, str header) : str =>
+			header.Length == 0 ? s.Class : Names.Writable(Names.Pascal(Names.Strip(Names.Stem(header), s.HeaderStrip.Count > 0 ? s.HeaderStrip : s.Strip)));
+
+		static NamespaceOf(BindingSettings s, str given, str header) : str =>
+			given.Length > 0 ? given : s.NamespaceByHeader && header.Length > 0 ? s.Namespace + "." + HeaderName(s, header) : s.Namespace;
+
+		/// The class of a function or constant; one with the name of a type of its namespace gets `Functions` after it.
+		static ClassOf(BindingModel model, str given, str ns, str header) : str
+		{
+			BindingSettings s = model.Settings;
+			str name = given.Length > 0 ? given : s.ClassByHeader && header.Length > 0 ? HeaderName(s, header) : s.Class;
+			if (model.Structs.Any(x => x.Namespace == ns && x.Name == name) || model.Enums.Any(e => e.Namespace == ns && e.Name == name))
+				return name + "Functions";
+			return name;
+		}
+
+		/// The file a declaration goes to (its stem: larva adds the language's extension); "" is the class's file.
+		static FileOf(BindingSettings s, str given, str kind, str ns, str cls, str header) : str
+		{
+			if (given.Length > 0)
+				return given;
+			if (s.Split == SplitBy.Header)
+				return HeaderName(s, header);
+			if (s.Split == SplitBy.Namespace)
+				return ns;
+			if (s.Split == SplitBy.Kind)
+				return kind.Length > 0 ? kind : cls;
+			return "";
+		}
+
+		/// `text` with every name of `names` replaced (`SDL_Rect*` → `Rect*`).
+		static Renamed(str text, Dictionary<str, str> names) : str
+		{
+			StringBuilder result = new StringBuilder();
+			i32 i = 0;
+			loop (i < text.Length)
+			{
+				u8 c = text.At(i);
+				if (c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z')
+				{
+					i32 start = i;
+					loop (i < text.Length && (text.At(i) == '_' || text.At(i) >= 'A' && text.At(i) <= 'Z' || text.At(i) >= 'a' && text.At(i) <= 'z' || text.At(i) >= '0' && text.At(i) <= '9'))
+						i++;
+					str word = text.Substring(start, i - start);
+					result.Append(names.ContainsKey(word) ? names.Get(word) : word);
+				}
+				else
+				{
+					result.Append(text.Substring(i, 1));
+					i++;
+				}
+			}
+			return result.ToString();
+		}
+
+		/// The binding as larva's description: the first library, then each declaration after where it goes.
+		static Describe(BindingModel model, Dictionary<str, str> typeNames) : str
+		{
+			BindingSettings s = model.Settings;
+			StringBuilder text = new StringBuilder();
+			str library = s.Libraries.Count > 0 ? s.Libraries[0] : "library";
+			i32 slash = library.LastIndexOf('/') > library.LastIndexOf('\\') ? library.LastIndexOf('/') : library.LastIndexOf('\\');
+			text.Append("library ").Append(library.Substring(slash + 1)).Append("\n");
+			if (s.Assembly.Length > 0)
+				text.Append("assembly ").Append(s.Assembly).Append("\n");
+			text.Append("namespace ").Append(s.Namespace).Append("\n");
+			text.Append("class ").Append(s.Class).Append("\n");
+			Place place = new Place(text, s.Namespace, s.Class);
+			loop (CEnum e in model.Enums)
+			{
+				place.At(e.Namespace, s.Class, e.File);
+				text.Append("enum ").Append(e.Name).Append(" : ").Append(e.Underlying).Append(e.IsFlags ? " flags" : "").Append(" { ");
+				loop (i32 i = 0..e.Members.Count)
+				{
+					if (i > 0)
+						text.Append(", ");
+					text.Append(e.Members[i].Name).Append(" = ").Append(e.Members[i].Value);
+				}
+				text.Append(" }\n");
+			}
+			loop (CStruct x in model.Structs)
+			{
+				place.At(x.Namespace, s.Class, x.File);
+				text.Append(x.IsUnion ? "union " : "struct ").Append(x.Name);
+				if (!x.IsUnion && x.Pack > 0)
+					text.Append(" pack ").Append(x.Pack.ToString());
+				text.Append(" { ");
+				loop (i32 i = 0..x.Fields.Count)
+				{
+					if (i > 0)
+						text.Append("; ");
+					text.Append(Renamed(x.Fields[i].Type.Text, typeNames)).Append(" ").Append(x.Fields[i].Name);
+				}
+				text.Append(" }\n");
+			}
+			loop (CConstant c in model.Constants)
+			{
+				place.At(c.Namespace, c.Class, c.File);
+				text.Append("const ").Append(c.Name).Append(" = ").Append(c.Value).Append("\n");
+			}
+			loop (CFunction f in model.Functions)
+			{
+				place.At(f.Namespace, f.Class, f.File);
+				text.Append(f.Entry);
+				if (f.Name != f.Entry)
+					text.Append(" as ").Append(f.Name);
+				text.Append("(");
+				loop (i32 i = 0..f.Parameters.Count)
+				{
+					if (i > 0)
+						text.Append(", ");
+					text.Append(Renamed(f.Parameters[i].Type.Text, typeNames)).Append(" ").Append(f.Parameters[i].Name);
+				}
+				text.Append(")");
+				if (f.Result.Text != "void")
+					text.Append(" : ").Append(Renamed(f.Result.Text, typeNames));
+				text.Append("\n");
+			}
+			return text.ToString();
+		}
+	}
+
+	/// Where the description is: the `namespace`, `class` and `file` lines written when they change.
+	final class Place
+	{
+		StringBuilder text;
+		str ns;
+		str cls;
+		str file = "";
+
+		public:
+			new(StringBuilder text, str ns, str cls)
+			{
+				this.text = text;
+				this.ns = ns;
+				this.cls = cls;
+			}
+
+			At(str wantNamespace, str wantClass, str wantFile)
+			{
+				if (wantFile.Length > 0 && wantFile != file)
+				{
+					file = wantFile;
+					text.Append("file ").Append(file).Append("\n");
+				}
+				if (wantNamespace != ns)
+				{
+					ns = wantNamespace;
+					text.Append("namespace ").Append(ns).Append("\n");
+				}
+				if (wantClass != cls)
+				{
+					cls = wantClass;
+					text.Append("class ").Append(cls).Append("\n");
+				}
+			}
+	}
+}

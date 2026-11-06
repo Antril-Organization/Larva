@@ -1,0 +1,147 @@
+// The program and its surroundings: the command line and the environment, time, other programs, the collector.
+
+into namespace System
+{
+	public static class Environment
+	{
+		extern("args.count") ArgumentCount() : i64;
+		extern("args.length") ArgumentLength(i64 index) : i64;
+		extern("args.unit") ArgumentUnit(i64 index, i64 at) : i64;
+		extern("env.get") VariableInto(u16[] name) : i64;
+		extern("env.unit") VariableUnit(i64 index) : i64;
+		extern("time.now") Now() : i64;
+		extern("cpu.count") Processors() : i64;
+		extern("thread.id") ThreadNumber() : i64;
+
+		public:
+			static str NewLine { get => "\n"; }
+
+			/// The program's arguments (not its own name).
+			GetCommandLineArgs() : List<str>
+			{
+				i64 count = ArgumentCount();
+				List<str> arguments = new List<str>((i32)count);
+				loop (i64 a = 0..count)
+				{
+					u16[] units = new u16[(i32)ArgumentLength(a)];
+					loop (i32 i = 0..units.Length)
+						units[i] = (u16)ArgumentUnit(a, i);
+					arguments.Add(Unicode.FromUtf16(units));
+				}
+				return arguments;
+			}
+
+			/// An environment variable, or null when it is not set.
+			GetEnvironmentVariable(str name) : str?
+			{
+				i64 length = VariableInto(Unicode.ToUtf16(name));
+				if (length < 0)
+					return null;
+				u16[] units = new u16[(i32)length];
+				loop (i32 i = 0..units.Length)
+					units[i] = (u16)VariableUnit(i);
+				return Unicode.FromUtf16(units);
+			}
+
+			/// Milliseconds from an arbitrary start (it only goes forward).
+			static i64 TickCount64 { get => Now(); }
+
+			/// How many processors the program can run on.
+			static i32 ProcessorCount { get => (i32)Processors(); }
+
+			/// The number of the thread that asks (1: the program's first).
+			static i32 CurrentManagedThreadId { get => (i32)ThreadNumber(); }
+	}
+
+	/// The collector (System.GC): asking for a collection, and what it has done.
+	public static class GC
+	{
+		extern("gc.request") Request();
+		extern("gc.collections") Collections() : i64;
+		extern("gc.objects") Objects() : i64;
+
+		public:
+			/// Collects at the next safepoint.
+			Collect() { Request(); }
+
+			/// How many collections ran.
+			CollectionCount() : i64 => Collections();
+
+			/// How many objects are alive (or not collected yet).
+			ObjectCount() : i64 => Objects();
+	}
+}
+
+into namespace System.Diagnostics
+{
+	/// Measures elapsed time, from the runtime's monotonic clock in nanoseconds.
+	public final class Stopwatch
+	{
+		extern("time.precise") Now() : i64;
+
+		i64 started;
+		i64 elapsed;
+		bool running;
+
+		/// Nanoseconds so far.
+		Nanoseconds() : i64 => running ? elapsed + Now() - started : elapsed;
+
+		public:
+			/// Ticks of GetTimestamp and ElapsedTicks per second (they are nanoseconds).
+			static i64 Frequency { get => 1000000000; }
+			static bool IsHighResolution { get => true; }
+
+			/// The clock now, in ticks of Frequency.
+			static GetTimestamp() : i64 => Now();
+
+			/// The time from a timestamp to now, and between two.
+			static GetElapsedTime(i64 start) : TimeSpan => new TimeSpan((Now() - start) / 100);
+			static GetElapsedTime(i64 start, i64 end) : TimeSpan => new TimeSpan((end - start) / 100);
+
+			static StartNew() : Stopwatch
+			{
+				Stopwatch watch = new Stopwatch();
+				watch.Start();
+				return watch;
+			}
+
+			Start()
+			{
+				if (!running)
+				{
+					started = Now();
+					running = true;
+				}
+			}
+
+			Stop()
+			{
+				if (running)
+				{
+					elapsed += Now() - started;
+					running = false;
+				}
+			}
+
+			Reset()
+			{
+				elapsed = 0;
+				running = false;
+			}
+
+			Restart()
+			{
+				elapsed = 0;
+				started = Now();
+				running = true;
+			}
+
+			bool IsRunning { get => running; }
+
+			TimeSpan Elapsed { get => new TimeSpan(Nanoseconds() / 100); }
+			i64 ElapsedMilliseconds { get => Nanoseconds() / 1000000; }
+			i64 ElapsedTicks { get => Nanoseconds(); }
+	}
+
+}
+

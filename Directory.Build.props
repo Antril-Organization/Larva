@@ -1,0 +1,6 @@
+<Project>
+  <!-- The compiler's own speed: optimized code in every configuration (Debug keeps its symbols for debugging). -->
+  <PropertyGroup>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+</Project>

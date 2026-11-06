@@ -1,0 +1,43 @@
+// Characters (code points; a byte of a str or a UTF-16 unit widens to one): what kind of character one is, and its other
+// case. Letters beyond Latin-1 are letters by range.
+
+into namespace System
+{
+	public static class Char
+	{
+		public:
+			IsDigit(u32 c) : bool => c >= '0' && c <= '9';
+			IsAsciiLetter(u32 c) : bool => c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z';
+			IsUpper(u32 c) : bool => c >= 'A' && c <= 'Z' || c >= 192 && c <= 222 && c != 215;
+			IsLower(u32 c) : bool => c >= 'a' && c <= 'z' || c >= 223 && c <= 255 && c != 247;
+
+			IsLetter(u32 c) : bool
+			{
+				if (c < 128)
+					return IsAsciiLetter(c);
+				if (c < 256)
+					return c >= 192 && c != 215 && c != 247;
+				// Outside Latin-1: the letter blocks of the common scripts (not the punctuation and symbol blocks).
+				return c < 0x2000 || c >= 0x3040 && c < 0xD800 || c >= 0xF900 && c < 0xFE30 || c >= 0x10000 && c < 0x1F000 || c >= 0x20000 && c < 0x30000;
+			}
+
+			IsLetterOrDigit(u32 c) : bool => IsLetter(c) || IsDigit(c);
+
+			IsWhiteSpace(u32 c) : bool => c == ' ' || c >= 9 && c <= 13 || c == 160 || c == 0x2028 || c == 0x2029 || c == 0x3000 || c >= 0x2000 && c <= 0x200A;
+
+			IsPunctuation(u32 c) : bool => c >= '!' && c <= '/' || c >= ':' && c <= '@' || c >= '[' && c <= '`' || c >= '{' && c <= '~';
+
+			IsSurrogate(u32 c) : bool => c >= 0xD800 && c <= 0xDFFF;
+			IsHighSurrogate(u32 c) : bool => c >= 0xD800 && c <= 0xDBFF;
+			IsLowSurrogate(u32 c) : bool => c >= 0xDC00 && c <= 0xDFFF;
+
+			ToUpper(u32 c) : u32 => c >= 'a' && c <= 'z' || c >= 224 && c <= 254 && c != 247 ? c - 32 : c;
+			ToLower(u32 c) : u32 => c >= 'A' && c <= 'Z' || c >= 192 && c <= 222 && c != 215 ? c + 32 : c;
+
+			/// The digit's value (0 to 9), or -1.
+			DigitValue(u32 c) : i32 => IsDigit(c) ? (i32)(c - '0') : -1;
+
+			/// The character as a str (in UTF-8).
+			ToString(u32 c) : str => Unicode.ToString(c);
+	}
+}

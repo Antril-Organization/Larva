@@ -1,0 +1,11 @@
+<Project>
+  <!--
+    The command-line tools (larva, the installer, the tests) run one job and exit: every method is compiled optimized
+    from its first call (no tiering), and the collector uses every core without running alongside the program.
+  -->
+  <PropertyGroup Condition="'$(OutputType)' == 'Exe'">
+    <TieredCompilation>false</TieredCompilation>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+</Project>

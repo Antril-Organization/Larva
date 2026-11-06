@@ -1,0 +1,769 @@
+// Threads and what they share safely: Thread, Mutex and Lock, Condition, atomic numbers, events, semaphores, the thread
+// pool, Parallel.For and concurrent queues. Threads run in parallel in executables (in the interpreter and the test
+// host they take turns).
+
+into namespace System.Threading
+{
+	/// A thread of its own running a function: `new Thread(() => …)`, Start, Join.
+	public final class Thread
+	{
+		extern("thread.start") StartNative(func body) : i64;
+		extern("thread.join") JoinNative(i64 handle, i64 milliseconds) : i64;
+		extern("thread.id") CurrentNative() : i64;
+		extern("thread.yield") YieldNative();
+		extern("time.sleep") SleepFor(i64 milliseconds);
+
+		func body;
+		i64 handle;
+		/// 0 not started, 1 started, 2 joined.
+		i32 state;
+		AtomicI32 done;
+		i32 number;
+
+		[NoInline]
+		static Misused(str what) { throw new InvalidOperationError("Thread: " + what); }
+
+		/// What the new thread runs: the function, then it says it is done.
+		Run()
+		{
+			number = (i32)CurrentNative();
+			try
+			{
+				body();
+			}
+			finally
+			{
+				done.Store(1);
+			}
+		}
+
+		public:
+			new(func body)
+			{
+				this.body = body;
+				done = new AtomicI32();
+			}
+
+			/// Starts the thread (once).
+			Start()
+			{
+				if (state != 0)
+					Misused("it was started already");
+				state = 1;
+				handle = StartNative(() => Run());
+			}
+
+			/// Waits until the thread has finished.
+			Join()
+			{
+				if (state == 0)
+					Misused("it was not started");
+				if (state == 1)
+				{
+					JoinNative(handle, -1);
+					handle = 0;
+					state = 2;
+				}
+			}
+
+			/// Waits at most `milliseconds`: whether the thread has finished.
+			Join(i32 milliseconds) : bool
+			{
+				if (state == 0)
+					Misused("it was not started");
+				if (state == 2)
+					return true;
+				if (JoinNative(handle, milliseconds) == 0)
+					return false;
+				handle = 0;
+				state = 2;
+				return true;
+			}
+
+			/// Started and not finished.
+			bool IsAlive { get => state != 0 && done.Load() == 0; }
+
+			/// Its number (0 until it runs): the main thread's is 1.
+			i32 ManagedThreadId { get => number; }
+
+			/// The number of the thread that asks.
+			static i32 CurrentId { get => (i32)CurrentNative(); }
+
+			/// Sleeps `milliseconds` (other threads run).
+			static Sleep(i32 milliseconds) { SleepFor(milliseconds); }
+
+			/// Lets another thread run.
+			static Yield() { YieldNative(); }
+
+			/// Waits a little without giving the processor up (in a loop that waits for another thread).
+			static SpinWait(i32 iterations)
+			{
+				i32 sink = 0;
+				loop (i32 i = 0..iterations)
+					sink += i;
+			}
+	}
+
+	/// A lock: one thread at a time between Lock and Unlock (not re-entrant: a thread that holds it must not lock it again).
+	/// `Run(() => …)` holds it around a function. Dispose frees it.
+	public class Mutex
+	{
+		extern("mutex.new") New() : i64;
+		extern("mutex.lock") LockNative(i64 handle);
+		extern("mutex.trylock") TryNative(i64 handle) : i64;
+		extern("mutex.unlock") UnlockNative(i64 handle);
+		extern("mutex.free") Free(i64 handle);
+
+		i64 handle;
+
+		public:
+			new() { handle = New(); }
+
+			Lock() { LockNative(handle); }
+			Unlock() { UnlockNative(handle); }
+
+			/// Takes it when no other thread holds it: whether it did.
+			TryLock() : bool => TryNative(handle) != 0;
+
+			/// The names .NET's Mutex has.
+			WaitOne() { LockNative(handle); }
+			ReleaseMutex() { UnlockNative(handle); }
+
+			/// Runs `body` holding the lock.
+			Run(func body)
+			{
+				LockNative(handle);
+				try
+				{
+					body();
+				}
+				finally
+				{
+					UnlockNative(handle);
+				}
+			}
+
+			/// The handle (for Condition).
+			i64 Handle { get => handle; }
+
+			/// Frees it (it must not be used after).
+			Dispose()
+			{
+				if (handle != 0)
+					Free(handle);
+				handle = 0;
+			}
+	}
+
+	/// .NET 9's Lock: Enter, Exit, TryEnter.
+	public final class Lock : Mutex
+	{
+		public:
+			new() : base() { }
+			Enter() { Lock(); }
+			Exit() { Unlock(); }
+			TryEnter() : bool => TryLock();
+	}
+
+	/// Waiting until another thread says something changed: Wait releases the mutex (which the caller holds) while it
+	/// waits and takes it back before it returns. Signal wakes one waiter, Broadcast all. Wake-ups can be spurious: wait in
+	/// a loop that checks what is waited for.
+	public final class Condition
+	{
+		extern("cond.new") New() : i64;
+		extern("cond.wait") WaitNative(i64 condition, i64 mutex, i64 milliseconds) : i64;
+		extern("cond.signal") SignalNative(i64 condition);
+		extern("cond.broadcast") BroadcastNative(i64 condition);
+		extern("cond.free") Free(i64 condition);
+
+		i64 handle;
+
+		public:
+			new() { handle = New(); }
+
+			Wait(Mutex mutex) { WaitNative(handle, mutex.Handle, -1); }
+
+			/// Waits at most `milliseconds`: false when the time ran out.
+			Wait(Mutex mutex, i32 milliseconds) : bool => WaitNative(handle, mutex.Handle, milliseconds) != 0;
+
+			Signal() { SignalNative(handle); }
+			Broadcast() { BroadcastNative(handle); }
+
+			Dispose()
+			{
+				if (handle != 0)
+					Free(handle);
+				handle = 0;
+			}
+	}
+
+	/// An i32 that threads change together (each operation is atomic). Add, Increment and Decrement give the new value,
+	/// Exchange and CompareExchange the old one.
+	public final class AtomicI32
+	{
+		unsafe extern("atomic.load.i32") LoadAt(i32* at) : i32;
+		unsafe extern("atomic.store.i32") StoreAt(i32* at, i32 value);
+		unsafe extern("atomic.add.i32") AddAt(i32* at, i32 value) : i32;
+		unsafe extern("atomic.xchg.i32") ExchangeAt(i32* at, i32 value) : i32;
+		unsafe extern("atomic.cas.i32") CompareAt(i32* at, i32 expected, i32 value) : i32;
+
+		i32 value;
+
+		public:
+			new() { }
+			new(i32 value) { this.value = value; }
+
+			Load() : i32 { unsafe { return LoadAt(&value); } }
+			Store(i32 v) { unsafe { StoreAt(&value, v); } }
+			Add(i32 delta) : i32 { unsafe { return AddAt(&value, delta) + delta; } }
+			Increment() : i32 { unsafe { return AddAt(&value, 1) + 1; } }
+			Decrement() : i32 { unsafe { return AddAt(&value, -1) - 1; } }
+			Exchange(i32 v) : i32 { unsafe { return ExchangeAt(&value, v); } }
+
+			/// Sets `v` if the value is `comparand`: the value before.
+			CompareExchange(i32 v, i32 comparand) : i32 { unsafe { return CompareAt(&value, comparand, v); } }
+
+			i32 Value { get => Load(); set => Store(value); }
+	}
+
+	/// An i64 that threads change together (as AtomicI32).
+	public final class AtomicI64
+	{
+		unsafe extern("atomic.load.i64") LoadAt(i64* at) : i64;
+		unsafe extern("atomic.store.i64") StoreAt(i64* at, i64 value);
+		unsafe extern("atomic.add.i64") AddAt(i64* at, i64 value) : i64;
+		unsafe extern("atomic.xchg.i64") ExchangeAt(i64* at, i64 value) : i64;
+		unsafe extern("atomic.cas.i64") CompareAt(i64* at, i64 expected, i64 value) : i64;
+
+		i64 value;
+
+		public:
+			new() { }
+			new(i64 value) { this.value = value; }
+
+			Load() : i64 { unsafe { return LoadAt(&value); } }
+			Store(i64 v) { unsafe { StoreAt(&value, v); } }
+			Add(i64 delta) : i64 { unsafe { return AddAt(&value, delta) + delta; } }
+			Increment() : i64 { unsafe { return AddAt(&value, 1) + 1; } }
+			Decrement() : i64 { unsafe { return AddAt(&value, -1) - 1; } }
+			Exchange(i64 v) : i64 { unsafe { return ExchangeAt(&value, v); } }
+			CompareExchange(i64 v, i64 comparand) : i64 { unsafe { return CompareAt(&value, comparand, v); } }
+
+			i64 Value { get => Load(); set => Store(value); }
+	}
+
+	/// A bool that threads change together.
+	public final class AtomicBool
+	{
+		AtomicI32 bits;
+
+		public:
+			new() { bits = new AtomicI32(); }
+			new(bool value) { bits = new AtomicI32(value ? 1 : 0); }
+
+			Load() : bool => bits.Load() != 0;
+			Store(bool v) { bits.Store(v ? 1 : 0); }
+			Exchange(bool v) : bool => bits.Exchange(v ? 1 : 0) != 0;
+
+			/// Sets `v` if the value is `comparand`: the value before.
+			CompareExchange(bool v, bool comparand) : bool => bits.CompareExchange(v ? 1 : 0, comparand ? 1 : 0) != 0;
+
+			bool Value { get => Load(); set => Store(value); }
+	}
+
+	/// Atomic operations on numbers in memory reached by pointers (unsafe code): `Interlocked.Add(&counts[i], 1)`.
+	public static class Interlocked
+	{
+		unsafe extern("atomic.add.i64") AddAt64(i64* at, i64 value) : i64;
+		unsafe extern("atomic.xchg.i64") ExchangeAt64(i64* at, i64 value) : i64;
+		unsafe extern("atomic.cas.i64") CompareAt64(i64* at, i64 expected, i64 value) : i64;
+		unsafe extern("atomic.load.i64") LoadAt64(i64* at) : i64;
+		unsafe extern("atomic.add.i32") AddAt32(i32* at, i32 value) : i32;
+		unsafe extern("atomic.xchg.i32") ExchangeAt32(i32* at, i32 value) : i32;
+		unsafe extern("atomic.cas.i32") CompareAt32(i32* at, i32 expected, i32 value) : i32;
+
+		public:
+			unsafe Add(i64* location, i64 value) : i64 => AddAt64(location, value) + value;
+			unsafe Add(i32* location, i32 value) : i32 => AddAt32(location, value) + value;
+			unsafe Increment(i64* location) : i64 => AddAt64(location, 1) + 1;
+			unsafe Increment(i32* location) : i32 => AddAt32(location, 1) + 1;
+			unsafe Decrement(i64* location) : i64 => AddAt64(location, -1) - 1;
+			unsafe Decrement(i32* location) : i32 => AddAt32(location, -1) - 1;
+			unsafe Exchange(i64* location, i64 value) : i64 => ExchangeAt64(location, value);
+			unsafe Exchange(i32* location, i32 value) : i32 => ExchangeAt32(location, value);
+			unsafe CompareExchange(i64* location, i64 value, i64 comparand) : i64 => CompareAt64(location, comparand, value);
+			unsafe CompareExchange(i32* location, i32 value, i32 comparand) : i32 => CompareAt32(location, comparand, value);
+			unsafe Read(i64* location) : i64 => LoadAt64(location);
+	}
+
+	/// An event that stays set until Reset: WaitOne returns at once while it is set.
+	public class ManualResetEvent
+	{
+		inherited:
+			Mutex mutex;
+			Condition changed;
+			bool set;
+
+		public:
+			new(bool initialState)
+			{
+				mutex = new Mutex();
+				changed = new Condition();
+				set = initialState;
+			}
+
+			Set()
+			{
+				mutex.Lock();
+				set = true;
+				mutex.Unlock();
+				changed.Broadcast();
+			}
+
+			Reset()
+			{
+				mutex.Lock();
+				set = false;
+				mutex.Unlock();
+			}
+
+			virtual WaitOne()
+			{
+				mutex.Lock();
+				loop (!set)
+					changed.Wait(mutex);
+				mutex.Unlock();
+			}
+
+			/// Waits at most `milliseconds`: whether it was set.
+			virtual WaitOne(i32 milliseconds) : bool
+			{
+				i64 until = Environment.TickCount64 + milliseconds;
+				mutex.Lock();
+				loop (!set)
+				{
+					i64 left = until - Environment.TickCount64;
+					if (left <= 0)
+						break;
+					changed.Wait(mutex, (i32)left);
+				}
+				bool result = set;
+				mutex.Unlock();
+				return result;
+			}
+
+			bool IsSet { get => set; }
+	}
+
+	/// An event that lets one waiter through each time it is set (and resets itself).
+	public final class AutoResetEvent : ManualResetEvent
+	{
+		public:
+			new(bool initialState) : base(initialState) { }
+
+			override WaitOne()
+			{
+				mutex.Lock();
+				loop (!set)
+					changed.Wait(mutex);
+				set = false;
+				mutex.Unlock();
+			}
+
+			override WaitOne(i32 milliseconds) : bool
+			{
+				i64 until = Environment.TickCount64 + milliseconds;
+				mutex.Lock();
+				loop (!set)
+				{
+					i64 left = until - Environment.TickCount64;
+					if (left <= 0)
+						break;
+					changed.Wait(mutex, (i32)left);
+				}
+				bool result = set;
+				set = false;
+				mutex.Unlock();
+				return result;
+			}
+	}
+
+	/// Counts permits: Wait takes one (waiting while there are none), Release gives them back.
+	public final class SemaphoreSlim
+	{
+		Mutex mutex;
+		Condition changed;
+		i32 count;
+		i32 most;
+
+		public:
+			new(i32 initialCount) : (initialCount, 2147483647) { }
+
+			new(i32 initialCount, i32 maxCount)
+			{
+				if (initialCount < 0 || maxCount <= 0 || initialCount > maxCount)
+					throw new ArgumentOutOfRangeError("SemaphoreSlim: the counts are out of range");
+				mutex = new Mutex();
+				changed = new Condition();
+				count = initialCount;
+				most = maxCount;
+			}
+
+			Wait()
+			{
+				mutex.Lock();
+				loop (count == 0)
+					changed.Wait(mutex);
+				count--;
+				mutex.Unlock();
+			}
+
+			/// Waits at most `milliseconds`: whether it took a permit.
+			Wait(i32 milliseconds) : bool
+			{
+				i64 until = Environment.TickCount64 + milliseconds;
+				mutex.Lock();
+				loop (count == 0)
+				{
+					i64 left = until - Environment.TickCount64;
+					if (left <= 0)
+					{
+						mutex.Unlock();
+						return false;
+					}
+					changed.Wait(mutex, (i32)left);
+				}
+				count--;
+				mutex.Unlock();
+				return true;
+			}
+
+			/// Gives `releaseCount` permits back: the count before.
+			Release(i32 releaseCount) : i32
+			{
+				mutex.Lock();
+				i32 before = count;
+				if (releaseCount < 1 || count > most - releaseCount)
+				{
+					mutex.Unlock();
+					throw new InvalidOperationError("SemaphoreSlim: more permits than its maximum");
+				}
+				count += releaseCount;
+				mutex.Unlock();
+				if (releaseCount == 1)
+					changed.Signal();
+				else
+					changed.Broadcast();
+				return before;
+			}
+
+			Release() : i32 => Release(1);
+
+			i32 CurrentCount { get => count; }
+	}
+
+	/// Set once it has been signaled `initialCount` times: Wait waits for that.
+	public final class CountdownEvent
+	{
+		AtomicI32 left;
+		ManualResetEvent zero;
+
+		public:
+			new(i32 initialCount)
+			{
+				left = new AtomicI32(initialCount);
+				zero = new ManualResetEvent(initialCount == 0);
+			}
+
+			/// One signal: whether that made it zero.
+			Signal() : bool
+			{
+				i32 now = left.Decrement();
+				if (now < 0)
+					throw new InvalidOperationError("CountdownEvent: signaled more times than its count");
+				if (now == 0)
+				{
+					zero.Set();
+					return true;
+				}
+				return false;
+			}
+
+			/// One more signal to wait for.
+			AddCount() { left.Increment(); }
+
+			Wait() { zero.WaitOne(); }
+			Wait(i32 milliseconds) : bool => zero.WaitOne(milliseconds);
+
+			i32 CurrentCount { get => left.Load(); }
+			bool IsSet { get => left.Load() == 0; }
+	}
+
+	/// Threads that run queued work: as many as processors, started with the first work item, kept for the program.
+	public static class ThreadPool
+	{
+		static Mutex mutex = new Mutex();
+		static Condition waiting = new Condition();
+		static Queue<func> work = new Queue<func>();
+		static i32 workers;
+		static i32 idle;
+		static AtomicI32 spinning = new AtomicI32();
+
+		/// What each worker does: takes work, runs it, again. Before it sleeps it waits a little, giving the processor
+		/// up in turns: work often comes right after.
+		static Work()
+		{
+			loop (true)
+			{
+				// At most two workers wait actively (the others sleep at once: no crowd at the lock when work comes).
+				if (spinning.Increment() <= 2)
+				{
+					loop (i32 spin = 0; spin < 2000 && work.Count == 0; spin++)
+						Thread.SpinWait(spin < 1000 ? 20 : 0);
+					loop (i32 spin = 0; spin < 32 && work.Count == 0; spin++)
+						Thread.Yield();
+				}
+				spinning.Decrement();
+				mutex.Lock();
+				idle++;
+				loop (work.Count == 0)
+					waiting.Wait(mutex);
+				idle--;
+				func item = work.Dequeue();
+				mutex.Unlock();
+				item();
+			}
+		}
+
+		[NoInline]
+		static Begin()
+		{
+			workers = Environment.ProcessorCount;
+			loop (i32 i = 0..workers)
+				new Thread(() => Work()).Start();
+		}
+
+		public:
+			/// Runs `item` on a pool thread (an error it throws ends the program, as in .NET).
+			QueueUserWorkItem(func item)
+			{
+				mutex.Lock();
+				if (workers == 0)
+					Begin();
+				work.Enqueue(item);
+				bool someone = idle > 0;
+				mutex.Unlock();
+				if (someone)
+					waiting.Signal();
+			}
+
+			/// How many threads run the work.
+			static i32 ThreadCount { get => workers; }
+	}
+
+	/// Loops whose passes run on several threads at once.
+	public static class Parallel
+	{
+		public:
+			/// body(i) for every i from `fromInclusive` to `toExclusive`, in parallel (in no set order); the calling thread
+			/// takes part. An error a pass throws is thrown here, once every thread has stopped.
+			For(i32 fromInclusive, i32 toExclusive, func<i32> body)
+			{
+				i32 count = toExclusive - fromInclusive;
+				if (count <= 0)
+					return;
+				i32 threads = Environment.ProcessorCount;
+				if (threads > count)
+					threads = count;
+				if (threads <= 1)
+				{
+					loop (i32 i = fromInclusive..toExclusive)
+						body(i);
+					return;
+				}
+				// Chunks taken in turn: small enough to balance uneven passes, large enough to be cheap.
+				i32 chunk = count / (threads * 8);
+				if (chunk < 1)
+					chunk = 1;
+				AtomicI32 next = new AtomicI32(fromInclusive);
+				CountdownEvent finished = new CountdownEvent(threads - 1);
+				Shared<any?> failure = new Shared<any?>(null);
+				func run = () =>
+				{
+					try
+					{
+						loop (true)
+						{
+							i32 start = next.Add(chunk) - chunk;
+							if (start >= toExclusive)
+								break;
+							i32 end = toExclusive - start < chunk ? toExclusive : start + chunk;
+							loop (i32 i = start..end)
+								body(i);
+						}
+					}
+					catch (any error)
+					{
+						failure.Value = error;
+						next.Store(toExclusive);
+					}
+				};
+				loop (i32 t = 1..threads)
+					ThreadPool.QueueUserWorkItem(() => { run(); finished.Signal(); });
+				run();
+				finished.Wait();
+				if (failure.Value is any error)
+					throw error;
+			}
+
+			/// Runs each function, in parallel.
+			Invoke(func[] actions)
+			{
+				For(0, actions.Length, i => actions[i]());
+			}
+	}
+
+	/// A value in an object (what several lambdas share and change).
+	final class Shared<T>
+	{
+		public:
+			T Value;
+			new(T value) { Value = value; }
+	}
+
+	/// A queue several threads use at once (a lock around a Queue).
+	public final class ConcurrentQueue<T>
+	{
+		Mutex mutex;
+		Queue<T> items;
+
+		public:
+			new()
+			{
+				mutex = new Mutex();
+				items = new Queue<T>();
+			}
+
+			Enqueue(T item)
+			{
+				mutex.Lock();
+				items.Enqueue(item);
+				mutex.Unlock();
+			}
+
+			/// The first item, taken out; `fallback` when the queue is empty.
+			TryDequeue(T fallback) : T
+			{
+				mutex.Lock();
+				T item = items.Count > 0 ? items.Dequeue() : fallback;
+				mutex.Unlock();
+				return item;
+			}
+
+			i32 Count
+			{
+				get
+				{
+					mutex.Lock();
+					i32 n = items.Count;
+					mutex.Unlock();
+					return n;
+				}
+			}
+
+			bool IsEmpty { get => Count == 0; }
+	}
+
+	/// A queue that hands items from producers to consumers: Take waits for an item; after CompleteAdding, Take on an
+	/// empty queue throws and TryTake gives false.
+	public final class BlockingCollection<T>
+	{
+		Mutex mutex;
+		Condition changed;
+		Queue<T> items;
+		bool completed;
+		i32 waiters;
+
+		public:
+			new()
+			{
+				mutex = new Mutex();
+				changed = new Condition();
+				items = new Queue<T>();
+			}
+
+			Add(T item)
+			{
+				mutex.Lock();
+				if (completed)
+				{
+					mutex.Unlock();
+					throw new InvalidOperationError("BlockingCollection: adding is complete");
+				}
+				items.Enqueue(item);
+				bool wake = waiters > 0;
+				mutex.Unlock();
+				if (wake)
+					changed.Signal();
+			}
+
+			/// The next item (waiting for one).
+			Take() : T
+			{
+				mutex.Lock();
+				loop (items.Count == 0)
+				{
+					if (completed)
+					{
+						mutex.Unlock();
+						throw new InvalidOperationError("BlockingCollection: empty and adding is complete");
+					}
+					waiters++;
+					changed.Wait(mutex);
+					waiters--;
+				}
+				T item = items.Dequeue();
+				mutex.Unlock();
+				return item;
+			}
+
+			/// Whether an item can be taken (waiting for one, unless adding is complete); then Take gives it at once to
+			/// this consumer only if no other one takes it first.
+			WaitForItem() : bool
+			{
+				mutex.Lock();
+				loop (items.Count == 0 && !completed)
+				{
+					waiters++;
+					changed.Wait(mutex);
+					waiters--;
+				}
+				bool any = items.Count > 0;
+				mutex.Unlock();
+				return any;
+			}
+
+			CompleteAdding()
+			{
+				mutex.Lock();
+				completed = true;
+				mutex.Unlock();
+				changed.Broadcast();
+			}
+
+			bool IsAddingCompleted { get => completed; }
+
+			bool IsCompleted
+			{
+				get
+				{
+					mutex.Lock();
+					bool done = completed && items.Count == 0;
+					mutex.Unlock();
+					return done;
+				}
+			}
+
+			i32 Count { get => items.Count; }
+	}
+}

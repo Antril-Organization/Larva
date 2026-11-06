@@ -1,0 +1,690 @@
+// Streams (System.IO): sequences of bytes read and written in ranges of a u8[]. Stream is the base every stream derives
+// from; MemoryStream keeps its bytes in an array, FileStream in a file, BufferedStream puts a buffer in front of another
+// stream, and the console's input, output and error are streams too (Console.OpenStandardInput and the others).
+
+into namespace System.IO
+{
+	/// The end of a stream came before what had to be read.
+	public class EndOfStreamError : IOError
+	{
+		public:
+			new() : base("the stream ended before what had to be read") { }
+
+			new(str message) : base(message) { }
+	}
+
+	/// Where Seek counts from.
+	public enum SeekOrigin { Begin, Current, End }
+
+	/// A sequence of bytes. A stream says what it can do (CanRead, CanWrite, CanSeek); what it cannot do throws IOError.
+	public base class Stream
+	{
+		public:
+			virtual bool CanRead { get => false; }
+
+			virtual bool CanWrite { get => false; }
+
+			virtual bool CanSeek { get => false; }
+
+			/// How many bytes it has (streams that can seek).
+			virtual i64 Length { get { throw new IOError("the stream has no length"); } }
+
+			/// Where the next byte is read or written (streams that can seek).
+			virtual i64 Position
+			{
+				get { throw new IOError("the stream has no position"); }
+				set { throw new IOError("the stream has no position"); }
+			}
+
+			/// Reads up to `count` bytes into buffer[offset..]: how many (0 only at the end).
+			virtual Read(u8[] buffer, i32 offset, i32 count) : i32 { throw new IOError("the stream cannot be read"); }
+
+			/// Writes buffer[offset..offset + count].
+			virtual Write(u8[] buffer, i32 offset, i32 count) { throw new IOError("the stream cannot be written"); }
+
+			/// Moves to `offset` from `origin`: the new position.
+			virtual Seek(i64 offset, SeekOrigin origin) : i64 { throw new IOError("the stream cannot seek"); }
+
+			/// Makes it `length` bytes long (cutting or adding zeros).
+			virtual SetLength(i64 length) { throw new IOError("the stream cannot change its length"); }
+
+			/// Sends what is buffered to where the stream ends up.
+			virtual Flush() { }
+
+			/// Flushes and lets go of what the stream holds; using it afterwards throws.
+			virtual Close() { }
+
+			/// The next byte (0–255), or -1 at the end.
+			virtual ReadByte() : i32
+			{
+				u8[] one = new u8[1];
+				return Read(one, 0, 1) == 0 ? -1 : one[0];
+			}
+
+			virtual WriteByte(u8 value)
+			{
+				u8[] one = new u8[1];
+				one[0] = value;
+				Write(one, 0, 1);
+			}
+
+			/// Reads up to buffer.Length bytes: how many (0 only at the end).
+			Read(u8[] buffer) : i32 => Read(buffer, 0, buffer.Length);
+
+			Write(u8[] buffer) { Write(buffer, 0, buffer.Length); }
+
+			/// Reads exactly `count` bytes into buffer[offset..] (EndOfStreamError if the stream ends first).
+			ReadExactly(u8[] buffer, i32 offset, i32 count)
+			{
+				loop (count > 0)
+				{
+					i32 read = Read(buffer, offset, count);
+					if (read == 0)
+						throw new EndOfStreamError();
+					offset += read;
+					count -= read;
+				}
+			}
+
+			/// Everything from the position to the end.
+			ReadToEnd() : u8[]
+			{
+				MemoryStream all = new MemoryStream();
+				CopyTo(all);
+				return all.ToArray();
+			}
+
+			/// Copies everything from the position to the end into `destination`.
+			CopyTo(Stream destination) { CopyTo(destination, 81920); }
+
+			CopyTo(Stream destination, i32 bufferSize)
+			{
+				u8[] buffer = new u8[bufferSize];
+				i32 read = Read(buffer, 0, bufferSize);
+				loop (read > 0)
+				{
+					destination.Write(buffer, 0, read);
+					read = Read(buffer, 0, bufferSize);
+				}
+			}
+	}
+
+	/// Bytes kept in an array that grows as it is written (or in a fixed array given to it).
+	public class MemoryStream : Stream
+	{
+		u8[] data;
+		i32 length;
+		i32 position;
+		bool writable;
+		bool growable;
+		bool open;
+		/// Where a write can go without the slow path: data.Length when open and writable, else 0.
+		i32 room;
+
+		/// The throw is kept out of the methods that check (so they stay small enough to inline).
+		[NoInline]
+		static Closed() { throw new IOError("the stream is closed"); }
+
+		[NoInline]
+		static ReadOnly() { throw new IOError("the memory stream is read-only"); }
+
+		Check()
+		{
+			if (!open)
+				Closed();
+		}
+
+		/// Room for at least `needed` bytes.
+		Reserve(i32 needed)
+		{
+			if (needed > data.Length)
+				Grow(needed);
+		}
+
+		[NoInline]
+		Grow(i32 needed)
+		{
+			if (!growable)
+				throw new IOError("the memory stream cannot grow");
+			i32 capacity = data.Length < 256 ? 256 : data.Length * 2;
+			if (capacity < needed)
+				capacity = needed;
+			u8[] grown = new u8[capacity];
+			Array.Copy(data, 0, grown, 0, length);
+			data = grown;
+			room = capacity;
+		}
+
+		[NoInline]
+		WriteByteSlow(u8 value)
+		{
+			Check();
+			if (!writable)
+				ReadOnly();
+			Reserve(position + 1);
+			loop (i32 i = length..position)
+				data[i] = 0;
+			data[position] = value;
+			position++;
+			if (position > length)
+				length = position;
+		}
+
+		public:
+			new() : (0) { }
+
+			new(i32 capacity)
+			{
+				data = new u8[capacity];
+				writable = true;
+				growable = true;
+				open = true;
+				room = capacity;
+			}
+
+			/// Over `buffer` (its bytes are the stream's, it does not grow).
+			new(u8[] buffer) : (buffer, true) { }
+
+			new(u8[] buffer, bool writable)
+			{
+				data = buffer;
+				length = buffer.Length;
+				this.writable = writable;
+				open = true;
+				room = writable ? buffer.Length : 0;
+			}
+
+			override bool CanRead { get => open; }
+
+			override bool CanWrite { get => open && writable; }
+
+			override bool CanSeek { get => open; }
+
+			override i64 Length { get => length; }
+
+			override i64 Position
+			{
+				get => position;
+				set
+				{
+					if (value < 0 || value > 2147483647)
+						throw new ArgumentError("MemoryStream.Position: out of range");
+					position = (i32)value;
+				}
+			}
+
+			/// How many bytes fit before it grows.
+			i32 Capacity { get => data.Length; }
+
+			override Read(u8[] buffer, i32 offset, i32 count) : i32
+			{
+				Check();
+				i32 n = length - position;
+				if (n > count)
+					n = count;
+				if (n <= 0)
+					return 0;
+				if (n <= 16 && offset >= 0 && offset + n <= buffer.Length)
+				{
+					loop (i32 i = 0..n)
+						buffer[offset + i] = data[position + i];
+				}
+				else
+				{
+					Array.Copy(data, position, buffer, offset, n);
+				}
+				position += n;
+				return n;
+			}
+
+			override ReadByte() : i32
+			{
+				i32 at = position;
+				if (at < length && open)
+				{
+					position = at + 1;
+					return data[at];
+				}
+				Check();
+				return -1;
+			}
+
+			override Write(u8[] buffer, i32 offset, i32 count)
+			{
+				Check();
+				if (!writable)
+					ReadOnly();
+				i32 end = position + count;
+				Reserve(end);
+				loop (i32 i = length..position)
+					data[i] = 0;
+				if (count <= 16 && offset >= 0 && offset + count <= buffer.Length)
+				{
+					loop (i32 i = 0..count)
+						data[position + i] = buffer[offset + i];
+				}
+				else
+				{
+					Array.Copy(buffer, offset, data, position, count);
+				}
+				position = end;
+				if (end > length)
+					length = end;
+			}
+
+			override WriteByte(u8 value)
+			{
+				i32 at = position;
+				if (at < room && at <= length)
+				{
+					data[at] = value;
+					position = at + 1;
+					if (at == length)
+						length = at + 1;
+					return;
+				}
+				WriteByteSlow(value);
+			}
+
+			override Seek(i64 offset, SeekOrigin origin) : i64
+			{
+				Check();
+				i64 at = origin == SeekOrigin.Begin ? offset : origin == SeekOrigin.Current ? position + offset : length + offset;
+				if (at < 0 || at > 2147483647)
+					throw new IOError("MemoryStream.Seek: before the start");
+				position = (i32)at;
+				return at;
+			}
+
+			override SetLength(i64 newLength)
+			{
+				Check();
+				if (!writable)
+					throw new IOError("the memory stream is read-only");
+				if (newLength < 0 || newLength > 2147483647)
+					throw new ArgumentError("MemoryStream.SetLength: out of range");
+				i32 n = (i32)newLength;
+				Reserve(n);
+				loop (i32 i = length..n)
+					data[i] = 0;
+				length = n;
+				if (position > length)
+					position = length;
+			}
+
+			override Close()
+			{
+				open = false;
+				room = 0;
+			}
+
+			/// A copy of its bytes.
+			ToArray() : u8[]
+			{
+				u8[] copy = new u8[length];
+				Array.Copy(data, 0, copy, 0, length);
+				return copy;
+			}
+
+			/// The array it keeps its bytes in (Length of them are the stream's).
+			GetBuffer() : u8[] => data;
+
+			/// Writes all its bytes into `destination`.
+			WriteTo(Stream destination) { destination.Write(data, 0, length); }
+	}
+
+	/// A buffer in front of another stream: small reads and writes become few large ones.
+	public class BufferedStream : Stream
+	{
+		Stream inner;
+		u8[] buffer;
+		/// Bytes read ahead: buffer[readAt..readEnd].
+		i32 readAt;
+		i32 readEnd;
+		/// Bytes not written yet: buffer[0..writeEnd].
+		i32 writeEnd;
+
+		FlushWrites()
+		{
+			if (writeEnd > 0)
+			{
+				inner.Write(buffer, 0, writeEnd);
+				writeEnd = 0;
+			}
+		}
+
+		/// Gives back the bytes read ahead (moving the inner stream back to where this one is).
+		DropReads()
+		{
+			if (readAt < readEnd && inner.CanSeek)
+				inner.Seek(readAt - readEnd, SeekOrigin.Current);
+			readAt = 0;
+			readEnd = 0;
+		}
+
+		public:
+			new(Stream stream) : (stream, 4096) { }
+
+			new(Stream stream, i32 bufferSize)
+			{
+				if (bufferSize <= 0)
+					throw new ArgumentError("BufferedStream: the buffer size must be positive");
+				inner = stream;
+				buffer = new u8[bufferSize];
+			}
+
+			/// The stream behind the buffer.
+			Stream UnderlyingStream { get => inner; }
+
+			i32 BufferSize { get => buffer.Length; }
+
+			override bool CanRead { get => inner.CanRead; }
+
+			override bool CanWrite { get => inner.CanWrite; }
+
+			override bool CanSeek { get => inner.CanSeek; }
+
+			override i64 Length
+			{
+				get
+				{
+					FlushWrites();
+					return inner.Length;
+				}
+			}
+
+			override i64 Position
+			{
+				get => inner.Position - (readEnd - readAt) + writeEnd;
+				set { Seek(value, SeekOrigin.Begin); }
+			}
+
+			override Read(u8[] target, i32 offset, i32 count) : i32
+			{
+				i32 buffered = readEnd - readAt;
+				if (buffered == 0)
+				{
+					FlushWrites();
+					// Reads as large as the buffer go straight through.
+					if (count >= buffer.Length)
+						return inner.Read(target, offset, count);
+					readAt = 0;
+					readEnd = inner.Read(buffer, 0, buffer.Length);
+					buffered = readEnd;
+					if (buffered == 0)
+						return 0;
+				}
+				i32 n = buffered < count ? buffered : count;
+				Array.Copy(buffer, readAt, target, offset, n);
+				readAt += n;
+				return n;
+			}
+
+			override ReadByte() : i32
+			{
+				if (readAt < readEnd)
+				{
+					readAt++;
+					return buffer[readAt - 1];
+				}
+				FlushWrites();
+				readAt = 0;
+				readEnd = inner.Read(buffer, 0, buffer.Length);
+				if (readEnd == 0)
+					return -1;
+				readAt = 1;
+				return buffer[0];
+			}
+
+			override Write(u8[] source, i32 offset, i32 count)
+			{
+				if (readEnd > 0)
+					DropReads();
+				if (writeEnd + count <= buffer.Length)
+				{
+					Array.Copy(source, offset, buffer, writeEnd, count);
+					writeEnd += count;
+					return;
+				}
+				FlushWrites();
+				if (count >= buffer.Length)
+				{
+					inner.Write(source, offset, count);
+					return;
+				}
+				Array.Copy(source, offset, buffer, 0, count);
+				writeEnd = count;
+			}
+
+			override WriteByte(u8 value)
+			{
+				if (readEnd == 0 && writeEnd < buffer.Length)
+				{
+					buffer[writeEnd] = value;
+					writeEnd++;
+					return;
+				}
+				if (readEnd > 0)
+					DropReads();
+				if (writeEnd == buffer.Length)
+					FlushWrites();
+				buffer[writeEnd] = value;
+				writeEnd++;
+			}
+
+			override Seek(i64 offset, SeekOrigin origin) : i64
+			{
+				FlushWrites();
+				if (origin == SeekOrigin.Current)
+					offset -= readEnd - readAt;
+				readAt = 0;
+				readEnd = 0;
+				return inner.Seek(offset, origin);
+			}
+
+			override SetLength(i64 length)
+			{
+				FlushWrites();
+				DropReads();
+				inner.SetLength(length);
+			}
+
+			override Flush()
+			{
+				FlushWrites();
+				inner.Flush();
+			}
+
+			override Close()
+			{
+				FlushWrites();
+				inner.Close();
+			}
+	}
+
+	public enum FileMode { Open, Create, CreateNew, OpenOrCreate, Truncate, Append }
+
+	public enum FileAccess { Read, Write, ReadWrite }
+
+	/// A file the runtime has open, by handle (0, 1 and 2 are the console's input, output and error): no buffer of its own.
+	public class HandleStream : Stream
+	{
+		extern("stream.close") CloseHandle(i64 handle) : i64;
+		extern("stream.read") ReadRange(i64 handle, u8[] bytes, i64 offset, i64 count) : i64;
+		extern("stream.write") WriteRange(i64 handle, u8[] bytes, i64 offset, i64 count) : i64;
+		extern("stream.seek") SeekTo(i64 handle, i64 offset, i64 origin) : i64;
+		extern("stream.length") LengthOf(i64 handle) : i64;
+		extern("stream.flush") FlushHandle(i64 handle) : i64;
+
+		i64 handle;
+		str name;
+		bool reads;
+		bool writes;
+
+		Check()
+		{
+			if (handle < 0)
+				throw new IOError("the stream is closed: " + name);
+		}
+
+		public:
+			new(i64 handle, str name, bool reads, bool writes)
+			{
+				this.handle = handle;
+				this.name = name;
+				this.reads = reads;
+				this.writes = writes;
+			}
+
+			override bool CanRead { get => handle >= 0 && reads; }
+
+			override bool CanWrite { get => handle >= 0 && writes; }
+
+			override bool CanSeek { get => handle >= 3; }
+
+			override i64 Length
+			{
+				get
+				{
+					Check();
+					i64 length = LengthOf(handle);
+					if (length < 0)
+						throw new IOError("the stream has no length: " + name);
+					return length;
+				}
+			}
+
+			override i64 Position
+			{
+				get => Seek(0, SeekOrigin.Current);
+				set { Seek(value, SeekOrigin.Begin); }
+			}
+
+			override Read(u8[] buffer, i32 offset, i32 count) : i32
+			{
+				Check();
+				if (offset < 0 || count < 0 || offset + count > buffer.Length)
+					throw new ArgumentError("Stream.Read: the range is outside the buffer");
+				i64 read = ReadRange(handle, buffer, offset, count);
+				if (read < 0)
+					throw new IOError("cannot read " + name);
+				return (i32)read;
+			}
+
+			override Write(u8[] buffer, i32 offset, i32 count)
+			{
+				Check();
+				if (offset < 0 || count < 0 || offset + count > buffer.Length)
+					throw new ArgumentError("Stream.Write: the range is outside the buffer");
+				if (WriteRange(handle, buffer, offset, count) != count)
+					throw new IOError("cannot write " + name);
+			}
+
+			override Seek(i64 offset, SeekOrigin origin) : i64
+			{
+				Check();
+				i64 at = SeekTo(handle, offset, origin == SeekOrigin.Begin ? 0 : origin == SeekOrigin.Current ? 1 : 2);
+				if (at < 0)
+					throw new IOError("cannot seek in " + name);
+				return at;
+			}
+
+			override Flush()
+			{
+				Check();
+				FlushHandle(handle);
+			}
+
+			override Close()
+			{
+				if (handle >= 3)
+					CloseHandle(handle);
+				else if (handle >= 0)
+					FlushHandle(handle);
+				handle = -1;
+			}
+	}
+
+	/// A file read and written in ranges of bytes, at a position, through a buffer.
+	public class FileStream : Stream
+	{
+		extern("stream.open") OpenAt(u16[] path, i64 mode) : i64;
+
+		BufferedStream buffered;
+		str path;
+		bool reads;
+		bool writes;
+
+		public:
+			new(str path, FileMode mode) : (path, mode, mode == FileMode.Append ? FileAccess.Write : mode == FileMode.Open ? FileAccess.Read : FileAccess.ReadWrite) { }
+
+			new(str path, FileMode mode, FileAccess access) : (path, mode, access, 4096) { }
+
+			new(str path, FileMode mode, FileAccess access, i32 bufferSize)
+			{
+				this.path = path;
+				// The runtime's bits: 1 read, 2 write, 4 create, 8 truncate, 16 append, 32 only a new file.
+				i64 bits = access == FileAccess.Read ? 1 : access == FileAccess.Write ? 2 : 3;
+				if (mode == FileMode.Create)
+					bits = bits | 4 | 8;
+				else if (mode == FileMode.CreateNew)
+					bits = bits | 4 | 32;
+				else if (mode == FileMode.OpenOrCreate)
+					bits = bits | 4;
+				else if (mode == FileMode.Truncate)
+					bits = bits | 8;
+				else if (mode == FileMode.Append)
+					bits = bits | 2 | 4 | 16;
+				i64 handle = OpenAt(Unicode.ToUtf16(path), bits);
+				if (handle < 0)
+					throw new IOError("cannot open " + path);
+				reads = access != FileAccess.Write;
+				writes = access != FileAccess.Read;
+				buffered = new BufferedStream(new HandleStream(handle, path, reads, writes), bufferSize);
+			}
+
+			/// The path it was opened with.
+			str Name { get => path; }
+
+			override bool CanRead { get => buffered.CanRead; }
+
+			override bool CanWrite { get => buffered.CanWrite; }
+
+			override bool CanSeek { get => buffered.CanSeek; }
+
+			override i64 Length { get => buffered.Length; }
+
+			override i64 Position
+			{
+				get => buffered.Position;
+				set { buffered.Position = value; }
+			}
+
+			override Read(u8[] buffer, i32 offset, i32 count) : i32
+			{
+				if (!reads)
+					throw new IOError("the file was not opened for reading: " + path);
+				return buffered.Read(buffer, offset, count);
+			}
+
+			override ReadByte() : i32 => buffered.ReadByte();
+
+			override Write(u8[] buffer, i32 offset, i32 count)
+			{
+				if (!writes)
+					throw new IOError("the file was not opened for writing: " + path);
+				buffered.Write(buffer, offset, count);
+			}
+
+			override WriteByte(u8 value) { buffered.WriteByte(value); }
+
+			override Seek(i64 offset, SeekOrigin origin) : i64 => buffered.Seek(offset, origin);
+
+			/// Moves to `offset` from the start (0), the position (1) or the end (2): the new position.
+			Seek(i64 offset, i32 origin) : i64 => buffered.Seek(offset, origin == 0 ? SeekOrigin.Begin : origin == 1 ? SeekOrigin.Current : SeekOrigin.End);
+
+			override Flush() { buffered.Flush(); }
+
+			override Close() { buffered.Close(); }
+	}
+}

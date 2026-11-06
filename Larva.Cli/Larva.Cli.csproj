@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>larva</AssemblyName>
+    <!-- The Larva toolchain version (larva version, the installer, the editor). -->
+    <Version>0.8.0</Version>
+    <!-- JIT code raises SEH exceptions whose continuations are not CET-registered (see JitMemory). -->
+    <CETCompat>false</CETCompat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.Runtime\Larva.Runtime.csproj" />
+    <ProjectReference Include="..\Larva.Llvm\Larva.Llvm.csproj" />
+    <ProjectReference Include="..\Larva.X64\Larva.X64.csproj" />
+    <ProjectReference Include="..\Larva.Driver\Larva.Driver.csproj" />
+    <ProjectReference Include="..\Larva.Build\Larva.Build.csproj" />
+    <ProjectReference Include="..\Larva.Bindings\Larva.Bindings.csproj" />
+    <ProjectReference Include="..\Hive.Core\Hive.Core.csproj" />
+    <ProjectReference Include="..\Larva.Hir.Services\Larva.Hir.Services.csproj" />
+    <ProjectReference Include="..\Larva.Hir.Lowering\Larva.Hir.Lowering.csproj" />
+  </ItemGroup>
+
+  <!--
+    Languages are packs larva loads, built in their own repositories (Antril: ..\Antril). A working copy of larva finds
+    them through LARVA_LANGUAGES (for Antril: ..\Antril\artifacts\pack, what its build writes); an installation's packs are
+    native and signed, next to larva (tools/publish-larva.ps1).
+  -->
+
+</Project>

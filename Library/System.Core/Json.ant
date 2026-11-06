@@ -1,0 +1,453 @@
+// JSON: a value read from text (JsonValue.Parse) or built by hand, and written back (ToString, compact). Objects keep
+// their members in order. Numbers are f64 (an integer prints without a fraction). Text is UTF-8 in and out; `\uXXXX`
+// escapes (surrogate pairs included) become the character's bytes.
+
+into namespace System.Text
+{
+	public enum JsonKind { Null, Bool, Number, String, Array, Object }
+
+	public final class JsonValue
+	{
+		JsonKind kind;
+		bool boolean;
+		f64 number;
+		str text;
+		List<JsonValue> items;
+		List<str> keys;
+		List<JsonValue> values;
+
+		new(JsonKind kind)
+		{
+			this.kind = kind;
+			text = "";
+			items = new List<JsonValue>();
+			keys = new List<str>();
+			values = new List<JsonValue>();
+		}
+
+		Expect(JsonKind wanted, str what)
+		{
+			if (kind != wanted)
+				throw new FormatError("the JSON value is not " + what);
+		}
+
+		static WriteText(StringBuilder sb, str value)
+		{
+			sb.Append("\"");
+			u8[] units = value.Units();
+			loop (i32 i = 0..units.Length)
+			{
+				u32 c = units[i];
+				if (c == '"')
+					sb.Append("\\\"");
+				else if (c == '\\')
+					sb.Append("\\\\");
+				else if (c == 10)
+					sb.Append("\\n");
+				else if (c == 13)
+					sb.Append("\\r");
+				else if (c == 9)
+					sb.Append("\\t");
+				else if (c == 8)
+					sb.Append("\\b");
+				else if (c == 12)
+					sb.Append("\\f");
+				else if (c < 32)
+					sb.Append("\\u00" + Hex(c >> 4) + Hex(c & 15));
+				else
+					sb.Append(new String<u8>([units[i]]));
+			}
+			sb.Append("\"");
+		}
+
+		static Hex(u32 digit) : str => new String<u8>([(u8)(digit < 10 ? '0' + digit : 'a' + digit - 10)]);
+
+		Write(StringBuilder sb)
+		{
+			if (kind == JsonKind.Null)
+				sb.Append("null");
+			else if (kind == JsonKind.Bool)
+				sb.Append(boolean ? "true" : "false");
+			else if (kind == JsonKind.Number)
+			{
+				i64 whole = (i64)number;
+				if ((f64)whole == number && number > -9007199254740992.0 && number < 9007199254740992.0)
+					sb.Append(whole.ToString());
+				else
+					sb.Append(number.ToString());
+			}
+			else if (kind == JsonKind.String)
+				WriteText(sb, text);
+			else if (kind == JsonKind.Array)
+			{
+				sb.Append("[");
+				loop (i32 i = 0..items.Count)
+				{
+					if (i > 0)
+						sb.Append(",");
+					items[i].Write(sb);
+				}
+				sb.Append("]");
+			}
+			else
+			{
+				sb.Append("{");
+				loop (i32 i = 0..keys.Count)
+				{
+					if (i > 0)
+						sb.Append(",");
+					WriteText(sb, keys[i]);
+					sb.Append(":");
+					values[i].Write(sb);
+				}
+				sb.Append("}");
+			}
+		}
+
+		public:
+			JsonKind Kind { get => kind; }
+			bool IsNull { get => kind == JsonKind.Null; }
+
+			static Null() : JsonValue => new JsonValue(JsonKind.Null);
+
+			static Of(bool value) : JsonValue
+			{
+				JsonValue v = new JsonValue(JsonKind.Bool);
+				v.boolean = value;
+				return v;
+			}
+
+			static Of(f64 value) : JsonValue
+			{
+				JsonValue v = new JsonValue(JsonKind.Number);
+				v.number = value;
+				return v;
+			}
+
+			static Of(i32 value) : JsonValue => Of((f64)value);
+
+			static Of(str value) : JsonValue
+			{
+				JsonValue v = new JsonValue(JsonKind.String);
+				v.text = value;
+				return v;
+			}
+
+			static NewArray() : JsonValue => new JsonValue(JsonKind.Array);
+
+			static NewObject() : JsonValue => new JsonValue(JsonKind.Object);
+
+			bool AsBool { get { Expect(JsonKind.Bool, "a bool"); return boolean; } }
+			f64 AsNumber { get { Expect(JsonKind.Number, "a number"); return number; } }
+			str AsString { get { Expect(JsonKind.String, "a string"); return text; } }
+
+			/// Items of an array, or members of an obj.
+			i32 Count { get => kind == JsonKind.Array ? items.Count : kind == JsonKind.Object ? keys.Count : 0; }
+
+			/// An array's item.
+			At(i32 index) : JsonValue
+			{
+				Expect(JsonKind.Array, "an array");
+				return items[index];
+			}
+
+			/// Appends to an array (returns this, to chain).
+			Add(JsonValue item) : JsonValue
+			{
+				Expect(JsonKind.Array, "an array");
+				items.Add(item);
+				return this;
+			}
+
+			/// The key of the i-th member of an obj.
+			KeyAt(i32 index) : str
+			{
+				Expect(JsonKind.Object, "an obj");
+				return keys[index];
+			}
+
+			/// The i-th member's value.
+			ValueAt(i32 index) : JsonValue
+			{
+				Expect(JsonKind.Object, "an obj");
+				return values[index];
+			}
+
+			Has(str key) : bool
+			{
+				if (kind != JsonKind.Object)
+					return false;
+				loop (i32 i = 0..keys.Count)
+				{
+					if (keys[i] == key)
+						return true;
+				}
+				return false;
+			}
+
+			/// An obj's member, or null when there is none.
+			Get(str key) : JsonValue?
+			{
+				if (kind != JsonKind.Object)
+					return null;
+				loop (i32 i = 0..keys.Count)
+				{
+					if (keys[i] == key)
+						return values[i];
+				}
+				return null;
+			}
+
+			/// Sets an obj's member (replacing one with that key; returns this, to chain).
+			Set(str key, JsonValue value) : JsonValue
+			{
+				Expect(JsonKind.Object, "an obj");
+				loop (i32 i = 0..keys.Count)
+				{
+					if (keys[i] == key)
+					{
+						values[i] = value;
+						return this;
+					}
+				}
+				keys.Add(key);
+				values.Add(value);
+				return this;
+			}
+
+			/// The value as JSON text (compact).
+			override ToString() : str
+			{
+				StringBuilder sb = new StringBuilder();
+				Write(sb);
+				return sb.ToString();
+			}
+
+			static Parse(str json) : JsonValue
+			{
+				JsonReader reader = new JsonReader(json.Units());
+				JsonValue value = reader.ReadValue();
+				reader.SkipSpace();
+				if (!reader.AtEnd)
+					reader.Fail("text after the value");
+				return value;
+			}
+	}
+
+	/// Reads a value from UTF-8 units.
+	public final class JsonReader
+	{
+		u8[] p;
+		i32 at;
+
+		public:
+			new(u8[] units)
+			{
+				p = units;
+			}
+
+			bool AtEnd { get => at >= p.Length; }
+
+			Fail(str what)
+			{
+				throw new FormatError("JSON: " + what + " at " + at);
+			}
+
+			SkipSpace()
+			{
+				loop (at < p.Length && (p[at] == 32 || p[at] == 9 || p[at] == 10 || p[at] == 13))
+					at++;
+			}
+
+			ReadValue() : JsonValue
+			{
+				SkipSpace();
+				if (at >= p.Length)
+					Fail("unexpected end");
+				u32 c = p[at];
+				if (c == '{')
+					return ReadObject();
+				if (c == '[')
+					return ReadArray();
+				if (c == '"')
+					return JsonValue.Of(ReadText());
+				if (c == 't')
+				{
+					ExpectWord("true");
+					return JsonValue.Of(true);
+				}
+				if (c == 'f')
+				{
+					ExpectWord("false");
+					return JsonValue.Of(false);
+				}
+				if (c == 'n')
+				{
+					ExpectWord("null");
+					return JsonValue.Null();
+				}
+				if (c == '-' || (c >= '0' && c <= '9'))
+					return ReadNumber();
+				Fail("unexpected character");
+				return JsonValue.Null();
+			}
+
+			ExpectWord(str word)
+			{
+				u8[] w = word.Units();
+				loop (i32 i = 0..w.Length)
+				{
+					if (at + i >= p.Length || p[at + i] != w[i])
+						Fail("expected " + word);
+				}
+				at += w.Length;
+			}
+
+			ReadNumber() : JsonValue
+			{
+				i32 start = at;
+				if (p[at] == '-')
+					at++;
+				loop (at < p.Length && ((p[at] >= '0' && p[at] <= '9') || p[at] == '.' || p[at] == 'e' || p[at] == 'E' || p[at] == '+' || p[at] == '-'))
+					at++;
+				u8[] digits = new u8[at - start];
+				Array.Copy(p, start, digits, 0, at - start);
+				f64? parsed = Float64.TryParse(new String<u8>(digits));
+				if (parsed == null)
+					Fail("bad number");
+				return JsonValue.Of(parsed ?? 0.0);
+			}
+
+			ReadText() : str
+			{
+				at++;
+				List<u8> bytes = new List<u8>();
+				loop (true)
+				{
+					if (at >= p.Length)
+						Fail("unterminated string");
+					u32 c = p[at];
+					at++;
+					if (c == '"')
+						break;
+					if (c != '\\')
+					{
+						bytes.Add((u8)c);
+						continue;
+					}
+					if (at >= p.Length)
+						Fail("unterminated escape");
+					u32 e = p[at];
+					at++;
+					if (e == 'n')
+						bytes.Add(10);
+					else if (e == 't')
+						bytes.Add(9);
+					else if (e == 'r')
+						bytes.Add(13);
+					else if (e == 'b')
+						bytes.Add(8);
+					else if (e == 'f')
+						bytes.Add(12);
+					else if (e == '"' || e == '\\' || e == '/')
+						bytes.Add((u8)e);
+					else if (e == 'u')
+					{
+						u32 code = ReadHex4();
+						if (code >= 0xD800 && code < 0xDC00 && at + 1 < p.Length && p[at] == '\\' && p[at + 1] == 'u')
+						{
+							at += 2;
+							u32 low = ReadHex4();
+							code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+						}
+						u8[] encoded = Unicode.Encode<u8>([code]);
+						loop (i32 i = 0..encoded.Length)
+							bytes.Add(encoded[i]);
+					}
+					else
+						Fail("bad escape");
+				}
+				u8[] units = new u8[bytes.Count];
+				loop (i32 i = 0..bytes.Count)
+					units[i] = bytes[i];
+				return new String<u8>(units);
+			}
+
+			ReadHex4() : u32
+			{
+				u32 value = 0;
+				loop (i32 i = 0..4)
+				{
+					if (at >= p.Length)
+						Fail("bad \\u escape");
+					u32 c = p[at];
+					at++;
+					u32 digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+					if (digit > 15)
+						Fail("bad \\u escape");
+					value = value * 16 + digit;
+				}
+				return value;
+			}
+
+			ReadArray() : JsonValue
+			{
+				at++;
+				JsonValue array = JsonValue.NewArray();
+				SkipSpace();
+				if (at < p.Length && p[at] == ']')
+				{
+					at++;
+					return array;
+				}
+				loop (true)
+				{
+					array.Add(ReadValue());
+					SkipSpace();
+					if (at >= p.Length)
+						Fail("unterminated array");
+					u32 c = p[at];
+					at++;
+					if (c == ']')
+						break;
+					if (c != ',')
+						Fail("expected , or ]");
+				}
+				return array;
+			}
+
+			ReadObject() : JsonValue
+			{
+				at++;
+				JsonValue obj = JsonValue.NewObject();
+				SkipSpace();
+				if (at < p.Length && p[at] == '}')
+				{
+					at++;
+					return obj;
+				}
+				loop (true)
+				{
+					SkipSpace();
+					if (at >= p.Length || p[at] != '"')
+						Fail("expected a key");
+					str key = ReadText();
+					SkipSpace();
+					if (at >= p.Length || p[at] != ':')
+						Fail("expected :");
+					at++;
+					obj.Set(key, ReadValue());
+					SkipSpace();
+					if (at >= p.Length)
+						Fail("unterminated obj");
+					u32 c = p[at];
+					at++;
+					if (c == '}')
+						break;
+					if (c != ',')
+						Fail("expected , or }");
+				}
+				return obj;
+			}
+	}
+}

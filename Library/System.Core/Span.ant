@@ -1,0 +1,162 @@
+// Views of arrays without copies: a Span is part of an array (its start and length), read and written in place.
+
+into namespace System
+{
+	/// A run of an array's elements, seen in place: `span[i]` reads and writes the array, Slice makes a smaller view,
+	/// nothing is copied. A view of a list sees its elements until the list grows.
+	public value Span<T>
+	{
+		T[] items;
+		i32 start;
+		i32 length;
+
+		[NoInline]
+		static OutOfRange() { throw new ArgumentError("Span: the range is outside the span"); }
+
+		public:
+			/// The whole array.
+			new(T[] array)
+			{
+				items = array;
+				length = array.Length;
+			}
+
+			/// `count` elements of the array from `from`.
+			new(T[] array, i32 from, i32 count)
+			{
+				if ((u32)from > (u32)array.Length || (u32)count > (u32)(array.Length - from))
+					OutOfRange();
+				items = array;
+				start = from;
+				length = count;
+			}
+
+			i32 Length { get => length; }
+			bool IsEmpty { get => length == 0; }
+
+			/// `span[i]`.
+			At(i32 index) : T
+			{
+				if ((u32)index >= (u32)length)
+					Fail.Index();
+				return items[start + index];
+			}
+
+			/// `span[i] = value`.
+			SetAt(i32 index, T value)
+			{
+				if ((u32)index >= (u32)length)
+					Fail.Index();
+				items[start + index] = value;
+			}
+
+			/// The view from `from` to the end, and `count` elements from `from`.
+			Slice(i32 from) : Span<T> => Slice(from, length - from);
+
+			Slice(i32 from, i32 count) : Span<T>
+			{
+				if ((u32)from > (u32)length || (u32)count > (u32)(length - from))
+					OutOfRange();
+				Span<T> view = this;
+				view.start = start + from;
+				view.length = count;
+				return view;
+			}
+
+			/// A new array with the elements.
+			ToArray() : T[]
+			{
+				T[] copy = new T[length];
+				loop (i32 i = 0..length)
+					copy[i] = items[start + i];
+				return copy;
+			}
+
+			/// Copies the elements into `target` (at least as long).
+			CopyTo(Span<T> target)
+			{
+				if (target.length < length)
+					OutOfRange();
+				if (length > 0)
+					Array.Copy(items, start, target.items, target.start, length);
+			}
+
+			/// Every element set to `value`.
+			Fill(T value)
+			{
+				loop (i32 i = start..start + length)
+					items[i] = value;
+			}
+
+			/// The array under the view and where the view starts in it (for code that works on arrays).
+			T[] Items { get => items; }
+			i32 Start { get => start; }
+
+			Iterator() : SpanIterator<T> => new SpanIterator<T>(this);
+	}
+
+	/// The elements of a span, in order.
+	public value SpanIterator<T>
+	{
+		Span<T> span;
+		i32 index;
+
+		public:
+			new(Span<T> span) { this.span = span; index = -1; }
+
+			Next() : bool
+			{
+				index++;
+				return index < span.Length;
+			}
+
+			T Current { get => span.At(index); }
+	}
+
+	/// What spans of comparable, equatable and number elements can do.
+	public static class Spans
+	{
+		public:
+			/// A span of a list's elements (in place: it sees them until the list grows).
+			Of<T>(List<T> list) : Span<T> => new Span<T>(list.Items(), 0, list.Count);
+
+			Sort<T : IComparable<T>>(Span<T> span)
+			{
+				if (span.Length > 1)
+					Array.Sort(span.Items, span.Start, span.Length);
+			}
+
+			IndexOf<T : IHashable<T>>(Span<T> span, T value) : i32
+			{
+				loop (i32 i = 0..span.Length)
+				{
+					if (span[i].Equals(value))
+						return i;
+				}
+				return -1;
+			}
+
+			Contains<T : IHashable<T>>(Span<T> span, T value) : bool => IndexOf(span, value) >= 0;
+
+			SequenceEqual<T : IHashable<T>>(Span<T> a, Span<T> b) : bool
+			{
+				if (a.Length != b.Length)
+					return false;
+				loop (i32 i = 0..a.Length)
+				{
+					if (!a[i].Equals(b[i]))
+						return false;
+				}
+				return true;
+			}
+
+			Sum<T : number>(Span<T> span) : T
+			{
+				T total = T.Zero;
+				T[] array = span.Items;
+				loop (i32 i = span.Start..span.Start + span.Length)
+					total += array[i];
+				return total;
+			}
+	}
+}

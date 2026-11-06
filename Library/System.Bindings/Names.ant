@@ -1,0 +1,187 @@
+// What a binding profile shapes C names with: prefixes taken off, words recased, patterns matched.
+
+import System;
+
+into namespace System.Bindings
+{
+	/// The case a name is written in.
+	public enum NameCase
+	{
+		/// As C wrote it.
+		Keep,
+		/// `WindowFlags` (an ALL_CAPS name's words are capitalized; a mixed one keeps its acronyms: `windowID` → `WindowID`).
+		Pascal,
+		/// `windowFlags`.
+		Camel,
+		/// `WINDOW_FLAGS`.
+		Upper,
+		/// `window_flags`.
+		Snake,
+	}
+
+	/// Names: prefixes, case, patterns.
+	public static class Names
+	{
+		public:
+			/// `name` without the longest of `prefixes` it starts with (when something is left).
+			Strip(str name, List<str> prefixes) : str
+			{
+				str best = "";
+				loop (str prefix in prefixes)
+				{
+					if (prefix.Length > best.Length && name.Length > prefix.Length && name.StartsWith(prefix))
+						best = prefix;
+				}
+				return best.Length == 0 ? name : name.Substring(best.Length);
+			}
+
+			/// `name` without `prefix` (when it starts with it and something is left).
+			Strip(str name, str prefix) : str =>
+				prefix.Length > 0 && name.Length > prefix.Length && name.StartsWith(prefix) ? name.Substring(prefix.Length) : name;
+
+			/// The words of a name: split at `_`, and at lower-to-upper and acronym-to-word boundaries (`GPUDevice` → GPU, Device).
+			Words(str name) : List<str>
+			{
+				List<str> words = new List<str>();
+				loop (str part in name.Split('_'))
+				{
+					if (part.Length == 0)
+						continue;
+					i32 start = 0;
+					loop (i32 i = 1..part.Length)
+					{
+						bool lowerToUpper = IsLower(part.At(i - 1)) && IsUpper(part.At(i));
+						bool acronymEnd = IsUpper(part.At(i - 1)) && IsUpper(part.At(i)) && i + 1 < part.Length && IsLower(part.At(i + 1));
+						if (lowerToUpper || acronymEnd)
+						{
+							words.Add(part.Substring(start, i - start));
+							start = i;
+						}
+					}
+					words.Add(part.Substring(start));
+				}
+				return words;
+			}
+
+			/// `name` in `Pascal` case.
+			Pascal(str name) : str => Shape(name, NameCase.Pascal);
+
+			/// `name` in `camel` case.
+			Camel(str name) : str => Shape(name, NameCase.Camel);
+
+			/// `name` in `UPPER_SNAKE` case.
+			Upper(str name) : str => Shape(name, NameCase.Upper);
+
+			/// `name` in `snake` case.
+			Snake(str name) : str => Shape(name, NameCase.Snake);
+
+			/// `name` in a case.
+			Shape(str name, NameCase shape) : str
+			{
+				if (shape == NameCase.Keep || name.Length == 0)
+					return name;
+				List<str> words = Words(name);
+				if (words.Count == 0)
+					return name;
+				bool screaming = !HasLower(name);
+				StringBuilder text = new StringBuilder();
+				loop (i32 i = 0..words.Count)
+				{
+					str word = words[i];
+					if (shape == NameCase.Upper || shape == NameCase.Snake)
+					{
+						if (i > 0)
+							text.Append("_");
+						text.Append(shape == NameCase.Upper ? word.ToUpper() : word.ToLower());
+					}
+					else if (shape == NameCase.Camel && i == 0)
+						text.Append(HasLower(word) ? First(word, false) : word.ToLower());
+					else
+						text.Append(screaming ? First(word.ToLower(), true) : First(word, true));
+				}
+				return text.ToString();
+			}
+
+			/// Whether `name` matches `pattern`: `*` any text, `?` one character, the rest as it is (`SDL_INIT_*`).
+			Matches(str name, str pattern) : bool => MatchesFrom(name, 0, pattern, 0);
+
+			/// The prefix the names share, up to a `_` (`SDL_EVENT_QUIT`, `SDL_EVENT_USER` → `SDL_EVENT_`); one name: up to its last `_`.
+			CommonPrefix(List<str> names) : str
+			{
+				if (names.Count == 0)
+					return "";
+				str prefix = names[0];
+				if (names.Count == 1)
+					return prefix.LastIndexOf('_') >= 0 ? prefix.Substring(0, prefix.LastIndexOf('_') + 1) : "";
+				loop (i32 n = 1..names.Count)
+				{
+					str other = names[n];
+					i32 i = 0;
+					loop (i < prefix.Length && i < other.Length && prefix.At(i) == other.At(i))
+						i++;
+					prefix = prefix.Substring(0, i);
+				}
+				i32 cut = prefix.LastIndexOf('_');
+				return cut < 0 ? "" : prefix.Substring(0, cut + 1);
+			}
+
+			/// A name that can be written: one that starts with a digit gets a `_` before it.
+			Writable(str name) : str => name.Length > 0 && IsDigit(name.At(0)) ? "_" + name : name;
+
+			/// The stem of a header's path, without its folder and extension (`include/SDL3/SDL_video.h` → `SDL_video`).
+			Stem(str path) : str
+			{
+				i32 slash = path.LastIndexOf('/');
+				i32 back = path.LastIndexOf('\\');
+				i32 start = (slash > back ? slash : back) + 1;
+				str file = path.Substring(start);
+				i32 dot = file.LastIndexOf('.');
+				return dot > 0 ? file.Substring(0, dot) : file;
+			}
+
+		static IsUpper(u8 c) : bool => c >= 'A' && c <= 'Z';
+		static IsLower(u8 c) : bool => c >= 'a' && c <= 'z';
+		static IsDigit(u8 c) : bool => c >= '0' && c <= '9';
+
+		static HasLower(str text) : bool
+		{
+			loop (i32 i = 0..text.Length)
+			{
+				if (IsLower(text.At(i)))
+					return true;
+			}
+			return false;
+		}
+
+		/// The word with its first letter in upper (or lower) case.
+		static First(str word, bool upper) : str
+		{
+			if (word.Length == 0)
+				return word;
+			str head = word.Substring(0, 1);
+			return (upper ? head.ToUpper() : head.ToLower()) + word.Substring(1);
+		}
+
+		static MatchesFrom(str name, i32 at, str pattern, i32 from) : bool
+		{
+			loop (from < pattern.Length)
+			{
+				u8 p = pattern.At(from);
+				if (p == '*')
+				{
+					loop (i32 rest = at..name.Length + 1)
+					{
+						if (MatchesFrom(name, rest, pattern, from + 1))
+							return true;
+					}
+					return false;
+				}
+				if (at >= name.Length || p != '?' && p != name.At(at))
+					return false;
+				at++;
+				from++;
+			}
+			return at == name.Length;
+		}
+	}
+}

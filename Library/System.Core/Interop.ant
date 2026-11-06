@@ -1,0 +1,250 @@
+// Interop with C: native memory, C strings and reading or writing through addresses. Functions of C libraries are
+// declared with `[Import("lib.dll")]` (or `[Import("lib.dll", "Entry")]`) on a function without a body; a `str`
+// argument travels as a temporary null-terminated UTF-8 copy, a `String<u16>` as UTF-16.
+
+into namespace System.Runtime.InteropServices
+{
+	/// Raw memory (unsafe code).
+	public static class Memory
+	{
+		public:
+			/// `count` bytes from `source` to `target` (the ranges may overlap).
+			unsafe extern("mem.copy") static Copy(u8* target, u8* source, i64 count);
+
+			/// The first `count` bytes at `left` and `right` compared as unsigned values: negative, zero or positive.
+			unsafe extern("mem.cmp") static Compare(u8* left, u8* right, i64 count) : i32;
+	}
+
+	/// Temporary C strings: what the compiler calls around an imported function that takes strings.
+	internal static class CStrings
+	{
+		public:
+			unsafe extern("mem.alloc") Allocate(i64 bytes) : u8*;
+			unsafe extern("mem.free") Release(u8* block);
+
+			/// A null-terminated UTF-8 copy of `text` (Free gives it back).
+			unsafe Utf8(str text) : u8*
+			{
+				u8[] units = text.Units();
+				i32 n = units.Length;
+				u8* copy = Allocate(n + 1);
+				loop (i32 i = 0..n)
+					copy[i] = units[i];
+				return copy;
+			}
+
+			/// A null-terminated UTF-16 copy of `text` (Free16 gives it back).
+			unsafe Utf16(String<u16> text) : u16*
+			{
+				u16[] units = text.Units();
+				i32 n = units.Length;
+				u16* copy = (u16*)Allocate(2 * (n + 1));
+				loop (i32 i = 0..n)
+					copy[i] = units[i];
+				return copy;
+			}
+
+			/// `text` null-terminated into `buffer` (`capacity` units) when it fits: whether it did.
+			unsafe Utf8Into(str text, u8* buffer, i32 capacity) : bool
+			{
+				u8[] units = text.Units();
+				i32 n = units.Length;
+				if (n >= capacity)
+					return false;
+				loop (i32 i = 0..n)
+					buffer[i] = units[i];
+				buffer[n] = 0;
+				return true;
+			}
+
+			unsafe Utf16Into(String<u16> text, u16* buffer, i32 capacity) : bool
+			{
+				u16[] units = text.Units();
+				i32 n = units.Length;
+				if (n >= capacity)
+					return false;
+				loop (i32 i = 0..n)
+					buffer[i] = units[i];
+				buffer[n] = 0;
+				return true;
+			}
+
+			unsafe Free(u8* block) { Release(block); }
+
+			unsafe Free16(u16* block) { Release((u8*)block); }
+
+			/// How many units come before the first 0.
+			unsafe Length8(u8* text) : i32
+			{
+				i32 n = 0;
+				loop (text[n] != 0)
+					n++;
+				return n;
+			}
+
+			unsafe Length16(u16* text) : i32
+			{
+				i32 n = 0;
+				loop (text[n] != 0)
+					n++;
+				return n;
+			}
+	}
+
+	/// Native memory and conversions between Antril values and C data.
+	public static class Marshal
+	{
+		public:
+			/// `bytes` of native memory, zeroed (FreeHGlobal gives it back).
+			unsafe AllocHGlobal(i64 bytes) : void* => CStrings.Allocate(bytes);
+
+			unsafe FreeHGlobal(void* block) { CStrings.Release((u8*)block); }
+
+			/// `bytes` of native memory, zeroed (FreeCoTaskMem gives it back).
+			unsafe AllocCoTaskMem(i32 bytes) : void* => CStrings.Allocate(bytes);
+
+			unsafe FreeCoTaskMem(void* block) { CStrings.Release((u8*)block); }
+
+			/// A null-terminated UTF-8 copy of `text` in native memory (FreeCoTaskMem gives it back).
+			unsafe StringToCoTaskMemUTF8(str text) : u8* => CStrings.Utf8(text);
+
+			/// A null-terminated UTF-8 copy of `text` in native memory (FreeHGlobal gives it back).
+			unsafe StringToHGlobalUTF8(str text) : u8* => CStrings.Utf8(text);
+
+			/// A null-terminated UTF-16 copy of `text` in native memory (FreeHGlobal gives it back).
+			unsafe StringToHGlobalUni(str text) : u16* => CStrings.Utf16(new String<u16>(Unicode.ToUtf16(text)));
+
+			/// The null-terminated UTF-8 text at `text` (null: an empty string).
+			unsafe PtrToStringUTF8(u8* text) : str => text == null ? "" : PtrToStringUTF8(text, CStrings.Length8(text));
+
+			/// The `length` bytes of UTF-8 at `text`.
+			unsafe PtrToStringUTF8(u8* text, i32 length) : str
+			{
+				u8[] units = new u8[length];
+				loop (i32 i = 0..length)
+					units[i] = text[i];
+				return new String<u8>(units);
+			}
+
+			/// The null-terminated UTF-16 text at `text` (null: an empty string).
+			unsafe PtrToStringUni(u16* text) : str => text == null ? "" : PtrToStringUni(text, CStrings.Length16(text));
+
+			/// The `length` UTF-16 units at `text`.
+			unsafe PtrToStringUni(u16* text, i32 length) : str
+			{
+				u16[] units = new u16[length];
+				loop (i32 i = 0..length)
+					units[i] = text[i];
+				return Unicode.FromUtf16(units);
+			}
+
+			unsafe ReadByte(void* at) : u8 => *(u8*)at;
+			unsafe ReadByte(void* at, i32 offset) : u8 => *((u8*)at + offset);
+			unsafe ReadInt16(void* at) : i16 => *(i16*)at;
+			unsafe ReadInt16(void* at, i32 offset) : i16 => *(i16*)((u8*)at + offset);
+			unsafe ReadInt32(void* at) : i32 => *(i32*)at;
+			unsafe ReadInt32(void* at, i32 offset) : i32 => *(i32*)((u8*)at + offset);
+			unsafe ReadInt64(void* at) : i64 => *(i64*)at;
+			unsafe ReadInt64(void* at, i32 offset) : i64 => *(i64*)((u8*)at + offset);
+			unsafe ReadIntPtr(void* at) : void* => *(void**)at;
+			unsafe ReadIntPtr(void* at, i32 offset) : void* => *(void**)((u8*)at + offset);
+
+			unsafe WriteByte(void* at, u8 value) { *(u8*)at = value; }
+			unsafe WriteByte(void* at, i32 offset, u8 value) { *((u8*)at + offset) = value; }
+			unsafe WriteInt16(void* at, i16 value) { *(i16*)at = value; }
+			unsafe WriteInt16(void* at, i32 offset, i16 value) { *(i16*)((u8*)at + offset) = value; }
+			unsafe WriteInt32(void* at, i32 value) { *(i32*)at = value; }
+			unsafe WriteInt32(void* at, i32 offset, i32 value) { *(i32*)((u8*)at + offset) = value; }
+			unsafe WriteInt64(void* at, i64 value) { *(i64*)at = value; }
+			unsafe WriteInt64(void* at, i32 offset, i64 value) { *(i64*)((u8*)at + offset) = value; }
+			unsafe WriteIntPtr(void* at, void* value) { *(void**)at = value; }
+			unsafe WriteIntPtr(void* at, i32 offset, void* value) { *(void**)((u8*)at + offset) = value; }
+
+			/// Copies `length` elements of `source` from `start` to native memory at `destination`.
+			unsafe Copy<T : numeric>(T[] source, i32 start, void* destination, i32 length)
+			{
+				T* to = (T*)destination;
+				loop (i32 i = 0..length)
+					to[i] = source[start + i];
+			}
+
+			/// Copies `length` elements from native memory at `source` into `destination` from `start`.
+			unsafe Copy<T : numeric>(void* source, T[] destination, i32 start, i32 length)
+			{
+				T* from = (T*)source;
+				loop (i32 i = 0..length)
+					destination[start + i] = from[i];
+			}
+
+			/// The size of a `T` in bytes (as C sees it).
+			SizeOf<T>() : i32 => (i32)sizeof(T);
+	}
+
+	/// Native memory blocks (not seen by the collector).
+	public static class NativeMemory
+	{
+		public:
+			/// `bytes` of native memory, zeroed (Free gives it back).
+			unsafe Alloc(u64 bytes) : void* => CStrings.Allocate((i64)bytes);
+
+			/// `count` elements of `size` bytes, zeroed.
+			unsafe AllocZeroed(u64 count, u64 size) : void* => CStrings.Allocate((i64)(count * size));
+
+			unsafe Free(void* block) { CStrings.Release((u8*)block); }
+
+			/// Copies `bytes` bytes from `source` to `destination` (the blocks do not overlap).
+			unsafe Copy(void* source, void* destination, u64 bytes)
+			{
+				u8* from = (u8*)source;
+				u8* to = (u8*)destination;
+				loop (u64 i = 0; i < bytes; i++)
+					to[i] = from[i];
+			}
+
+			/// Sets `bytes` bytes at `block` to `value`.
+			unsafe Fill(void* block, u64 bytes, u8 value)
+			{
+				u8* at = (u8*)block;
+				loop (u64 i = 0; i < bytes; i++)
+					at[i] = value;
+			}
+
+			unsafe Clear(void* block, u64 bytes) { Fill(block, bytes, 0); }
+	}
+
+	/// How the fields of a `value` are placed in memory.
+	public enum Layout
+	{
+		/// One after another in the order they are written, each at its own alignment (packed down to `Pack` when given).
+		Sequential,
+		/// Each where its `[FieldOffset(n)]` says: fields may overlap (a C union is every field at offset 0).
+		Explicit,
+	}
+
+	/// `[ValueLayout(Layout.Explicit, Size = 128)]`, `[ValueLayout(Layout.Sequential, Pack = 1)]` on a `value`: its
+	/// fields where C would put them, for structs and unions that cross to C by pointer. The fields hold numbers, bools,
+	/// pointers, `func*`, inline arrays and other such values (no objects); reading or writing one is unsafe memory
+	/// access, so the value is meant for interop.
+	public final class ValueLayoutAttribute : Attribute
+	{
+		public:
+			/// Sequential or explicit.
+			Layout Kind;
+			/// The largest alignment a field gets (1, 2, 4, 8 or 16; 0: each field's own).
+			i32 Pack;
+			/// The value's size in bytes when it must be larger than its fields (0: what the fields need).
+			i32 Size;
+
+			new(Layout kind) { Kind = kind; }
+	}
+
+	/// `[FieldOffset(n)]` on each field of a `[ValueLayout(Layout.Explicit)]` value: its place in bytes from the start.
+	public final class FieldOffsetAttribute : Attribute
+	{
+		public:
+			/// Bytes from the start of the value.
+			i32 Offset;
+
+			new(i32 offset) { Offset = offset; }
+	}
+}

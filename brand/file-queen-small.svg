@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFE78A"/>
+      <stop offset="0.55" stop-color="#F2B92A"/>
+      <stop offset="1" stop-color="#C98A10"/>
+    </linearGradient>
+    <linearGradient id="band" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7C843"/>
+      <stop offset="1" stop-color="#B57A08"/>
+    </linearGradient>
+    <radialGradient id="pearl" cx="0.35" cy="0.35" r="0.7">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.5" stop-color="#FFF1C4"/>
+      <stop offset="1" stop-color="#E0B44A"/>
+    </radialGradient>
+    <radialGradient id="ruby" cx="0.35" cy="0.3" r="0.75">
+      <stop offset="0" stop-color="#FF7A90"/>
+      <stop offset="0.45" stop-color="#DC143C"/>
+      <stop offset="1" stop-color="#8E0B26"/>
+    </radialGradient>
+    <radialGradient id="emerald" cx="0.35" cy="0.3" r="0.75">
+      <stop offset="0" stop-color="#B8F59A"/>
+      <stop offset="0.45" stop-color="#2E9E44"/>
+      <stop offset="1" stop-color="#145A26"/>
+    </radialGradient>
+  </defs>
+  <ellipse cx="128" cy="226" rx="96" ry="9" fill="#000000" opacity="0.16"/>
+  <path d="M38 182 L26 78 L84 132 L128 52 L172 132 L230 78 L218 182 Z" fill="url(#gold)" stroke="#8A5A06" stroke-width="6" stroke-linejoin="round"/>
+  <path d="M42 170 L34 96 L80 140 M128 66 L96 126" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.45"/>
+  <path d="M34 176 Q128 160 222 176 L222 214 Q128 198 34 214 Z" fill="url(#band)" stroke="#8A5A06" stroke-width="6" stroke-linejoin="round"/>
+  <path d="M44 182 Q128 168 212 182" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" fill="none" opacity="0.4"/>
+  <ellipse cx="128" cy="190" rx="16" ry="13" fill="url(#ruby)" stroke="#7A4E04" stroke-width="3"/>
+  <ellipse cx="76" cy="195" rx="10" ry="9" fill="url(#emerald)" stroke="#7A4E04" stroke-width="3"/>
+  <ellipse cx="180" cy="195" rx="10" ry="9" fill="url(#emerald)" stroke="#7A4E04" stroke-width="3"/>
+  <circle cx="26" cy="72" r="14" fill="url(#pearl)" stroke="#8A5A06" stroke-width="4"/><circle cx="128" cy="44" r="16" fill="url(#pearl)" stroke="#8A5A06" stroke-width="4"/><circle cx="230" cy="72" r="14" fill="url(#pearl)" stroke="#8A5A06" stroke-width="4"/>
+  <circle cx="122" cy="185" r="3.5" fill="#FFFFFF" opacity="0.8"/>
+</svg>

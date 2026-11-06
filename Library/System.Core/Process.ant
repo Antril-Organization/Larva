@@ -1,0 +1,97 @@
+// Other programs: Process.Start runs one with its standard output captured (a stream to read it from), WaitForExit gives
+// its exit code; Process.Run does all of that and returns the output as text. The command line is given as the program
+// and one argument string, quoted as that program expects (Windows passes it as is; elsewhere `/bin/sh -c` splits it).
+// Standard error goes where this program's goes; standard input is this program's.
+
+import System.IO;
+
+into namespace System.Diagnostics
+{
+	/// What a program that ran left: its exit code and what it wrote.
+	public final class ProcessResult
+	{
+		public:
+			i32 ExitCode;
+			str Output;
+
+			new(i32 exitCode, str output)
+			{
+				ExitCode = exitCode;
+				Output = output;
+			}
+	}
+
+	/// A program started by this one.
+	public final class Process
+	{
+		extern("proc.start") StartNative(u16[] command, u16[] arguments) : i64;
+		extern("proc.wait") WaitNative(i64 handle) : i64;
+		extern("process.run") RunCommand(u16[] command) : i64;
+
+		i64 handle;
+		HandleStream output;
+		i32 exitCode;
+		bool exited;
+
+		new(i64 handle)
+		{
+			this.handle = handle;
+			output = new HandleStream(handle, "process", true, false);
+			exitCode = -1;
+		}
+
+		public:
+			/// Runs a command line through the system's shell, sharing this program's console: its exit code.
+			static Run(str command) : i32 => (i32)RunCommand(Unicode.ToUtf16(command));
+
+			/// Starts `command` with `arguments`; its standard output is `Output`.
+			static Start(str command, str arguments) : Process
+			{
+				i64 handle = StartNative(Unicode.ToUtf16(command), Unicode.ToUtf16(arguments));
+				if (handle < 0)
+					throw new IOError("cannot start " + command);
+				return new Process(handle);
+			}
+
+			/// Runs `command` to the end: its exit code and everything it wrote to standard output.
+			static Run(str command, str arguments) : ProcessResult
+			{
+				Process process = Start(command, arguments);
+				str output = process.ReadAll();
+				return new ProcessResult(process.WaitForExit(), output);
+			}
+
+			/// What the program writes to standard output (reads block until it writes or ends).
+			HandleStream Output { get => output; }
+
+			/// All the output until the program closes it, as text.
+			ReadAll() : str
+			{
+				StringBuilder text = new StringBuilder();
+				u8[] buffer = new u8[4096];
+				loop (true)
+				{
+					i32 n = output.Read(buffer, 0, 4096);
+					if (n <= 0)
+						break;
+					u8[] got = new u8[n];
+					Array.Copy(buffer, 0, got, 0, n);
+					text.Append(new String<u8>(got));
+				}
+				return text.ToString();
+			}
+
+			/// Waits for the program to end: its exit code (the output stream is closed with it).
+			WaitForExit() : i32
+			{
+				if (!exited)
+				{
+					exitCode = (i32)WaitNative(handle);
+					exited = true;
+				}
+				return exitCode;
+			}
+
+			i32 ExitCode { get => WaitForExit(); }
+	}
+}

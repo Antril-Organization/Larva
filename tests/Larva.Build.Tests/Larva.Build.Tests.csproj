@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Project files (.queen) and Hive packages: parsing, schema, diagnostics, packing, signing, registries and installs. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Larva.Build\Larva.Build.csproj" />
+    <ProjectReference Include="..\..\Hive.Core\Hive.Core.csproj" />
+    <ProjectReference Include="..\..\Larva.IR\Larva.IR.csproj" />
+  </ItemGroup>
+
+</Project>

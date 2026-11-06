@@ -1,0 +1,624 @@
+// Operations on arrays: copying, filling, searching and sorting (introsort: quicksort with a median of three, insertion
+// sort for short ranges, heapsort when the recursion goes too deep).
+
+into namespace System
+{
+	public static class Array
+	{
+		/// From how many integers a sort goes by bytes (below, the passes over the counts cost more than comparing).
+		const i32 RadixFrom = 1024;
+
+		/// Insertion sort of items[low..high] (inclusive).
+		static InsertionSort<T : IComparable<T>>(T[] items, i32 low, i32 high)
+		{
+			loop (i32 i = low + 1..=high)
+			{
+				T item = items[i];
+				i32 j = i - 1;
+				loop (j >= low && items[j].CompareTo(item) > 0)
+				{
+					items[j + 1] = items[j];
+					j--;
+				}
+				items[j + 1] = item;
+			}
+		}
+
+		static Swap<T>(T[] items, i32 a, i32 b)
+		{
+			T kept = items[a];
+			items[a] = items[b];
+			items[b] = kept;
+		}
+
+		static SiftDown<T : IComparable<T>>(T[] items, i32 low, i32 root, i32 count)
+		{
+			loop (true)
+			{
+				i32 child = 2 * root + 1;
+				if (child >= count)
+					return;
+				if (child + 1 < count && items[low + child].CompareTo(items[low + child + 1]) < 0)
+					child++;
+				if (items[low + root].CompareTo(items[low + child]) >= 0)
+					return;
+				Swap(items, low + root, low + child);
+				root = child;
+			}
+		}
+
+		static HeapSort<T : IComparable<T>>(T[] items, i32 low, i32 high)
+		{
+			i32 count = high - low + 1;
+			i32 i = count / 2 - 1;
+			loop (i >= 0)
+			{
+				SiftDown(items, low, i, count);
+				i--;
+			}
+			i32 end = count - 1;
+			loop (end > 0)
+			{
+				Swap(items, low, low + end);
+				SiftDown(items, low, 0, end);
+				end--;
+			}
+		}
+
+		static IntroSort<T : IComparable<T>>(T[] items, i32 low, i32 high, i32 depth)
+		{
+			loop (high - low > 16)
+			{
+				if (depth == 0)
+				{
+					HeapSort(items, low, high);
+					return;
+				}
+				depth--;
+				// Median of three to items[low], then Hoare partition around it.
+				i32 middle = low + (high - low) / 2;
+				if (items[middle].CompareTo(items[low]) < 0)
+					Swap(items, middle, low);
+				if (items[high].CompareTo(items[low]) < 0)
+					Swap(items, high, low);
+				if (items[high].CompareTo(items[middle]) < 0)
+					Swap(items, high, middle);
+				Swap(items, low, middle);
+				T pivot = items[low];
+				i32 i = low;
+				i32 j = high + 1;
+				loop (true)
+				{
+					do i++; loop (i < high && items[i].CompareTo(pivot) < 0);
+					do j--; loop (items[j].CompareTo(pivot) > 0);
+					if (i >= j)
+						break;
+					Swap(items, i, j);
+				}
+				Swap(items, low, j);
+				// Recurse into the smaller side, loop on the larger.
+				if (j - low < high - j)
+				{
+					IntroSort(items, low, j - 1, depth);
+					low = j + 1;
+				}
+				else
+				{
+					IntroSort(items, j + 1, high, depth);
+					high = j - 1;
+				}
+			}
+			if (high > low)
+				InsertionSort(items, low, high);
+		}
+
+		/// Integers of 32 bits sorted by their bytes, the lowest first (`flip` 128 on the top byte puts the negative ones
+		/// first): each pass counts the bytes and places the items, without comparing them; a pass where every item has
+		/// the same byte is skipped. Both arrays stay where they are meanwhile (an address taken inside one pins it).
+		unsafe static RadixSort32(u32* data, i32 count, u32 flip)
+		{
+			u32[] spare = new u32[count];
+			i32[] counts = new i32[1024];
+			loop (i32 i = 0..count)
+			{
+				u32 x = data[i];
+				counts[0 + (i32)(((x >> 0) & 255u32))] += 1;
+				counts[256 + (i32)(((x >> 8) & 255u32))] += 1;
+				counts[512 + (i32)(((x >> 16) & 255u32))] += 1;
+				counts[768 + (i32)(((x >> 24) & 255u32) ^ flip)] += 1;
+			}
+			u32* from = data;
+			u32* to = &spare[0];
+			bool inSpare = false;
+			loop (i32 pass = 0..4)
+			{
+				i32 row = pass * 256;
+				u32 shift = (u32)(pass * 8);
+				u32 top = pass == 3 ? flip : 0u32;
+				if (counts[row + (i32)(((from[0] >> shift) & 255u32) ^ top)] == count)
+					continue;
+				i32 total = 0;
+				loop (i32 d = 0..256)
+				{
+					i32 c = counts[row + d];
+					counts[row + d] = total;
+					total += c;
+				}
+				loop (i32 i = 0..count)
+				{
+					u32 x = from[i];
+					i32 at = row + (i32)(((x >> shift) & 255u32) ^ top);
+					to[counts[at]] = x;
+					counts[at] += 1;
+				}
+				u32* kept = from;
+				from = to;
+				to = kept;
+				inSpare = !inSpare;
+			}
+			if (inSpare)
+				System.Runtime.InteropServices.Memory.Copy((u8*)data, (u8*)from, (i64)count * 4);
+		}
+
+		/// Integers of 64 bits sorted by their bytes, the lowest first (`flip` 128 on the top byte puts the negative ones
+		/// first): each pass counts the bytes and places the items, without comparing them; a pass where every item has
+		/// the same byte is skipped. Both arrays stay where they are meanwhile (an address taken inside one pins it).
+		unsafe static RadixSort64(u64* data, i32 count, u64 flip)
+		{
+			u64[] spare = new u64[count];
+			i32[] counts = new i32[2048];
+			loop (i32 i = 0..count)
+			{
+				u64 x = data[i];
+				counts[0 + (i32)(((x >> 0) & 255u64))] += 1;
+				counts[256 + (i32)(((x >> 8) & 255u64))] += 1;
+				counts[512 + (i32)(((x >> 16) & 255u64))] += 1;
+				counts[768 + (i32)(((x >> 24) & 255u64))] += 1;
+				counts[1024 + (i32)(((x >> 32) & 255u64))] += 1;
+				counts[1280 + (i32)(((x >> 40) & 255u64))] += 1;
+				counts[1536 + (i32)(((x >> 48) & 255u64))] += 1;
+				counts[1792 + (i32)(((x >> 56) & 255u64) ^ flip)] += 1;
+			}
+			u64* from = data;
+			u64* to = &spare[0];
+			bool inSpare = false;
+			loop (i32 pass = 0..8)
+			{
+				i32 row = pass * 256;
+				u64 shift = (u64)(pass * 8);
+				u64 top = pass == 7 ? flip : 0u64;
+				if (counts[row + (i32)(((from[0] >> shift) & 255u64) ^ top)] == count)
+					continue;
+				i32 total = 0;
+				loop (i32 d = 0..256)
+				{
+					i32 c = counts[row + d];
+					counts[row + d] = total;
+					total += c;
+				}
+				loop (i32 i = 0..count)
+				{
+					u64 x = from[i];
+					i32 at = row + (i32)(((x >> shift) & 255u64) ^ top);
+					to[counts[at]] = x;
+					counts[at] += 1;
+				}
+				u64* kept = from;
+				from = to;
+				to = kept;
+				inSpare = !inSpare;
+			}
+			if (inSpare)
+				System.Runtime.InteropServices.Memory.Copy((u8*)data, (u8*)from, (i64)count * 8);
+		}
+
+		// The same introsort, ordered by a comparison function (negative: a before b; zero: equal; positive: after).
+
+		static InsertionSortBy<T>(T[] items, i32 low, i32 high, func<T, T> : i32 order)
+		{
+			loop (i32 i = low + 1..=high)
+			{
+				T item = items[i];
+				i32 j = i - 1;
+				loop (j >= low && order(items[j], item) > 0)
+				{
+					items[j + 1] = items[j];
+					j--;
+				}
+				items[j + 1] = item;
+			}
+		}
+
+		static SiftDownBy<T>(T[] items, i32 low, i32 root, i32 count, func<T, T> : i32 order)
+		{
+			loop (true)
+			{
+				i32 child = 2 * root + 1;
+				if (child >= count)
+					return;
+				if (child + 1 < count && order(items[low + child], items[low + child + 1]) < 0)
+					child++;
+				if (order(items[low + root], items[low + child]) >= 0)
+					return;
+				Swap(items, low + root, low + child);
+				root = child;
+			}
+		}
+
+		static HeapSortBy<T>(T[] items, i32 low, i32 high, func<T, T> : i32 order)
+		{
+			i32 count = high - low + 1;
+			i32 i = count / 2 - 1;
+			loop (i >= 0)
+			{
+				SiftDownBy(items, low, i, count, order);
+				i--;
+			}
+			i32 end = count - 1;
+			loop (end > 0)
+			{
+				Swap(items, low, low + end);
+				SiftDownBy(items, low, 0, end, order);
+				end--;
+			}
+		}
+
+		static IntroSortBy<T>(T[] items, i32 low, i32 high, i32 depth, func<T, T> : i32 order)
+		{
+			loop (high - low > 16)
+			{
+				if (depth == 0)
+				{
+					HeapSortBy(items, low, high, order);
+					return;
+				}
+				depth--;
+				i32 middle = low + (high - low) / 2;
+				if (order(items[middle], items[low]) < 0)
+					Swap(items, middle, low);
+				if (order(items[high], items[low]) < 0)
+					Swap(items, high, low);
+				if (order(items[high], items[middle]) < 0)
+					Swap(items, high, middle);
+				Swap(items, low, middle);
+				T pivot = items[low];
+				i32 i = low;
+				i32 j = high + 1;
+				loop (true)
+				{
+					do i++; loop (i < high && order(items[i], pivot) < 0);
+					do j--; loop (order(items[j], pivot) > 0);
+					if (i >= j)
+						break;
+					Swap(items, i, j);
+				}
+				Swap(items, low, j);
+				if (j - low < high - j)
+				{
+					IntroSortBy(items, low, j - 1, depth, order);
+					low = j + 1;
+				}
+				else
+				{
+					IntroSortBy(items, j + 1, high, depth, order);
+					high = j - 1;
+				}
+			}
+			if (high > low)
+				InsertionSortBy(items, low, high, order);
+		}
+
+		static Depth(i32 count) : i32
+		{
+			i32 depth = 0;
+			i32 n = count;
+			loop (n > 0)
+			{
+				depth += 2;
+				n = n / 2;
+			}
+			return depth;
+		}
+
+		public:
+			/// The total of a run of numbers (0 when empty).
+			Sum<T : number>(T[] items, i32 start, i32 count) : T
+			{
+				T total = T.Zero;
+				loop (i32 i = start..start + count)
+					total += items[i];
+				return total;
+			}
+			Sum<T : number>(T[] items) : T => Sum(items, 0, items.Length);
+
+			/// The smallest of a run of numbers; the run must not be empty.
+			Min<T : number>(T[] items, i32 start, i32 count) : T
+			{
+				T best = items[start];
+				loop (i32 i = start + 1..start + count)
+				{
+					if (items[i] < best)
+						best = items[i];
+				}
+				return best;
+			}
+			Min<T : number>(T[] items) : T => Min(items, 0, items.Length);
+
+			/// The largest of a run of numbers; the run must not be empty.
+			Max<T : number>(T[] items, i32 start, i32 count) : T
+			{
+				T best = items[start];
+				loop (i32 i = start + 1..start + count)
+				{
+					if (best < items[i])
+						best = items[i];
+				}
+				return best;
+			}
+			Max<T : number>(T[] items) : T => Max(items, 0, items.Length);
+
+			Average<T : number>(T[] items) : f64 => (f64)Sum(items) / items.Length;
+
+			/// Whether `a` and `b` hold the same bytes (`==` on arrays compares identity); one comparison in memory.
+			Equals(u8[] a, u8[] b) : bool
+			{
+				i32 length = a.Length;
+				if (length != b.Length)
+					return false;
+				if (length == 0)
+					return true;
+				unsafe
+				{
+					return System.Runtime.InteropServices.Memory.Compare(&a[0], &b[0], length) == 0;
+				}
+			}
+
+			/// Copies `length` items from source[sourceIndex..] to target[targetIndex..] (overlapping ranges too).
+			Copy<T>(T[] source, i32 sourceIndex, T[] target, i32 targetIndex, i32 length)
+			{
+				if (length < 0 || sourceIndex < 0 || targetIndex < 0 || sourceIndex + length > source.Length || targetIndex + length > target.Length)
+					throw new ArgumentError("Array.Copy: the range is outside an array");
+				if (sourceIndex < targetIndex)
+				{
+					i32 i = length - 1;
+					loop (i >= 0)
+					{
+						target[targetIndex + i] = source[sourceIndex + i];
+						i--;
+					}
+				}
+				else
+				{
+					loop (i32 i = 0..length)
+						target[targetIndex + i] = source[sourceIndex + i];
+				}
+			}
+
+			/// A new array with the first `length` items (and default values past the end of `items`).
+			Resize<T>(T[] items, i32 length) : T[]
+			{
+				T[] resized = new T[length];
+				Copy(items, 0, resized, 0, items.Length < length ? items.Length : length);
+				return resized;
+			}
+
+			Fill<T>(T[] items, T value)
+			{
+				loop (i32 i = 0..items.Length)
+					items[i] = value;
+			}
+
+			Reverse<T>(T[] items)
+			{
+				i32 i = 0;
+				i32 j = items.Length - 1;
+				loop (i < j)
+				{
+					Swap(items, i, j);
+					i++;
+					j--;
+				}
+			}
+
+			/// Where `value` first is (by Equals), or -1.
+			IndexOf<T : IHashable<T>>(T[] items, T value) : i32
+			{
+				loop (i32 i = 0..items.Length)
+				{
+					if (items[i].Equals(value))
+						return i;
+				}
+				return -1;
+			}
+
+			/// Sorts `count` integers from `start`: by their bytes when there are enough of them (no comparisons to mispredict).
+			Sort(i32[] items, i32 start, i32 count)
+			{
+				if (count >= RadixFrom && start >= 0 && count <= items.Length - start)
+				{
+					unsafe
+					{
+						RadixSort32((u32*)(u8*)&items[start], count, 128u32);
+					}
+					return;
+				}
+				Sort<i32>(items, start, count);
+			}
+
+			Sort(i32[] items) { Sort(items, 0, items.Length); }
+
+			/// Sorts `count` integers from `start`: by their bytes when there are enough of them (no comparisons to mispredict).
+			Sort(u32[] items, i32 start, i32 count)
+			{
+				if (count >= RadixFrom && start >= 0 && count <= items.Length - start)
+				{
+					unsafe
+					{
+						RadixSort32((u32*)(u8*)&items[start], count, 0u32);
+					}
+					return;
+				}
+				Sort<u32>(items, start, count);
+			}
+
+			Sort(u32[] items) { Sort(items, 0, items.Length); }
+
+			/// Sorts `count` integers from `start`: by their bytes when there are enough of them (no comparisons to mispredict).
+			Sort(i64[] items, i32 start, i32 count)
+			{
+				if (count >= RadixFrom && start >= 0 && count <= items.Length - start)
+				{
+					unsafe
+					{
+						RadixSort64((u64*)(u8*)&items[start], count, 128u64);
+					}
+					return;
+				}
+				Sort<i64>(items, start, count);
+			}
+
+			Sort(i64[] items) { Sort(items, 0, items.Length); }
+
+			/// Sorts `count` integers from `start`: by their bytes when there are enough of them (no comparisons to mispredict).
+			Sort(u64[] items, i32 start, i32 count)
+			{
+				if (count >= RadixFrom && start >= 0 && count <= items.Length - start)
+				{
+					unsafe
+					{
+						RadixSort64((u64*)(u8*)&items[start], count, 0u64);
+					}
+					return;
+				}
+				Sort<u64>(items, start, count);
+			}
+
+			Sort(u64[] items) { Sort(items, 0, items.Length); }
+
+			/// Sorts the items in place (by CompareTo; not stable).
+			Sort<T : IComparable<T>>(T[] items) { Sort(items, 0, items.Length); }
+
+			/// Sorts `count` items from `start`.
+			Sort<T : IComparable<T>>(T[] items, i32 start, i32 count)
+			{
+				if (count < 2)
+					return;
+				i32 depth = 0;
+				i32 n = count;
+				loop (n > 0)
+				{
+					depth += 2;
+					n = n / 2;
+				}
+				IntroSort(items, start, start + count - 1, depth);
+			}
+
+			/// Sorts the items in place by `order` (negative: a goes first; not stable).
+			Sort<T>(T[] items, func<T, T> : i32 order) { Sort(items, 0, items.Length, order); }
+
+			/// Sorts `count` items from `start` by `order`.
+			Sort<T>(T[] items, i32 start, i32 count, func<T, T> : i32 order)
+			{
+				if (count < 2)
+					return;
+				IntroSortBy(items, start, start + count - 1, Depth(count), order);
+			}
+
+			/// Where the first item that `match` accepts is, or -1.
+			FindIndex<T>(T[] items, func<T> : bool match) : i32
+			{
+				loop (i32 i = 0..items.Length)
+				{
+					if (match(items[i]))
+						return i;
+				}
+				return -1;
+			}
+
+			/// Whether some item is accepted by `match`.
+			Exists<T>(T[] items, func<T> : bool match) : bool => FindIndex(items, match) >= 0;
+
+			/// Whether every item is accepted by `match`.
+			TrueForAll<T>(T[] items, func<T> : bool match) : bool
+			{
+				loop (i32 i = 0..items.Length)
+				{
+					if (!match(items[i]))
+						return false;
+				}
+				return true;
+			}
+
+			/// Runs `action` on each item, in order.
+			ForEach<T>(T[] items, func<T> action)
+			{
+				loop (i32 i = 0..items.Length)
+					action(items[i]);
+			}
+
+			/// A new array with `convert` of each item.
+			ConvertAll<T, R>(T[] items, func<T> : R convert) : R[]
+			{
+				R[] made = new R[items.Length];
+				loop (i32 i = 0..items.Length)
+					made[i] = convert(items[i]);
+				return made;
+			}
+
+			/// Where `value` is in sorted `items`, or the bitwise complement of where it would go.
+			BinarySearch<T : IComparable<T>>(T[] items, T value) : i32
+			{
+				i32 low = 0;
+				i32 high = items.Length - 1;
+				loop (low <= high)
+				{
+					i32 middle = low + (high - low) / 2;
+					i32 order = items[middle].CompareTo(value);
+					if (order == 0)
+						return middle;
+					if (order < 0)
+						low = middle + 1;
+					else
+						high = middle - 1;
+				}
+				return ~low;
+			}
+	}
+
+	/// What List<T> offers when its items can be compared or tested for equality.
+	public static class Lists
+	{
+		public:
+			/// The total of a list of numbers (0 when empty).
+			Sum<T : number>(List<T> list) : T => Array.Sum(list.Items(), 0, list.Count);
+			/// The smallest and largest; the list must not be empty.
+			Min<T : number>(List<T> list) : T => Array.Min(list.Items(), 0, list.Count);
+			Max<T : number>(List<T> list) : T => Array.Max(list.Items(), 0, list.Count);
+			Average<T : number>(List<T> list) : f64 => (f64)Sum(list) / list.Count;
+
+			Sort<T : IComparable<T>>(List<T> list) { Array.Sort(list.Items(), 0, list.Count); }
+
+			IndexOf<T : IHashable<T>>(List<T> list, T value) : i32
+			{
+				T[] items = list.Items();
+				loop (i32 i = 0..list.Count)
+				{
+					if (items[i].Equals(value))
+						return i;
+				}
+				return -1;
+			}
+
+			Contains<T : IHashable<T>>(List<T> list, T value) : bool => IndexOf(list, value) >= 0;
+
+			/// Takes out the first item equal to `value`; false when there is none.
+			Remove<T : IHashable<T>>(List<T> list, T value) : bool
+			{
+				i32 at = IndexOf(list, value);
+				if (at < 0)
+					return false;
+				list.RemoveAt(at);
+				return true;
+			}
+	}
+}

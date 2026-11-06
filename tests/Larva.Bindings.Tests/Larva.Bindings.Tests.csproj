@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Native library bindings: export tables (PE, ELF), .bind descriptions, C headers and the HIR they become. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Larva.Bindings\Larva.Bindings.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir\Larva.Hir.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir.Services\Larva.Hir.Services.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir.Lowering\Larva.Hir.Lowering.csproj" />
+    <ProjectReference Include="..\..\Larva.Build\Larva.Build.csproj" />
+    <ProjectReference Include="..\..\Larva.IR\Larva.IR.csproj" />
+    <ProjectReference Include="..\..\Larva.IL\Larva.IL.csproj" />
+    <ProjectReference Include="..\..\Larva.Runtime\Larva.Runtime.csproj" />
+    <ProjectReference Include="..\..\Larva.Native\Larva.Native.csproj" />
+    <ProjectReference Include="..\..\Larva.X64\Larva.X64.csproj" />
+    <ProjectReference Include="..\..\Larva.Llvm\Larva.Llvm.csproj" />
+    <ProjectReference Include="..\..\Larva.Driver\Larva.Driver.csproj" />
+  </ItemGroup>
+
+</Project>

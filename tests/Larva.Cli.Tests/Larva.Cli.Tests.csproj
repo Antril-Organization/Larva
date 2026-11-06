@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The larva command line, run as a process: languages from a registry (publish, approve, search, install, update, remove, trust). -->
+
+  <ItemGroup>
+    <!-- Built first; the tests run its larva.dll with dotnet. -->
+    <ProjectReference Include="..\..\Larva.Cli\Larva.Cli.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

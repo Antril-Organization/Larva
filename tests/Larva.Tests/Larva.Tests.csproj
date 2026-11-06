@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The IR, IL, VM, memory and GC modes, generics, reflection, runtime features, the linker and the back ends (LLVM, x64,
+       WebAssembly, native executables), on modules built in code. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Larva.IL\Larva.IL.csproj" />
+    <ProjectReference Include="..\..\Larva.IR\Larva.IR.csproj" />
+    <ProjectReference Include="..\..\Larva.Runtime\Larva.Runtime.csproj" />
+    <ProjectReference Include="..\..\Larva.Native\Larva.Native.csproj" />
+    <ProjectReference Include="..\..\Larva.Llvm\Larva.Llvm.csproj" />
+    <ProjectReference Include="..\..\Larva.X64\Larva.X64.csproj" />
+    <ProjectReference Include="..\..\Larva.Wasm\Larva.Wasm.csproj" />
+    <ProjectReference Include="..\..\Larva.Driver\Larva.Driver.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir\Larva.Hir.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir.Lowering\Larva.Hir.Lowering.csproj" />
+    <ProjectReference Include="..\..\Larva.Build\Larva.Build.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The stand-in for LLVM's `opt` the Polly test runs (built first, not referenced: see Repository.FakeOpt). -->
+    <ProjectReference Include="..\FakeOpt\FakeOpt.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

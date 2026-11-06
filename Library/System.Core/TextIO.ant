@@ -1,0 +1,452 @@
+// Text on streams (System.IO): TextWriter and TextReader are the bases; StreamWriter and StreamReader write and read
+// UTF-8 through a stream, StringWriter and StringReader through a str. Readers give code points (-1 at the end).
+
+import System.Text;
+
+into namespace System.IO
+{
+	/// Writes text. A writer overrides Write(str) (and Write(u16) if it can do better than a str per character).
+	public base class TextWriter
+	{
+		public:
+			/// What WriteLine ends a line with.
+			str NewLine { get; set; }
+
+			new() { NewLine = "\n"; }
+
+			virtual Write(str text) { }
+
+			/// One UTF-16 code unit (a character literal).
+			virtual Write(u16 c) { Write(Unicode.ToString((u32)c)); }
+
+			// Each primitive as its text (u16 above is a character: a character literal is one).
+			Write(i8 value) { Write(value.ToString()); }
+			Write(i16 value) { Write(value.ToString()); }
+			Write(i32 value) { Write(value.ToString()); }
+			Write(i64 value) { Write(value.ToString()); }
+			Write(i128 value) { Write(value.ToString()); }
+			Write(i256 value) { Write(value.ToString()); }
+			Write(u8 value) { Write(value.ToString()); }
+			Write(u32 value) { Write(value.ToString()); }
+			Write(u64 value) { Write(value.ToString()); }
+			Write(u128 value) { Write(value.ToString()); }
+			Write(u256 value) { Write(value.ToString()); }
+			Write(f16 value) { Write(value.ToString()); }
+			Write(f32 value) { Write(value.ToString()); }
+			Write(f64 value) { Write(value.ToString()); }
+			Write(f128 value) { Write(value.ToString()); }
+			Write(f256 value) { Write(value.ToString()); }
+			Write(bool value) { Write(value ? "true" : "false"); }
+
+			WriteLine() { Write(NewLine); }
+
+			WriteLine(str text)
+			{
+				Write(text);
+				Write(NewLine);
+			}
+
+			WriteLine(i8 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(i16 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(i32 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(i64 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(i128 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(i256 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(u8 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(u32 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(u64 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(u128 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(u256 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(f16 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(f32 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(f64 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(f128 value) { Write(value.ToString()); Write(NewLine); }
+			WriteLine(f256 value) { Write(value.ToString()); Write(NewLine); }
+
+			WriteLine(bool value)
+			{
+				Write(value ? "true" : "false");
+				Write(NewLine);
+			}
+
+			virtual Flush() { }
+
+			/// Flushes and closes what it writes to.
+			virtual Close() { Flush(); }
+	}
+
+	/// Text written to a stream as UTF-8, through a buffer.
+	public class StreamWriter : TextWriter
+	{
+		Stream stream;
+		u8[] buffer;
+		i32 used;
+
+		/// Writes what is buffered (without flushing the stream).
+		Drain()
+		{
+			if (used > 0)
+			{
+				stream.Write(buffer, 0, used);
+				used = 0;
+			}
+		}
+
+		public:
+			/// Sends the text to the stream after every Write.
+			bool AutoFlush { get; set; }
+
+			new(Stream stream) : (stream, 8192) { }
+
+			new(Stream stream, i32 bufferSize)
+			{
+				if (!stream.CanWrite)
+					throw new ArgumentError("StreamWriter: the stream cannot be written");
+				this.stream = stream;
+				buffer = new u8[bufferSize < 16 ? 16 : bufferSize];
+			}
+
+			/// A new file (or the file emptied).
+			new(str path) : (path, false) { }
+
+			/// A file written from its end when `append`, else emptied first.
+			new(str path, bool append) : (new FileStream(path, append ? FileMode.Append : FileMode.Create, FileAccess.Write)) { }
+
+			/// The stream it writes to.
+			Stream BaseStream { get => stream; }
+
+			override Write(str text)
+			{
+				u8[] bytes = text.Units();
+				i32 count = bytes.Length;
+				if (used + count > buffer.Length)
+				{
+					Drain();
+					if (count > buffer.Length)
+					{
+						stream.Write(bytes, 0, count);
+						if (AutoFlush)
+							stream.Flush();
+						return;
+					}
+				}
+				Array.Copy(bytes, 0, buffer, used, count);
+				used += count;
+				if (AutoFlush)
+					Flush();
+			}
+
+			override Write(u16 c)
+			{
+				if (c < 0x80)
+				{
+					if (used == buffer.Length)
+						Drain();
+					buffer[used] = (u8)c;
+					used++;
+					if (AutoFlush)
+						Flush();
+					return;
+				}
+				Write(Unicode.ToString((u32)c));
+			}
+
+			override Flush()
+			{
+				Drain();
+				stream.Flush();
+			}
+
+			override Close()
+			{
+				Drain();
+				stream.Close();
+			}
+	}
+
+	/// Text gathered into a StringBuilder.
+	public class StringWriter : TextWriter
+	{
+		StringBuilder builder;
+
+		public:
+			new() { builder = new StringBuilder(); }
+
+			new(StringBuilder builder) { this.builder = builder; }
+
+			override Write(str text) { builder.Append(text); }
+
+			override Write(u16 c) { builder.Append(c); }
+
+			GetStringBuilder() : StringBuilder => builder;
+
+			override ToString() : str => builder.ToString();
+	}
+
+	/// Reads text: code points one at a time, lines, or all of it.
+	public base class TextReader
+	{
+		public:
+			/// The next code point without taking it, or -1 at the end.
+			virtual Peek() : i32 => -1;
+
+			/// The next code point, or -1 at the end.
+			virtual Read() : i32 => -1;
+
+			/// The next line without its line break ("\n" or "\r\n"), or null at the end.
+			virtual ReadLine() : str?
+			{
+				i32 c = Read();
+				if (c < 0)
+					return null;
+				StringBuilder line = new StringBuilder();
+				loop (c >= 0 && c != 10)
+				{
+					if (c != 13 || Peek() != 10)
+						line.AppendCodePoint((u32)c);
+					c = Read();
+				}
+				return line.ToString();
+			}
+
+			/// Everything left.
+			virtual ReadToEnd() : str
+			{
+				StringBuilder all = new StringBuilder();
+				i32 c = Read();
+				loop (c >= 0)
+				{
+					all.AppendCodePoint((u32)c);
+					c = Read();
+				}
+				return all.ToString();
+			}
+
+			virtual Close() { }
+	}
+
+	/// Text read from a stream as UTF-8 (a byte order mark at the start is skipped), through a buffer.
+	public class StreamReader : TextReader
+	{
+		Stream stream;
+		u8[] buffer;
+		i32 at;
+		i32 end;
+		bool started;
+		/// A line that does not fit in what is buffered gathers here.
+		u8[] pending;
+		i32 pendingLength;
+
+		/// Whether there are bytes to read (reading more when the buffer is used up).
+		Fill() : bool
+		{
+			if (at < end)
+				return true;
+			at = 0;
+			end = stream.Read(buffer, 0, buffer.Length);
+			if (!started)
+			{
+				started = true;
+				if (end >= 3 && buffer[0] == 0xEF && buffer[1] == 0xBB && buffer[2] == 0xBF)
+					at = 3;
+			}
+			return at < end;
+		}
+
+		Keep(i32 from, i32 count)
+		{
+			if (pendingLength + count > pending.Length)
+			{
+				i32 capacity = pending.Length * 2;
+				if (capacity < pendingLength + count)
+					capacity = pendingLength + count;
+				u8[] grown = new u8[capacity];
+				Array.Copy(pending, 0, grown, 0, pendingLength);
+				pending = grown;
+			}
+			Array.Copy(buffer, from, pending, pendingLength, count);
+			pendingLength += count;
+		}
+
+		/// The code point starting at the next byte, taken when `take`.
+		Decode(bool take) : i32
+		{
+			if (!Fill())
+				return -1;
+			i32 b = buffer[at];
+			if (b < 0x80)
+			{
+				if (take)
+					at++;
+				return b;
+			}
+			i32 extra = b >= 0xF5 ? 0 : b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC2 ? 1 : 0;
+			if (extra == 0)
+			{
+				if (take)
+					at++;
+				return 0xFFFD;
+			}
+			if (at + extra >= end)
+			{
+				// The sequence goes past the buffer: move what is left to its start and read more.
+				i32 left = end - at;
+				Array.Copy(buffer, at, buffer, 0, left);
+				at = 0;
+				end = left;
+				i32 read = stream.Read(buffer, end, buffer.Length - end);
+				loop (read > 0 && end + read <= extra)
+				{
+					end += read;
+					read = stream.Read(buffer, end, buffer.Length - end);
+				}
+				end += read;
+				if (extra >= end)
+				{
+					if (take)
+						at++;
+					return 0xFFFD;
+				}
+			}
+			i32 point = b & (extra == 1 ? 0x1F : extra == 2 ? 0x0F : 0x07);
+			loop (i32 k = 1..=extra)
+			{
+				i32 next = buffer[at + k];
+				if ((next & 0xC0) != 0x80)
+				{
+					if (take)
+						at++;
+					return 0xFFFD;
+				}
+				point = point << 6 | next & 0x3F;
+			}
+			if (take)
+				at += extra + 1;
+			return point;
+		}
+
+		public:
+			new(Stream stream) : (stream, 4096) { }
+
+			new(Stream stream, i32 bufferSize)
+			{
+				if (!stream.CanRead)
+					throw new ArgumentError("StreamReader: the stream cannot be read");
+				this.stream = stream;
+				buffer = new u8[bufferSize < 16 ? 16 : bufferSize];
+				pending = new u8[0];
+			}
+
+			new(str path) : (new FileStream(path, FileMode.Open, FileAccess.Read)) { }
+
+			/// The stream it reads from.
+			Stream BaseStream { get => stream; }
+
+			/// Whether everything has been read.
+			bool EndOfStream { get => !Fill(); }
+
+			override Peek() : i32 => Decode(false);
+
+			override Read() : i32 => Decode(true);
+
+			override ReadLine() : str?
+			{
+				if (!Fill())
+					return null;
+				pendingLength = 0;
+				loop (true)
+				{
+					i32 i = at;
+					loop (i < end && buffer[i] != 10)
+						i++;
+					if (i < end)
+					{
+						// The line ends in the buffer.
+						i32 start = at;
+						at = i + 1;
+						if (pendingLength == 0)
+							return Encoding.UTF8.GetString(buffer, start, i > start && buffer[i - 1] == 13 ? i - start - 1 : i - start);
+						Keep(start, i - start);
+						return Encoding.UTF8.GetString(pending, 0, pending[pendingLength - 1] == 13 ? pendingLength - 1 : pendingLength);
+					}
+					Keep(at, end - at);
+					at = end;
+					if (!Fill())
+					{
+						i32 count = pendingLength > 0 && pending[pendingLength - 1] == 13 ? pendingLength - 1 : pendingLength;
+						return Encoding.UTF8.GetString(pending, 0, count);
+					}
+				}
+				return null;
+			}
+
+			override ReadToEnd() : str
+			{
+				pendingLength = 0;
+				loop (Fill())
+				{
+					Keep(at, end - at);
+					at = end;
+				}
+				return Encoding.UTF8.GetString(pending, 0, pendingLength);
+			}
+
+			override Close() { stream.Close(); }
+	}
+
+	/// Text read from a str.
+	public class StringReader : TextReader
+	{
+		u8[] units;
+		i32 at;
+
+		Decode(bool take) : i32
+		{
+			if (at >= units.Length)
+				return -1;
+			i32 b = units[at];
+			if (b < 0x80)
+			{
+				if (take)
+					at++;
+				return b;
+			}
+			i32 extra = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : 1;
+			if (at + extra >= units.Length)
+				extra = units.Length - at - 1;
+			i32 point = b & (extra == 1 ? 0x1F : extra == 2 ? 0x0F : 0x07);
+			loop (i32 k = 1..=extra)
+				point = point << 6 | units[at + k] & 0x3F;
+			if (take)
+				at += extra + 1;
+			return point;
+		}
+
+		public:
+			new(str text) { units = text.Units(); }
+
+			override Peek() : i32 => Decode(false);
+
+			override Read() : i32 => Decode(true);
+
+			override ReadLine() : str?
+			{
+				if (at >= units.Length)
+					return null;
+				i32 i = at;
+				loop (i < units.Length && units[i] != 10)
+					i++;
+				i32 count = i > at && units[i - 1] == 13 ? i - at - 1 : i - at;
+				str line = Encoding.UTF8.GetString(units, at, count);
+				at = i < units.Length ? i + 1 : i;
+				return line;
+			}
+
+			override ReadToEnd() : str
+			{
+				str rest = Encoding.UTF8.GetString(units, at, units.Length - at);
+				at = units.Length;
+				return rest;
+			}
+	}
+}

@@ -1,0 +1,1863 @@
+// Dates and times: TimeSpan (a length of time) and DateTime (a moment on the calendar), both counted in ticks of 100
+// nanoseconds from 0001-01-01. Text is the invariant culture's: English names, MM/dd/yyyy, the 24-hour clock.
+
+into namespace System
+{
+	/// The days of the week, from Sunday (0).
+	public enum DayOfWeek { Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday }
+
+	/// Whose clock a DateTime reads: not said, UTC's, or the local time zone's.
+	public enum DateTimeKind { Unspecified, Utc, Local }
+
+	/// How Parse reads a date. A date with a time zone (Z, GMT, +02:00) becomes local time, unless AdjustToUniversal
+	/// makes it UTC or RoundtripKind keeps a Z as UTC; a date without one is Unspecified, unless AssumeLocal or
+	/// AssumeUniversal say which it is.
+	public bitflag enum DateTimeStyles { None = 0, AdjustToUniversal = 2, AssumeLocal = 32, AssumeUniversal = 64, RoundtripKind = 128 }
+
+	/// A length of time (negative too): ticks of 100 ns. `a + b`, `a - b`, `-a`, `a * 2.5`, `a / 2`, `a / b`, and the
+	/// comparisons work on it; as text it is `[-][d.]hh:mm:ss[.fffffff]`.
+	public value TimeSpan : IHashable<TimeSpan>, IComparable<TimeSpan>
+	{
+		i64 ticks;
+
+		[NoInline]
+		static TooLong() { throw new OverflowError("TimeSpan: the length is too long"); }
+
+		[NoInline]
+		static NotANumber() { throw new ArgumentError("TimeSpan: the length is not a number"); }
+
+		/// `value` units of `scale` ticks, rounded toward zero.
+		static Interval(f64 value, f64 scale) : TimeSpan
+		{
+			if (value != value)
+				NotANumber();
+			f64 count = value * scale;
+			if (count >= 9223372036854775807.0 || count < -9223372036854775808.0)
+			{
+				if (count == 9223372036854775807.0)
+					return new TimeSpan(9223372036854775807);
+				TooLong();
+			}
+			return new TimeSpan((i64)count);
+		}
+
+		/// `value` whole units of `scale` ticks.
+		static Whole(i64 value, i64 scale) : TimeSpan
+		{
+			if (value > 9223372036854775807 / scale || value < (-9223372036854775807 - 1) / scale)
+				TooLong();
+			return new TimeSpan(value * scale);
+		}
+
+		public:
+			static i64 TicksPerMicrosecond { get => 10; }
+			static i64 TicksPerMillisecond { get => 10000; }
+			static i64 TicksPerSecond { get => 10000000; }
+			static i64 TicksPerMinute { get => 600000000; }
+			static i64 TicksPerHour { get => 36000000000; }
+			static i64 TicksPerDay { get => 864000000000; }
+
+			static TimeSpan Zero { get => new TimeSpan(0); }
+			static TimeSpan MaxValue { get => new TimeSpan(9223372036854775807); }
+			static TimeSpan MinValue { get => new TimeSpan(-9223372036854775807 - 1); }
+
+			new(i64 ticks) { this.ticks = ticks; }
+
+			new(i32 hours, i32 minutes, i32 seconds) : (0, hours, minutes, seconds, 0) { }
+
+			new(i32 days, i32 hours, i32 minutes, i32 seconds) : (days, hours, minutes, seconds, 0) { }
+
+			new(i32 days, i32 hours, i32 minutes, i32 seconds, i32 milliseconds)
+			{
+				// Milliseconds in all: within ±2^63 ticks unless the parts are near the i32 limits together.
+				i64 total = (((i64)days * 24 + hours) * 60 + minutes) * 60000 + (i64)seconds * 1000 + milliseconds;
+				if (total > 922337203685477 || total < -922337203685477)
+					TooLong();
+				ticks = total * 10000;
+			}
+
+			i64 Ticks { get => ticks; }
+
+			/// The parts: whole days, then hours (0–23), minutes, seconds, milliseconds, microseconds, nanoseconds of the
+			/// rest (negative for a negative length).
+			i32 Days { get => (i32)(ticks / 864000000000); }
+			i32 Hours { get => (i32)(ticks / 36000000000 % 24); }
+			i32 Minutes { get => (i32)(ticks / 600000000 % 60); }
+			i32 Seconds { get => (i32)(ticks / 10000000 % 60); }
+			i32 Milliseconds { get => (i32)(ticks / 10000 % 1000); }
+			i32 Microseconds { get => (i32)(ticks / 10 % 1000); }
+			i32 Nanoseconds { get => (i32)(ticks % 10) * 100; }
+
+			/// The whole length in one unit.
+			f64 TotalDays { get => (f64)ticks / 864000000000.0; }
+			f64 TotalHours { get => (f64)ticks / 36000000000.0; }
+			f64 TotalMinutes { get => (f64)ticks / 600000000.0; }
+			f64 TotalSeconds { get => (f64)ticks / 10000000.0; }
+			/// (Held to ±922337203685477, as .NET does.)
+			f64 TotalMilliseconds
+			{
+				get
+				{
+					f64 total = (f64)ticks / 10000.0;
+					if (total > 922337203685477.0)
+						return 922337203685477.0;
+					if (total < -922337203685477.0)
+						return -922337203685477.0;
+					return total;
+				}
+			}
+			f64 TotalMicroseconds { get => (f64)ticks / 10.0; }
+			f64 TotalNanoseconds { get => (f64)ticks * 100.0; }
+
+			/// A length in a unit: whole units exactly, fractions rounded toward zero to a tick.
+			static FromDays(i64 days) : TimeSpan => Whole(days, 864000000000);
+			static FromHours(i64 hours) : TimeSpan => Whole(hours, 36000000000);
+			static FromMinutes(i64 minutes) : TimeSpan => Whole(minutes, 600000000);
+			static FromSeconds(i64 seconds) : TimeSpan => Whole(seconds, 10000000);
+			static FromMilliseconds(i64 milliseconds) : TimeSpan => Whole(milliseconds, 10000);
+			static FromMicroseconds(i64 microseconds) : TimeSpan => Whole(microseconds, 10);
+			static FromDays(f64 days) : TimeSpan => Interval(days, 864000000000.0);
+			static FromHours(f64 hours) : TimeSpan => Interval(hours, 36000000000.0);
+			static FromMinutes(f64 minutes) : TimeSpan => Interval(minutes, 600000000.0);
+			static FromSeconds(f64 seconds) : TimeSpan => Interval(seconds, 10000000.0);
+			static FromMilliseconds(f64 milliseconds) : TimeSpan => Interval(milliseconds, 10000.0);
+			static FromMicroseconds(f64 microseconds) : TimeSpan => Interval(microseconds, 10.0);
+			static FromTicks(i64 ticks) : TimeSpan => new TimeSpan(ticks);
+
+			Add(TimeSpan other) : TimeSpan
+			{
+				i64 sum = ticks + other.ticks;
+				// Overflow: both had the same sign and the sum has the other one.
+				if (((ticks ^ sum) & (other.ticks ^ sum)) < 0)
+					TooLong();
+				return new TimeSpan(sum);
+			}
+
+			Subtract(TimeSpan other) : TimeSpan
+			{
+				i64 difference = ticks - other.ticks;
+				if (((ticks ^ other.ticks) & (ticks ^ difference)) < 0)
+					TooLong();
+				return new TimeSpan(difference);
+			}
+
+			Negate() : TimeSpan
+			{
+				if (ticks == -9223372036854775807 - 1)
+					TooLong();
+				return new TimeSpan(-ticks);
+			}
+
+			/// The length without its sign.
+			Duration() : TimeSpan => ticks < 0 ? Negate() : this;
+
+			/// Times a number, and divided by one (to the nearest tick, halves to even).
+			Multiply(f64 factor) : TimeSpan
+			{
+				if (factor != factor)
+					NotANumber();
+				return Interval(Math.Round((f64)ticks * factor), 1.0);
+			}
+
+			Divide(f64 divisor) : TimeSpan
+			{
+				if (divisor != divisor)
+					NotANumber();
+				return Interval(Math.Round((f64)ticks / divisor), 1.0);
+			}
+
+			/// How many times `other` fits in this length.
+			Divide(TimeSpan other) : f64 => (f64)ticks / (f64)other.ticks;
+
+			op +(TimeSpan a, TimeSpan b) : TimeSpan => a.Add(b);
+			op -(TimeSpan a, TimeSpan b) : TimeSpan => a.Subtract(b);
+			op -(TimeSpan a) : TimeSpan => a.Negate();
+			op +(TimeSpan a) : TimeSpan => a;
+			op *(TimeSpan a, f64 factor) : TimeSpan => a.Multiply(factor);
+			op *(f64 factor, TimeSpan a) : TimeSpan => a.Multiply(factor);
+			op /(TimeSpan a, f64 divisor) : TimeSpan => a.Divide(divisor);
+			op /(TimeSpan a, TimeSpan b) : f64 => a.Divide(b);
+			op ==(TimeSpan a, TimeSpan b) : bool => a.ticks == b.ticks;
+			op !=(TimeSpan a, TimeSpan b) : bool => a.ticks != b.ticks;
+			op <(TimeSpan a, TimeSpan b) : bool => a.ticks < b.ticks;
+			op <=(TimeSpan a, TimeSpan b) : bool => a.ticks <= b.ticks;
+			op >(TimeSpan a, TimeSpan b) : bool => a.ticks > b.ticks;
+			op >=(TimeSpan a, TimeSpan b) : bool => a.ticks >= b.ticks;
+
+			Equals(TimeSpan other) : bool => ticks == other.ticks;
+			Hash() : u64 => (u64)ticks * 0x9E3779B97F4A7C15;
+			CompareTo(TimeSpan other) : i32 => ticks < other.ticks ? -1 : ticks > other.ticks ? 1 : 0;
+			static Compare(TimeSpan a, TimeSpan b) : i32 => a.CompareTo(b);
+
+			/// `[-][d.]hh:mm:ss[.fffffff]` (the "c" format).
+			ToString() : str => TimeFormat.Span(this, "c");
+
+			/// As text by a format: "c" (`[-][d.]hh:mm:ss[.fffffff]`), "g" (`[-][d:]h:mm:ss[.FFFFFFF]`), "G"
+			/// (`[-]d:hh:mm:ss.fffffff`), or a custom one of d…, h, hh, m, mm, s, ss, f…, F…, 'text' and \x.
+			ToString(str format) : str => TimeFormat.Span(this, format);
+
+			/// The length `text` writes: `[-]d`, `[-][d.]h:mm[:ss[.fffffff]]` or `[-]d:h:mm:ss[.fffffff]`, spaces around
+			/// allowed; a FormatError when it writes none.
+			static Parse(str text) : TimeSpan
+			{
+				TimeSpan? read = TimeFormat.ReadSpan(text);
+				if (read == null)
+					throw new FormatError("String '" + text + "' was not recognized as a valid TimeSpan.");
+				return read.Value;
+			}
+
+			/// The length `text` writes, or null when it writes none.
+			static TryParse(str text) : TimeSpan? => TimeFormat.ReadSpan(text);
+	}
+
+	/// A moment on the calendar, from 0001-01-01 to 9999-12-31, to 100 ns, and whose clock it reads (Kind).
+	/// `date + span`, `date - span`, `a - b` (a TimeSpan) and the comparisons work on it; as text it is
+	/// `MM/dd/yyyy HH:mm:ss`, and ToString("o") gives the round-trip form.
+	public value DateTime : IHashable<DateTime>, IComparable<DateTime>
+	{
+		// The ticks since 0001-01-01 in the low 62 bits, the kind in the top two.
+		u64 data;
+
+		/// Throws an ArgumentOutOfRangeError: the message is made here, so the fast paths that may throw allocate nothing.
+		[NoInline]
+		static OutOfRange(i32 which)
+		{
+			str what = which switch
+			{
+				0 => "the year, month and day make no date",
+				1 => "the hour, minute and second make no time",
+				2 => "the result is outside the calendar",
+				3 => "the ticks are outside the calendar",
+				4 => "the millisecond is not 0-999",
+				5 => "the year is not 1-9999",
+				6 => "the month is not 1-12",
+				7 => "the months are not -120000-120000",
+				8 => "the years are not -10000-10000",
+				9 => "the seconds are outside the calendar",
+				10 => "the milliseconds are outside the calendar",
+				11 => "the bits make no DateTime",
+				_ => "the value is out of range",
+			};
+			throw new ArgumentOutOfRangeError("DateTime: " + what);
+		}
+
+		/// A DateTime from its bits (ticks already checked).
+		static Of(u64 data) : DateTime
+		{
+			DateTime made = new DateTime(0);
+			made.data = data;
+			return made;
+		}
+
+		/// The ticks of a date (checked), as .NET's DateToTicks.
+		static DateTicks(i32 year, i32 month, i32 day) : i64
+		{
+			if ((u32)(year - 1) >= 9999 || (u32)(month - 1) >= 12 || (u32)(day - 1) >= 28 && (day < 1 || day > Dates.MonthLength(year, month)))
+				OutOfRange(0);
+			return Dates.DaysOf(year, month, day) * 864000000000;
+		}
+
+		static TimeTicks(i32 hour, i32 minute, i32 second) : i64
+		{
+			if ((u32)hour >= 24 || (u32)minute >= 60 || (u32)second >= 60)
+				OutOfRange(1);
+			return ((i64)hour * 3600 + minute * 60 + second) * 10000000;
+		}
+
+		/// This moment `value` ticks later (an ArgumentOutOfRangeError past the calendar's ends).
+		Moved(i64 value) : DateTime
+		{
+			i64 ticks = (i64)(data & 0x3FFFFFFFFFFFFFFF);
+			if (value > 3155378975999999999 - ticks || value < -ticks)
+				OutOfRange(2);
+			return Of((u64)(ticks + value) | (data & 0xC000000000000000));
+		}
+
+		/// `value` units of `scale` ticks later: whole units exactly, the fraction rounded toward zero.
+		AddUnits(f64 value, i64 most, i64 scale) : DateTime
+		{
+			if (!(value <= (f64)most && value >= -(f64)most))
+				OutOfRange(2);
+			i64 whole = (i64)value;
+			f64 fraction = value - (f64)whole;
+			return Moved(whole * scale + (i64)(fraction * (f64)scale));
+		}
+
+		public:
+			static DateTime MinValue { get => Of(0); }
+			static DateTime MaxValue { get => Of(3155378975999999999); }
+			/// 1970-01-01 00:00:00 UTC.
+			static DateTime UnixEpoch { get => Of(621355968000000000 | 0x4000000000000000); }
+
+			/// Ticks since 0001-01-01 00:00:00.
+			new(i64 ticks)
+			{
+				if ((u64)ticks > 3155378975999999999)
+					OutOfRange(3);
+				data = (u64)ticks;
+			}
+
+			new(i64 ticks, DateTimeKind kind)
+			{
+				if ((u64)ticks > 3155378975999999999)
+					OutOfRange(3);
+				data = (u64)ticks | (u64)(i32)kind << 62;
+			}
+
+			new(i32 year, i32 month, i32 day) { data = (u64)DateTicks(year, month, day); }
+
+			new(i32 year, i32 month, i32 day, i32 hour, i32 minute, i32 second)
+			{
+				data = (u64)(DateTicks(year, month, day) + TimeTicks(hour, minute, second));
+			}
+
+			new(i32 year, i32 month, i32 day, i32 hour, i32 minute, i32 second, DateTimeKind kind)
+			{
+				data = (u64)(DateTicks(year, month, day) + TimeTicks(hour, minute, second)) | (u64)(i32)kind << 62;
+			}
+
+			new(i32 year, i32 month, i32 day, i32 hour, i32 minute, i32 second, i32 millisecond)
+			{
+				if ((u32)millisecond >= 1000)
+					OutOfRange(4);
+				data = (u64)(DateTicks(year, month, day) + TimeTicks(hour, minute, second) + (i64)millisecond * 10000);
+			}
+
+			new(i32 year, i32 month, i32 day, i32 hour, i32 minute, i32 second, i32 millisecond, DateTimeKind kind)
+			{
+				if ((u32)millisecond >= 1000)
+					OutOfRange(4);
+				data = (u64)(DateTicks(year, month, day) + TimeTicks(hour, minute, second) + (i64)millisecond * 10000) | (u64)(i32)kind << 62;
+			}
+
+			/// Now: in UTC, in the local time zone, and today's date (local, at midnight).
+			static DateTime UtcNow { get => Of((u64)(Dates.Clock() + 621355968000000000) | 0x4000000000000000); }
+
+			static DateTime Now
+			{
+				get
+				{
+					i64 utc = Dates.Clock() + 621355968000000000;
+					return Of((u64)(utc + LocalZone.Offset(utc)) | 0x8000000000000000);
+				}
+			}
+
+			static DateTime Today { get => Now.Date; }
+
+			i64 Ticks { get => (i64)(data & 0x3FFFFFFFFFFFFFFF); }
+			DateTimeKind Kind { get => (DateTimeKind)(i32)(data >> 62); }
+
+			i32 Year { get => Dates.YearOf(data & 0x3FFFFFFFFFFFFFFF); }
+			i32 Month { get => (i32)(Dates.Parts(data & 0x3FFFFFFFFFFFFFFF) >> 5 & 15); }
+			i32 Day { get => (i32)(Dates.Parts(data & 0x3FFFFFFFFFFFFFFF) & 31); }
+			i32 Hour { get => (i32)((data & 0x3FFFFFFFFFFFFFFF) / 36000000000 % 24); }
+			i32 Minute { get => (i32)((data & 0x3FFFFFFFFFFFFFFF) / 600000000 % 60); }
+			i32 Second { get => (i32)((data & 0x3FFFFFFFFFFFFFFF) / 10000000 % 60); }
+			i32 Millisecond { get => (i32)((data & 0x3FFFFFFFFFFFFFFF) / 10000 % 1000); }
+			i32 Microsecond { get => (i32)((data & 0x3FFFFFFFFFFFFFFF) / 10 % 1000); }
+			i32 Nanosecond { get => (i32)((data & 0x3FFFFFFFFFFFFFFF) % 10) * 100; }
+
+			DayOfWeek DayOfWeek { get => (DayOfWeek)(i32)(((data & 0x3FFFFFFFFFFFFFFF) / 864000000000 + 1) % 7); }
+
+			/// 1 for January 1st.
+			i32 DayOfYear
+			{
+				get
+				{
+					// The quarter day within the 400-year cycle, then the day within its year (the low 32 bits of the
+					// scaled value, as in Parts).
+					u32 quarters = (u32)((data & 0x3FFFFFFFFFFFFFFF) / 216000000000) | 3;
+					u32 rest = quarters % 146097 | 3;
+					u32 scaled = rest * 2939745;
+					return (i32)(scaled / 11758980) + 1;
+				}
+			}
+
+			/// The date at midnight (same kind), and the time since midnight.
+			DateTime Date { get => Of(data - (data & 0x3FFFFFFFFFFFFFFF) % 864000000000); }
+			TimeSpan TimeOfDay { get => new TimeSpan((i64)((data & 0x3FFFFFFFFFFFFFFF) % 864000000000)); }
+
+			static IsLeapYear(i32 year) : bool
+			{
+				if (year < 1 || year > 9999)
+					OutOfRange(5);
+				return (year & 3) == 0 && (year % 100 != 0 || year % 400 == 0);
+			}
+
+			static DaysInMonth(i32 year, i32 month) : i32
+			{
+				if (month < 1 || month > 12)
+					OutOfRange(6);
+				if (month == 2)
+					return IsLeapYear(year) ? 29 : 28;
+				return 30 + ((month + (month >> 3)) & 1);
+			}
+
+			/// The same moment with another kind (the clock reading is not changed).
+			static SpecifyKind(DateTime value, DateTimeKind kind) : DateTime => Of((value.data & 0x3FFFFFFFFFFFFFFF) | (u64)(i32)kind << 62);
+
+			Add(TimeSpan span) : DateTime => Moved(span.Ticks);
+			AddTicks(i64 value) : DateTime => Moved(value);
+			AddDays(f64 value) : DateTime => AddUnits(value, 10000000, 864000000000);
+			AddHours(f64 value) : DateTime => AddUnits(value, 240000000, 36000000000);
+			AddMinutes(f64 value) : DateTime => AddUnits(value, 14400000000, 600000000);
+			AddSeconds(f64 value) : DateTime => AddUnits(value, 864000000000, 10000000);
+			AddMilliseconds(f64 value) : DateTime => AddUnits(value, 864000000000000, 10000);
+			AddMicroseconds(f64 value) : DateTime => AddUnits(value, 864000000000000000, 10);
+
+			/// `months` months later: the same day, or the month's last day when it is shorter.
+			AddMonths(i32 months) : DateTime
+			{
+				if (months < -120000 || months > 120000)
+					OutOfRange(7);
+				u64 ticks = data & 0x3FFFFFFFFFFFFFFF;
+				u32 parts = Dates.Parts(ticks);
+				i32 year = (i32)(parts >> 9), month = (i32)(parts >> 5 & 15), day = (i32)(parts & 31);
+				i32 at = month - 1 + months;
+				if (at >= 0)
+				{
+					month = at % 12 + 1;
+					year += at / 12;
+				}
+				else
+				{
+					month = 12 + (at + 1) % 12;
+					year += (at - 11) / 12;
+				}
+				if (year < 1 || year > 9999)
+					OutOfRange(2);
+				if (day > 28)
+				{
+					i32 last = Dates.MonthLength(year, month);
+					if (day > last)
+						day = last;
+				}
+				return Of((u64)(Dates.DaysOf(year, month, day) * 864000000000) + ticks % 864000000000 | (data & 0xC000000000000000));
+			}
+
+			AddYears(i32 years) : DateTime
+			{
+				if (years < -10000 || years > 10000)
+					OutOfRange(8);
+				return AddMonths(years * 12);
+			}
+
+			/// The time from `other` to this moment, and this moment `span` earlier.
+			Subtract(DateTime other) : TimeSpan => new TimeSpan(Ticks - other.Ticks);
+			Subtract(TimeSpan span) : DateTime
+			{
+				if (span.Ticks == -9223372036854775807 - 1)
+					OutOfRange(2);
+				return Moved(-span.Ticks);
+			}
+
+			op +(DateTime d, TimeSpan span) : DateTime => d.Moved(span.Ticks);
+			op -(DateTime d, TimeSpan span) : DateTime => d.Subtract(span);
+			op -(DateTime a, DateTime b) : TimeSpan => new TimeSpan(a.Ticks - b.Ticks);
+			op ==(DateTime a, DateTime b) : bool => ((a.data ^ b.data) & 0x3FFFFFFFFFFFFFFF) == 0;
+			op !=(DateTime a, DateTime b) : bool => ((a.data ^ b.data) & 0x3FFFFFFFFFFFFFFF) != 0;
+			op <(DateTime a, DateTime b) : bool => (a.data & 0x3FFFFFFFFFFFFFFF) < (b.data & 0x3FFFFFFFFFFFFFFF);
+			op <=(DateTime a, DateTime b) : bool => (a.data & 0x3FFFFFFFFFFFFFFF) <= (b.data & 0x3FFFFFFFFFFFFFFF);
+			op >(DateTime a, DateTime b) : bool => (a.data & 0x3FFFFFFFFFFFFFFF) > (b.data & 0x3FFFFFFFFFFFFFFF);
+			op >=(DateTime a, DateTime b) : bool => (a.data & 0x3FFFFFFFFFFFFFFF) >= (b.data & 0x3FFFFFFFFFFFFFFF);
+
+			/// The same moment (the kind is not compared).
+			Equals(DateTime other) : bool => ((data ^ other.data) & 0x3FFFFFFFFFFFFFFF) == 0;
+			Hash() : u64 => (data & 0x3FFFFFFFFFFFFFFF) * 0x9E3779B97F4A7C15;
+			CompareTo(DateTime other) : i32
+			{
+				u64 a = data & 0x3FFFFFFFFFFFFFFF, b = other.data & 0x3FFFFFFFFFFFFFFF;
+				return a < b ? -1 : a > b ? 1 : 0;
+			}
+			static Compare(DateTime a, DateTime b) : i32 => a.CompareTo(b);
+
+			/// The moment on UTC's clock and on the local time zone's (Unspecified counts as the other one).
+			ToUniversalTime() : DateTime
+			{
+				if ((data >> 62) == 1)
+					return this;
+				i64 local = Ticks;
+				i64 utc = local - LocalZone.OffsetOfLocal(local);
+				if (utc < 0)
+					utc = 0;
+				if (utc > 3155378975999999999)
+					utc = 3155378975999999999;
+				return Of((u64)utc | 0x4000000000000000);
+			}
+
+			ToLocalTime() : DateTime
+			{
+				if ((data >> 62) == 2)
+					return this;
+				i64 utc = Ticks;
+				i64 local = utc + LocalZone.Offset(utc);
+				if (local < 0)
+					local = 0;
+				if (local > 3155378975999999999)
+					local = 3155378975999999999;
+				return Of((u64)local | 0x8000000000000000);
+			}
+
+			/// Seconds and milliseconds since 1970-01-01 UTC (Unspecified counts as UTC), and the UTC moment of a count of
+			/// them.
+			ToUnixTimeSeconds() : i64
+			{
+				i64 ticks = (data >> 62) == 2 ? ToUniversalTime().Ticks : Ticks;
+				i64 seconds = ticks / 10000000 - 62135596800;
+				return seconds;
+			}
+
+			ToUnixTimeMilliseconds() : i64
+			{
+				i64 ticks = (data >> 62) == 2 ? ToUniversalTime().Ticks : Ticks;
+				return ticks / 10000 - 62135596800000;
+			}
+
+			static FromUnixTimeSeconds(i64 seconds) : DateTime
+			{
+				if (seconds < -62135596800 || seconds > 253402300799)
+					OutOfRange(9);
+				return Of((u64)((seconds + 62135596800) * 10000000) | 0x4000000000000000);
+			}
+
+			static FromUnixTimeMilliseconds(i64 milliseconds) : DateTime
+			{
+				if (milliseconds < -62135596800000 || milliseconds > 253402300799999)
+					OutOfRange(10);
+				return Of((u64)((milliseconds + 62135596800000) * 10000) | 0x4000000000000000);
+			}
+
+			/// `MM/dd/yyyy HH:mm:ss`.
+			ToString() : str => TimeFormat.General(this);
+
+			/// As text by a format: a standard one (d, D, f, F, g, G, M, o, R, s, t, T, u, U, Y) or a custom one of
+			/// yyyy, yy, MMMM, MMM, MM, M, dddd, ddd, dd, d, HH, H, hh, h, mm, m, ss, s, f…, F…, tt, t, K, zzz, zz, z,
+			/// 'text', "text" and \x.
+			ToString(str format) : str => TimeFormat.Date(this, format);
+
+			/// The moment `text` writes: ISO 8601 (`2024-05-01`, `2024-05-01T13:45:30.5Z`, `…+02:00`), the invariant
+			/// culture's `05/01/2024 1:45 PM`, `Wed, 01 May 2024 13:45:30 GMT`, `1 May 2024`, `May 1, 2024`, or a time
+			/// alone (today); a FormatError when it writes none.
+			static Parse(str text) : DateTime => Parse(text, DateTimeStyles.None);
+
+			static Parse(str text, DateTimeStyles styles) : DateTime
+			{
+				DateTime? read = TimeFormat.ReadDate(text, null, styles);
+				if (read == null)
+					TimeFormat.NotADate(text);
+				return read.Value;
+			}
+
+			/// The moment `text` writes in exactly `format` (a standard or custom format, as ToString takes).
+			static ParseExact(str text, str format) : DateTime => ParseExact(text, format, DateTimeStyles.None);
+
+			static ParseExact(str text, str format, DateTimeStyles styles) : DateTime
+			{
+				DateTime? read = TimeFormat.ReadDate(text, format, styles);
+				if (read == null)
+					TimeFormat.NotADate(text);
+				return read.Value;
+			}
+
+			/// The moment, or null when `text` writes none.
+			static TryParse(str text) : DateTime? => TimeFormat.ReadDate(text, null, DateTimeStyles.None);
+			static TryParse(str text, DateTimeStyles styles) : DateTime? => TimeFormat.ReadDate(text, null, styles);
+			static TryParseExact(str text, str format) : DateTime? => TimeFormat.ReadDate(text, format, DateTimeStyles.None);
+			static TryParseExact(str text, str format, DateTimeStyles styles) : DateTime? => TimeFormat.ReadDate(text, format, styles);
+
+			/// The bits (ticks and kind), and a DateTime from them.
+			ToBinary() : i64 => (i64)data;
+			static FromBinary(i64 bits) : DateTime
+			{
+				if (((u64)bits & 0x3FFFFFFFFFFFFFFF) > 3155378975999999999 || ((u64)bits >> 62) == 3)
+					OutOfRange(11);
+				return Of((u64)bits);
+			}
+	}
+
+	/// The calendar's arithmetic (proleptic Gregorian, days since 0001-01-01).
+	static class Dates
+	{
+		extern("time.utc") Utc() : i64;
+
+		public:
+			/// Now, in ticks since 1970-01-01 UTC.
+			Clock() : i64 => Utc();
+
+			/// The days from 0001-01-01 to a date (not checked): days from 0000-03-01, with January and February the
+			/// last months of the year before.
+			DaysOf(i32 year, i32 month, i32 day) : i64
+			{
+				i32 y = year, m = month;
+				if (m < 3)
+				{
+					y--;
+					m += 12;
+				}
+				i32 centuries = y / 100;
+				return (i64)(y * 365 + (y >> 2) - centuries + (centuries >> 2) + (153 * m - 457) / 5 + day - 307);
+			}
+
+			/// The days in a month (both already checked).
+			MonthLength(i32 year, i32 month) : i32
+			{
+				if (month != 2)
+					return 30 + ((month + (month >> 3)) & 1);
+				return (year & 3) == 0 && (year % 100 != 0 || year % 400 == 0) ? 29 : 28;
+			}
+
+			/// The year of a tick count.
+			YearOf(u64 ticks) : i32
+			{
+				// Quarter days (the | 3 rounds them to the end of the day) in 400-year cycles of 146097 days.
+				u32 quarters = (u32)(ticks / 216000000000) | 3;
+				u32 cycles = quarters / 146097;
+				u32 rest = quarters % 146097;
+				return (i32)(1 + 100 * cycles + (rest | 3) / 1461);
+			}
+
+			/// The year, month and day of a tick count as `year << 9 | month << 5 | day` (Neri and Schneider's method,
+			/// as .NET does it: one division per part).
+			Parts(u64 ticks) : u32
+			{
+				u32 quarters = ((u32)(ticks / 216000000000) | 3) + 1224;
+				u32 centuries = quarters / 146097;
+				u32 rest = quarters % 146097;
+				u64 scaled = (u64)2939745 * (u64)(rest | 3);
+				u32 sinceMarch = (u32)scaled / 11758980;
+				u32 monthDay = 2141 * sinceMarch + 197913;
+				u32 year = 100 * centuries + (u32)(scaled >> 32);
+				u32 month = monthDay >> 16;
+				u32 day = (monthDay & 65535) / 2141 + 1;
+				if (sinceMarch >= 306)
+				{
+					year++;
+					month -= 12;
+				}
+				return year << 9 | month << 5 | day;
+			}
+	}
+
+	/// The local time zone's offset from UTC, asked of the system once per quarter hour of UTC (zones change their offset
+	/// only on quarter hours).
+	static class LocalZone
+	{
+		extern("time.offset") OffsetAt(i64 seconds) : i64;
+
+		static i64 quarter = -9223372036854775807 - 1;
+		static i64 cached;
+
+		public:
+			/// The offset in ticks at a UTC moment (ticks since 0001).
+			Offset(i64 utcTicks) : i64
+			{
+				i64 seconds = utcTicks / 10000000 - 62135596800;
+				i64 at = seconds >= 0 ? seconds / 900 : (seconds - 899) / 900;
+				if (at != quarter)
+				{
+					cached = OffsetAt(seconds) * 10000000;
+					quarter = at;
+				}
+				return cached;
+			}
+
+			/// The offset in ticks at a local moment: the offset at the moment it would be in UTC, checked once more
+			/// (near a change the two can differ).
+			OffsetOfLocal(i64 localTicks) : i64
+			{
+				i64 first = Offset(localTicks);
+				i64 second = Offset(localTicks - first);
+				return second;
+			}
+	}
+
+	/// Text being written for a date or a length of time.
+	final class TimeText
+	{
+		u8[] bytes = new u8[40];
+		i32 count;
+
+		[NoInline]
+		Grow()
+		{
+			u8[] bigger = new u8[bytes.Length * 2];
+			loop (i32 i = 0..count)
+				bigger[i] = bytes[i];
+			bytes = bigger;
+		}
+
+		public:
+			i32 Count { get => count; }
+
+			Add(u8 unit)
+			{
+				if (count == bytes.Length)
+					Grow();
+				bytes[count] = unit;
+				count++;
+			}
+
+			Text(str text)
+			{
+				loop (i32 i = 0..text.Length)
+					Add(text[i]);
+			}
+
+			/// A non-negative number with at least `width` digits.
+			Digits(i64 value, i32 width)
+			{
+				i32 n = 1;
+				loop (i64 m = value; m >= 10; m = m / 10)
+					n++;
+				if (n < width)
+					n = width;
+				loop (count + n > bytes.Length)
+					Grow();
+				loop (i32 i = count + n - 1; i >= count; i--)
+				{
+					bytes[i] = (u8)('0' + value % 10);
+					value = value / 10;
+				}
+				count += n;
+			}
+
+			/// An offset from UTC in ticks: `+hh:mm` (`colon` false: `+hhmm`; `minutes` false: `+hh`, `width` 1: `+h`).
+			Offset(i64 ticks, i32 width, bool minutes, bool colon)
+			{
+				i64 all = ticks / 600000000;
+				Add(all < 0 ? '-' : '+');
+				if (all < 0)
+					all = -all;
+				Digits(all / 60, width);
+				if (minutes)
+				{
+					if (colon)
+						Add(':');
+					Digits(all % 60, 2);
+				}
+			}
+
+			Last() : u8 => count > 0 ? bytes[count - 1] : (u8)0;
+			Drop() { count--; }
+
+			Made() : str
+			{
+				u8[] exact = new u8[count];
+				loop (i32 i = 0..count)
+					exact[i] = bytes[i];
+				return new String<u8>(exact);
+			}
+	}
+
+	/// What reading a date found.
+	final class DateFields
+	{
+		public:
+			i32 Year = -1;
+			i32 Month = -1;
+			i32 Day = -1;
+			i32 Hour;
+			i32 Minute;
+			i32 Second;
+			i64 Fraction;
+			/// -1: no AM/PM; 0: AM; 1: PM.
+			i32 Half = -1;
+			/// -1: no day name.
+			i32 Weekday = -1;
+			bool HasTime;
+			/// A zone: Z or GMT (UTC), or an offset (in ticks).
+			bool Utc;
+			bool HasOffset;
+			i64 Offset;
+	}
+
+	/// Dates and lengths of time as text, and read back.
+	static class TimeFormat
+	{
+		static str[] dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+		static str[] shortDayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+		static str[] monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+		static str[] shortMonthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+		[NoInline]
+		static BadFormat() { throw new FormatError("Input string was not in a correct format."); }
+
+		static Put2(u8[] b, i32 at, i64 v)
+		{
+			b[at] = (u8)('0' + v / 10);
+			b[at + 1] = (u8)('0' + v % 10);
+		}
+
+		static Put4(u8[] b, i32 at, i64 v)
+		{
+			Put2(b, at, v / 100);
+			Put2(b, at + 2, v % 100);
+		}
+
+		/// How many times the unit at `i` repeats from there.
+		static Run(str format, i32 i) : i32
+		{
+			u8 c = format[i];
+			i32 j = i + 1;
+			loop (j < format.Length && format[j] == c)
+				j++;
+			return j - i;
+		}
+
+		/// The custom pattern a one-letter standard date format stands for (null: not one).
+		static Standard(u8 letter) : str?
+		{
+			switch (letter)
+			{
+				'd' => return "MM/dd/yyyy",
+				'D' => return "dddd, dd MMMM yyyy",
+				'f' => return "dddd, dd MMMM yyyy HH:mm",
+				'F' => return "dddd, dd MMMM yyyy HH:mm:ss",
+				'g' => return "MM/dd/yyyy HH:mm",
+				'G' => return "MM/dd/yyyy HH:mm:ss",
+				'M' or 'm' => return "MMMM dd",
+				'O' or 'o' => return "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffffK",
+				'R' or 'r' => return "ddd, dd MMM yyyy HH':'mm':'ss 'GMT'",
+				's' => return "yyyy'-'MM'-'dd'T'HH':'mm':'ss",
+				't' => return "HH:mm",
+				'T' => return "HH:mm:ss",
+				'u' => return "yyyy'-'MM'-'dd HH':'mm':'ss'Z'",
+				'U' => return "dddd, dd MMMM yyyy HH:mm:ss",
+				'Y' or 'y' => return "yyyy MMMM",
+				_ => return null,
+			}
+		}
+
+		/// The offset from UTC a date's `z` and `K` write: none for Unspecified (K), 0 for UTC, the zone's for local.
+		static ZoneOf(DateTime value) : i64
+		{
+			DateTimeKind kind = value.Kind;
+			if (kind == DateTimeKind.Utc)
+				return 0;
+			return LocalZone.OffsetOfLocal(value.Ticks);
+		}
+
+		/// `value` by a custom date pattern.
+		static Custom(DateTime value, str format, TimeText text)
+		{
+			i64 ticks = value.Ticks;
+			u32 parts = Dates.Parts((u64)ticks);
+			i32 year = (i32)(parts >> 9), month = (i32)(parts >> 5 & 15), day = (i32)(parts & 31);
+			i32 hour = (i32)(ticks / 36000000000 % 24);
+			i32 i = 0;
+			loop (i < format.Length)
+			{
+				u8 c = format[i];
+				i32 run = Run(format, i);
+				if (c == 'y')
+				{
+					if (run <= 2)
+						text.Digits(year % 100, run);
+					else
+						text.Digits(year, run);
+				}
+				else if (c == 'M')
+				{
+					if (run <= 2)
+						text.Digits(month, run);
+					else
+						text.Text(run == 3 ? shortMonthNames[month - 1] : monthNames[month - 1]);
+				}
+				else if (c == 'd')
+				{
+					if (run <= 2)
+						text.Digits(day, run);
+					else
+					{
+						i32 weekday = (i32)((ticks / 864000000000 + 1) % 7);
+						text.Text(run == 3 ? shortDayNames[weekday] : dayNames[weekday]);
+					}
+				}
+				else if (c == 'H')
+					text.Digits(hour, run > 2 ? 2 : run);
+				else if (c == 'h')
+					text.Digits(hour % 12 == 0 ? 12 : hour % 12, run > 2 ? 2 : run);
+				else if (c == 'm')
+					text.Digits(ticks / 600000000 % 60, run > 2 ? 2 : run);
+				else if (c == 's')
+					text.Digits(ticks / 10000000 % 60, run > 2 ? 2 : run);
+				else if (c == 'f' || c == 'F')
+				{
+					if (run > 7)
+						BadFormat();
+					i64 fraction = ticks % 10000000;
+					loop (i32 k = run; k < 7; k++)
+						fraction = fraction / 10;
+					if (c == 'f')
+						text.Digits(fraction, run);
+					else if (fraction == 0)
+					{
+						if (text.Last() == '.')
+							text.Drop();
+					}
+					else
+					{
+						i32 digits = run;
+						loop (fraction % 10 == 0)
+						{
+							fraction = fraction / 10;
+							digits--;
+						}
+						text.Digits(fraction, digits);
+					}
+				}
+				else if (c == 't')
+				{
+					text.Add(hour < 12 ? 'A' : 'P');
+					if (run > 1)
+						text.Add('M');
+				}
+				else if (c == 'K')
+				{
+					DateTimeKind kind = value.Kind;
+					if (kind == DateTimeKind.Utc)
+						text.Add('Z');
+					else if (kind == DateTimeKind.Local)
+						text.Offset(ZoneOf(value), 2, true, true);
+				}
+				else if (c == 'z')
+				{
+					i64 zone = ZoneOf(value);
+					if (run == 1)
+						text.Offset(zone, 1, false, false);
+					else
+						text.Offset(zone, 2, run >= 3, true);
+				}
+				else if (c == '\'' || c == '"')
+				{
+					run = 1;
+					i32 j = i + 1;
+					loop (j < format.Length && format[j] != c)
+					{
+						text.Add(format[j]);
+						j++;
+					}
+					if (j >= format.Length)
+						BadFormat();
+					i = j;
+				}
+				else if (c == '\\')
+				{
+					if (i + 1 >= format.Length)
+						BadFormat();
+					text.Add(format[i + 1]);
+					run = 2;
+				}
+				else if (c == '%')
+					run = 1;
+				else
+				{
+					loop (i32 k = 0..run)
+						text.Add(c);
+				}
+				i += run;
+			}
+		}
+
+		public:
+			/// `MM/dd/yyyy HH:mm:ss`, written straight into its 19 bytes.
+			General(DateTime value) : str
+			{
+				i64 ticks = value.Ticks;
+				u32 parts = Dates.Parts((u64)ticks);
+				u8[] b = new u8[19];
+				Put2(b, 0, parts >> 5 & 15);
+				b[2] = '/';
+				Put2(b, 3, parts & 31);
+				b[5] = '/';
+				Put4(b, 6, parts >> 9);
+				b[10] = ' ';
+				i64 seconds = ticks / 10000000 % 86400;
+				Put2(b, 11, seconds / 3600);
+				b[13] = ':';
+				Put2(b, 14, seconds / 60 % 60);
+				b[16] = ':';
+				Put2(b, 17, seconds % 60);
+				return new String<u8>(b);
+			}
+
+			/// `yyyy-MM-ddTHH:mm:ss.fffffff` and the kind's suffix (the "o" format), straight into its bytes.
+			RoundTrip(DateTime value) : str
+			{
+				i64 ticks = value.Ticks;
+				DateTimeKind kind = value.Kind;
+				i64 zone = kind == DateTimeKind.Local ? LocalZone.OffsetOfLocal(ticks) : 0;
+				u32 parts = Dates.Parts((u64)ticks);
+				u8[] b = new u8[kind == DateTimeKind.Unspecified ? 27 : kind == DateTimeKind.Utc ? 28 : 33];
+				Put4(b, 0, parts >> 9);
+				b[4] = '-';
+				Put2(b, 5, parts >> 5 & 15);
+				b[7] = '-';
+				Put2(b, 8, parts & 31);
+				b[10] = 'T';
+				i64 seconds = ticks / 10000000 % 86400;
+				Put2(b, 11, seconds / 3600);
+				b[13] = ':';
+				Put2(b, 14, seconds / 60 % 60);
+				b[16] = ':';
+				Put2(b, 17, seconds % 60);
+				b[19] = '.';
+				i64 fraction = ticks % 10000000;
+				loop (i32 k = 26; k >= 20; k--)
+				{
+					b[k] = (u8)('0' + fraction % 10);
+					fraction = fraction / 10;
+				}
+				if (kind == DateTimeKind.Utc)
+					b[27] = 'Z';
+				else if (kind == DateTimeKind.Local)
+				{
+					i64 minutes = zone / 600000000;
+					b[27] = minutes < 0 ? '-' : '+';
+					if (minutes < 0)
+						minutes = -minutes;
+					Put2(b, 28, minutes / 60);
+					b[30] = ':';
+					Put2(b, 31, minutes % 60);
+				}
+				return new String<u8>(b);
+			}
+
+			/// A date by a standard or custom format.
+			Date(DateTime value, str format) : str
+			{
+				if (format.Length == 0)
+					return General(value);
+				if (format.Length == 1)
+				{
+					u8 letter = format[0];
+					if (letter == 'G')
+						return General(value);
+					if (letter == 'o' || letter == 'O')
+						return RoundTrip(value);
+					if (Standard(letter) is str pattern)
+					{
+						TimeText made = new TimeText();
+						Custom(letter == 'U' ? value.ToUniversalTime() : value, pattern, made);
+						return made.Made();
+					}
+					BadFormat();
+				}
+				TimeText text = new TimeText();
+				Custom(value, format, text);
+				return text.Made();
+			}
+
+			/// A length of time by a format.
+			Span(TimeSpan value, str format) : str
+			{
+				i64 ticks = value.Ticks;
+				bool negative = ticks < 0;
+				i64 days = ticks / 864000000000;
+				i64 rest = ticks % 864000000000;
+				if (negative)
+				{
+					days = -days;
+					rest = -rest;
+				}
+				i64 hours = rest / 36000000000, minutes = rest / 600000000 % 60, seconds = rest / 10000000 % 60;
+				i64 fraction = rest % 10000000;
+				TimeText text = new TimeText();
+				u8 letter = format.Length == 1 ? format[0] : (u8)0;
+				if (format.Length == 0 || letter == 'c' || letter == 't' || letter == 'T')
+				{
+					if (negative)
+						text.Add('-');
+					if (days != 0)
+					{
+						text.Digits(days, 1);
+						text.Add('.');
+					}
+					text.Digits(hours, 2);
+					text.Add(':');
+					text.Digits(minutes, 2);
+					text.Add(':');
+					text.Digits(seconds, 2);
+					if (fraction != 0)
+					{
+						text.Add('.');
+						text.Digits(fraction, 7);
+					}
+					return text.Made();
+				}
+				if (letter == 'g' || letter == 'G')
+				{
+					if (negative)
+						text.Add('-');
+					if (days != 0 || letter == 'G')
+					{
+						text.Digits(days, 1);
+						text.Add(':');
+					}
+					text.Digits(hours, letter == 'G' ? 2 : 1);
+					text.Add(':');
+					text.Digits(minutes, 2);
+					text.Add(':');
+					text.Digits(seconds, 2);
+					if (letter == 'G')
+					{
+						text.Add('.');
+						text.Digits(fraction, 7);
+					}
+					else if (fraction != 0)
+					{
+						i32 digits = 7;
+						loop (fraction % 10 == 0)
+						{
+							fraction = fraction / 10;
+							digits--;
+						}
+						text.Add('.');
+						text.Digits(fraction, digits);
+					}
+					return text.Made();
+				}
+				if (format.Length == 1)
+					BadFormat();
+				// Custom: the parts without a sign.
+				i32 i = 0;
+				loop (i < format.Length)
+				{
+					u8 c = format[i];
+					i32 run = Run(format, i);
+					if (c == 'd')
+					{
+						if (run > 8)
+							BadFormat();
+						text.Digits(days, run);
+					}
+					else if (c == 'h')
+						text.Digits(hours, run > 2 ? 2 : run);
+					else if (c == 'm')
+						text.Digits(minutes, run > 2 ? 2 : run);
+					else if (c == 's')
+						text.Digits(seconds, run > 2 ? 2 : run);
+					else if (c == 'f' || c == 'F')
+					{
+						if (run > 7)
+							BadFormat();
+						i64 part = fraction;
+						loop (i32 k = run; k < 7; k++)
+							part = part / 10;
+						if (c == 'f')
+							text.Digits(part, run);
+						else if (part != 0)
+						{
+							i32 digits = run;
+							loop (part % 10 == 0)
+							{
+								part = part / 10;
+								digits--;
+							}
+							text.Digits(part, digits);
+						}
+					}
+					else if (c == '\'' || c == '"')
+					{
+						run = 1;
+						i32 j = i + 1;
+						loop (j < format.Length && format[j] != c)
+						{
+							text.Add(format[j]);
+							j++;
+						}
+						if (j >= format.Length)
+							BadFormat();
+						i = j;
+					}
+					else if (c == '\\')
+					{
+						if (i + 1 >= format.Length)
+							BadFormat();
+						text.Add(format[i + 1]);
+						run = 2;
+					}
+					else if (c == '%')
+						run = 1;
+					else
+						BadFormat();
+					i += run;
+				}
+				return text.Made();
+			}
+
+			[NoInline]
+			NotADate(str text) { throw new FormatError("String '" + text + "' was not recognized as a valid DateTime."); }
+
+			// ── Reading ────────────────────────────────────
+
+			/// A length of time: `[-]d`, `[-][d.]h:mm[:ss[.f…]]`, `[-]d:h:mm:ss[.f…]`, spaces around.
+			ReadSpan(str text) : TimeSpan?
+			{
+				i32 i = 0, end = text.Length;
+				loop (i < end && text[i] == ' ')
+					i++;
+				loop (end > i && text[end - 1] == ' ')
+					end--;
+				bool negative = i < end && text[i] == '-';
+				if (negative)
+					i++;
+				i64[] numbers = new i64[5];
+				i32 count = 0;
+				i64 days = 0;
+				bool dotDays = false;
+				i64 fraction = 0;
+				loop (true)
+				{
+					if (i >= end || text[i] < '0' || text[i] > '9')
+						return null;
+					i64 n = 0;
+					i32 digits = 0;
+					loop (i < end && text[i] >= '0' && text[i] <= '9')
+					{
+						n = n * 10 + (text[i] - '0');
+						digits++;
+						if (digits > 10)
+							return null;
+						i++;
+					}
+					numbers[count] = n;
+					count++;
+					if (i == end)
+						break;
+					u8 c = text[i];
+					if (c == '.' && count == 1 && !dotDays && i + 1 < end && Has(text, i + 1, end, ':'))
+					{
+						dotDays = true;
+						days = n;
+						count = 0;
+						i++;
+						continue;
+					}
+					if (c == '.' && count >= 3)
+					{
+						// The fraction: up to 7 digits, a tick each at the 7th.
+						i++;
+						i32 places = 0;
+						if (i >= end)
+							return null;
+						loop (i < end && text[i] >= '0' && text[i] <= '9')
+						{
+							if (places == 7)
+								return null;
+							fraction = fraction * 10 + (text[i] - '0');
+							places++;
+							i++;
+						}
+						if (places == 0 || i != end)
+							return null;
+						loop (places < 7)
+						{
+							fraction = fraction * 10;
+							places++;
+						}
+						break;
+					}
+					if (c != ':' || count == 4)
+						return null;
+					i++;
+				}
+				i64 hours = 0, minutes = 0, seconds = 0;
+				if (count == 1 && !dotDays)
+					days = numbers[0];
+				else if (count == 2 || count == 3)
+				{
+					hours = numbers[0];
+					minutes = numbers[1];
+					seconds = count == 3 ? numbers[2] : 0;
+				}
+				else if (count == 4 && !dotDays)
+				{
+					days = numbers[0];
+					hours = numbers[1];
+					minutes = numbers[2];
+					seconds = numbers[3];
+				}
+				else
+					return null;
+				if (count == 2 && fraction != 0)
+					return null;
+				if (hours > 23 || minutes > 59 || seconds > 59 || days > 10675199)
+					return null;
+				i64 total = ((days * 24 + hours) * 60 + minutes) * 600000000 + seconds * 10000000 + fraction;
+				if (total < 0)
+					return null;
+				return new TimeSpan(negative ? -total : total);
+			}
+
+			/// Whether `unit` is in text[from..end).
+			Has(str text, i32 from, i32 end, u8 unit) : bool
+			{
+				loop (i32 i = from..end)
+				{
+					if (text[i] == unit)
+						return true;
+				}
+				return false;
+			}
+
+			/// A date, in `format` (standard or custom) or, with none, in any of the forms Parse reads.
+			ReadDate(str text, str? format, DateTimeStyles styles) : DateTime?
+			{
+				if (format is str o && o.Length == 1 && (o[0] == 'o' || o[0] == 'O'))
+					return RoundTripRead(text, styles);
+				DateFields found = new DateFields();
+				if (format is str exact)
+				{
+					str pattern = exact;
+					if (exact.Length == 1)
+					{
+						if (Standard(exact[0]) is str standard)
+							pattern = standard;
+						else
+							return null;
+					}
+					if (!ReadExact(text, pattern, found))
+						return null;
+				}
+				else if (!ReadAny(text, found))
+					return null;
+				return Made(found, styles);
+			}
+
+			/// Two digits at `at` (-1 when they are not).
+			Two(str text, i32 at) : i32
+			{
+				u32 a = (u32)text[at] - '0', b = (u32)text[at + 1] - '0';
+				return a > 9 || b > 9 ? -1 : (i32)(a * 10 + b);
+			}
+
+			/// `yyyy-MM-ddTHH:mm:ss.fffffff` and nothing, Z, or `+hh:mm`.
+			RoundTripRead(str text, DateTimeStyles styles) : DateTime?
+			{
+				i32 length = text.Length;
+				if (length != 27 && length != 28 && length != 33)
+					return null;
+				if (text[4] != '-' || text[7] != '-' || text[10] != 'T' || text[13] != ':' || text[16] != ':' || text[19] != '.')
+					return null;
+				i32 high = Two(text, 0), low = Two(text, 2), month = Two(text, 5), day = Two(text, 8);
+				i32 hour = Two(text, 11), minute = Two(text, 14), second = Two(text, 17);
+				if ((high | low | month | day | hour | minute | second) < 0)
+					return null;
+				i32 year = high * 100 + low;
+				if (year < 1 || month < 1 || month > 12 || day < 1 || day > 28 && day > Dates.MonthLength(year, month) || hour > 23 || minute > 59 || second > 59)
+					return null;
+				i64 fraction = 0;
+				loop (i32 i = 20..27)
+				{
+					u32 digit = (u32)text[i] - '0';
+					if (digit > 9)
+						return null;
+					fraction = fraction * 10 + digit;
+				}
+				i64 ticks = Dates.DaysOf(year, month, day) * 864000000000 + ((i64)hour * 3600 + minute * 60 + second) * 10000000 + fraction;
+				if (length == 27)
+					return Kinded(ticks, false, false, 0, styles);
+				if (length == 28)
+					return text[27] == 'Z' ? Kinded(ticks, true, false, 0, styles) : null;
+				u8 sign = text[27];
+				i32 hours = Two(text, 28), minutes = Two(text, 31);
+				if (sign != '+' && sign != '-' || text[30] != ':' || hours < 0 || minutes < 0 || hours > 14 || minutes > 59)
+					return null;
+				i64 offset = (i64)(hours * 60 + minutes) * 600000000;
+				return Kinded(ticks, false, true, sign == '-' ? -offset : offset, styles);
+			}
+
+			/// The date the fields make, by the styles.
+			Made(DateFields found, DateTimeStyles styles) : DateTime?
+			{
+				if (found.Year < 0 && found.Month < 0 && found.Day < 0)
+				{
+					// A time alone: today (local).
+					DateTime today = DateTime.Now;
+					u32 parts = Dates.Parts((u64)today.Ticks);
+					found.Year = (i32)(parts >> 9);
+					found.Month = (i32)(parts >> 5 & 15);
+					found.Day = (i32)(parts & 31);
+				}
+				// A date without some parts: this year, January, the 1st.
+				if (found.Year < 0)
+					found.Year = DateTime.Now.Year;
+				if (found.Month < 0)
+					found.Month = 1;
+				if (found.Day < 0)
+					found.Day = 1;
+				if (found.Year < 1 || found.Year > 9999 || found.Month < 1 || found.Month > 12 || found.Day < 1 || found.Day > DateTime.DaysInMonth(found.Year, found.Month))
+					return null;
+				i32 hour = found.Hour;
+				if (found.Half >= 0)
+				{
+					if (hour < 1 || hour > 12)
+						return null;
+					hour = hour % 12 + found.Half * 12;
+				}
+				if (hour > 23 || found.Minute > 59 || found.Second > 59)
+					return null;
+				i64 ticks = Dates.DaysOf(found.Year, found.Month, found.Day) * 864000000000 + ((i64)hour * 3600 + found.Minute * 60 + found.Second) * 10000000 + found.Fraction;
+				if (found.Weekday >= 0 && (i32)((ticks / 864000000000 + 1) % 7) != found.Weekday)
+					return null;
+				return Kinded(ticks, found.Utc, found.HasOffset, found.Offset, styles);
+			}
+
+			/// A date read as `ticks` on its clock, with a zone or not (`utc`: Z or GMT; `hasOffset`: an offset in ticks), by
+			/// the styles.
+			Kinded(i64 ticks, bool utc, bool hasOffset, i64 offset, DateTimeStyles styles) : DateTime?
+			{
+				bool toUtc = (styles & DateTimeStyles.AdjustToUniversal) == DateTimeStyles.AdjustToUniversal;
+				if (utc || hasOffset)
+				{
+					i64 moment = ticks - (hasOffset ? offset : 0);
+					if (moment < 0 || moment > 3155378975999999999)
+						return null;
+					if (toUtc || utc && !hasOffset && (styles & DateTimeStyles.RoundtripKind) == DateTimeStyles.RoundtripKind)
+						return new DateTime(moment, DateTimeKind.Utc);
+					return new DateTime(moment, DateTimeKind.Utc).ToLocalTime();
+				}
+				if ((styles & DateTimeStyles.AssumeUniversal) == DateTimeStyles.AssumeUniversal)
+				{
+					DateTime universal = new DateTime(ticks, DateTimeKind.Utc);
+					return toUtc ? universal : universal.ToLocalTime();
+				}
+				if ((styles & DateTimeStyles.AssumeLocal) == DateTimeStyles.AssumeLocal)
+				{
+					DateTime local = new DateTime(ticks, DateTimeKind.Local);
+					return toUtc ? local.ToUniversalTime() : local;
+				}
+				return new DateTime(ticks, DateTimeKind.Unspecified);
+			}
+
+			/// Digits at `at` (at least `least`, at most `most`) as a number; -1 when there are too few.
+			Number(str text, i32 at, i32 least, i32 most) : i64
+			{
+				i64 n = 0;
+				i32 i = at;
+				loop (i < text.Length && i - at < most && text[i] >= '0' && text[i] <= '9')
+				{
+					n = n * 10 + (text[i] - '0');
+					i++;
+				}
+				return i - at < least ? -1 : n;
+			}
+
+			/// How many digits follow `at` (up to `most`).
+			DigitCount(str text, i32 at, i32 most) : i32
+			{
+				i32 i = at;
+				loop (i < text.Length && i - at < most && text[i] >= '0' && text[i] <= '9')
+					i++;
+				return i - at;
+			}
+
+			/// Which of `names` (ignoring case) the text at `at` starts with, longest first: its index, and its length in
+			/// `length[0]`; -1 when none.
+			Name(str text, i32 at, str[] names, i32[] length) : i32
+			{
+				i32 best = -1;
+				loop (i32 n = 0..names.Length)
+				{
+					str name = names[n];
+					if (at + name.Length > text.Length || (best >= 0 && name.Length <= length[0]))
+						continue;
+					bool same = true;
+					loop (i32 k = 0..name.Length)
+					{
+						u8 a = text[at + k], b = name[k];
+						if (a >= 'A' && a <= 'Z')
+							a = (u8)(a + 32);
+						if (b >= 'A' && b <= 'Z')
+							b = (u8)(b + 32);
+						if (a != b)
+						{
+							same = false;
+							break;
+						}
+					}
+					if (same)
+					{
+						best = n;
+						length[0] = name.Length;
+					}
+				}
+				return best;
+			}
+
+			/// An offset at `at`: `+hh:mm`, `+hhmm` or `+hh` (`-` too), into `found`; how many units it took (0: none).
+			Zone(str text, i32 at, DateFields found) : i32
+			{
+				if (at >= text.Length || text[at] != '+' && text[at] != '-')
+					return 0;
+				i32 i = at + 1;
+				i32 hourDigits = DigitCount(text, i, 2);
+				if (hourDigits == 0)
+					return 0;
+				i64 hours = Number(text, i, 1, 2), minutes = 0;
+				i += hourDigits;
+				if (i < text.Length && text[i] == ':')
+				{
+					if (DigitCount(text, i + 1, 2) != 2)
+						return 0;
+					minutes = Number(text, i + 1, 2, 2);
+					i += 3;
+				}
+				else if (hourDigits == 2 && DigitCount(text, i, 2) == 2)
+				{
+					minutes = Number(text, i, 2, 2);
+					i += 2;
+				}
+				if (hours > 14 || minutes > 59)
+					return 0;
+				found.HasOffset = true;
+				found.Offset = (hours * 60 + minutes) * 600000000 * (text[at] == '-' ? -1 : 1);
+				return i - at;
+			}
+
+			/// `text` in exactly a custom pattern.
+			ReadExact(str text, str format, DateFields found) : bool
+			{
+				i32[] length = new i32[1];
+				i32 at = 0, i = 0;
+				loop (i < format.Length)
+				{
+					u8 c = format[i];
+					i32 run = Run(format, i);
+					if (c == 'y' || c == 'M' && run <= 2 || c == 'd' && run <= 2 || c == 'H' || c == 'h' || c == 'm' || c == 's')
+					{
+						i32 least = run >= 2 ? run : 1, most = c == 'y' && run != 2 ? (run > 4 ? run : 4) : 2;
+						if (c == 'y' && run == 1)
+							most = 2;
+						i32 digits = DigitCount(text, at, most);
+						if (digits < least)
+							return false;
+						i32 n = (i32)Number(text, at, least, most);
+						at += digits;
+						if (c == 'y')
+							found.Year = run <= 2 ? (n < 50 ? 2000 + n : 1900 + n) : n;
+						else if (c == 'M')
+							found.Month = n;
+						else if (c == 'd')
+							found.Day = n;
+						else if (c == 'm')
+							found.Minute = n;
+						else if (c == 's')
+							found.Second = n;
+						else
+							found.Hour = n;
+						if (c == 'H' || c == 'h' || c == 'm' || c == 's')
+							found.HasTime = true;
+					}
+					else if (c == 'M' || c == 'd')
+					{
+						str[] names = c == 'M' ? (run == 3 ? shortMonthNames : monthNames) : (run == 3 ? shortDayNames : dayNames);
+						i32 which = Name(text, at, names, length);
+						if (which < 0)
+							return false;
+						at += length[0];
+						if (c == 'M')
+							found.Month = which + 1;
+						else
+							found.Weekday = which;
+					}
+					else if (c == 'f' || c == 'F')
+					{
+						if (run > 7)
+							return false;
+						i32 digits = DigitCount(text, at, run);
+						if (c == 'f' && digits != run)
+							return false;
+						i64 fraction = digits == 0 ? 0 : Number(text, at, 1, run);
+						at += digits;
+						loop (i32 k = digits; k < 7; k++)
+							fraction = fraction * 10;
+						found.Fraction = fraction;
+					}
+					else if (c == 't')
+					{
+						if (at >= text.Length)
+							return false;
+						u8 h = text[at];
+						if (h != 'A' && h != 'P' && h != 'a' && h != 'p')
+							return false;
+						found.Half = h == 'P' || h == 'p' ? 1 : 0;
+						at++;
+						if (run > 1)
+						{
+							if (at >= text.Length || text[at] != 'M' && text[at] != 'm')
+								return false;
+							at++;
+						}
+					}
+					else if (c == 'K' || c == 'z')
+					{
+						if (at < text.Length && (text[at] == 'Z' || text[at] == 'z') && c == 'K')
+						{
+							found.Utc = true;
+							at++;
+						}
+						else
+						{
+							i32 took = Zone(text, at, found);
+							if (took == 0 && c == 'z')
+								return false;
+							at += took;
+						}
+					}
+					else if (c == '\'' || c == '"')
+					{
+						run = 1;
+						i32 j = i + 1;
+						loop (j < format.Length && format[j] != c)
+						{
+							if (at >= text.Length || text[at] != format[j])
+								return false;
+							at++;
+							j++;
+						}
+						if (j >= format.Length)
+							BadFormat();
+						i = j;
+					}
+					else if (c == '\\')
+					{
+						if (i + 1 >= format.Length || at >= text.Length || text[at] != format[i + 1])
+							return false;
+						at++;
+						run = 2;
+					}
+					else if (c == '%')
+						run = 1;
+					else
+					{
+						loop (i32 k = 0..run)
+						{
+							if (at >= text.Length || text[at] != c)
+								return false;
+							at++;
+						}
+					}
+					i += run;
+				}
+				return at == text.Length;
+			}
+
+			/// `text` in any of the forms Parse reads.
+			ReadAny(str text, DateFields found) : bool
+			{
+				i32[] length = new i32[1];
+				i32 at = 0, end = text.Length;
+				loop (at < end && text[at] == ' ')
+					at++;
+				loop (end > at && text[end - 1] == ' ')
+					end--;
+				if (at == end)
+					return false;
+				str t = at == 0 && end == text.Length ? text : text.Substring(at, end - at);
+				at = 0;
+				end = t.Length;
+				// A day name (checked against the date), and a comma.
+				i32 weekday = Name(t, 0, dayNames, length);
+				if (weekday < 0)
+					weekday = Name(t, 0, shortDayNames, length);
+				if (weekday >= 0)
+				{
+					found.Weekday = weekday;
+					at = length[0];
+					if (at < end && t[at] == ',')
+						at++;
+					loop (at < end && t[at] == ' ')
+						at++;
+				}
+				// The date.
+				i32 first = DigitCount(t, at, 9);
+				if (first > 0 && at + first < end && t[at + first] == ':')
+				{
+					// A time alone.
+				}
+				else if (first > 0)
+				{
+					i64 a = Number(t, at, 1, first);
+					at += first;
+					if (at < end && (t[at] == '-' || t[at] == '/' || t[at] == '.'))
+					{
+						u8 separator = t[at];
+						at++;
+						i32 secondDigits = DigitCount(t, at, 4);
+						i32 month = -1;
+						i64 b = -1;
+						if (secondDigits > 0)
+						{
+							b = Number(t, at, 1, secondDigits);
+							at += secondDigits;
+						}
+						else
+						{
+							month = Name(t, at, monthNames, length);
+							if (month < 0)
+								month = Name(t, at, shortMonthNames, length);
+							if (month < 0)
+								return false;
+							at += length[0];
+						}
+						i64 c = -1;
+						i32 thirdDigits = 0;
+						if (at < end && t[at] == separator)
+						{
+							at++;
+							thirdDigits = DigitCount(t, at, 4);
+							if (thirdDigits == 0)
+								return false;
+							c = Number(t, at, 1, thirdDigits);
+							at += thirdDigits;
+						}
+						if (first >= 3)
+						{
+							// yyyy-MM-dd (or yyyy-MM: the 1st).
+							found.Year = (i32)a;
+							found.Month = month >= 0 ? month + 1 : (i32)b;
+							found.Day = c >= 0 ? (i32)c : 1;
+						}
+						else if (month >= 0)
+						{
+							// dd-MMM-yyyy.
+							found.Day = (i32)a;
+							found.Month = month + 1;
+							found.Year = c >= 0 ? Year((i32)c, thirdDigits) : DateTime.Now.Year;
+						}
+						else
+						{
+							// MM/dd/yyyy (the invariant culture's order), or MM/dd this year.
+							found.Month = (i32)a;
+							found.Day = (i32)b;
+							found.Year = c >= 0 ? Year((i32)c, thirdDigits) : DateTime.Now.Year;
+						}
+					}
+					else
+					{
+						// d MMMM yyyy.
+						loop (at < end && t[at] == ' ')
+							at++;
+						i32 month = Name(t, at, monthNames, length);
+						if (month < 0)
+							month = Name(t, at, shortMonthNames, length);
+						if (month < 0 || first > 2)
+							return false;
+						at += length[0];
+						loop (at < end && (t[at] == ' ' || t[at] == ','))
+							at++;
+						i32 yearDigits = DigitCount(t, at, 4);
+						found.Day = (i32)a;
+						found.Month = month + 1;
+						if (yearDigits > 0 && !(at + yearDigits < end && t[at + yearDigits] == ':'))
+						{
+							found.Year = Year((i32)Number(t, at, 1, yearDigits), yearDigits);
+							at += yearDigits;
+						}
+						else
+							found.Year = DateTime.Now.Year;
+					}
+				}
+				else
+				{
+					// MMMM d, yyyy.
+					i32 month = Name(t, at, monthNames, length);
+					if (month < 0)
+						month = Name(t, at, shortMonthNames, length);
+					if (month < 0)
+						return false;
+					at += length[0];
+					loop (at < end && t[at] == ' ')
+						at++;
+					i32 dayDigits = DigitCount(t, at, 2);
+					if (dayDigits == 0)
+						return false;
+					found.Month = month + 1;
+					found.Day = (i32)Number(t, at, 1, dayDigits);
+					at += dayDigits;
+					loop (at < end && (t[at] == ' ' || t[at] == ','))
+						at++;
+					i32 yearDigits = DigitCount(t, at, 4);
+					if (yearDigits > 0 && !(at + yearDigits < end && t[at + yearDigits] == ':'))
+					{
+						found.Year = Year((i32)Number(t, at, 1, yearDigits), yearDigits);
+						at += yearDigits;
+					}
+					else
+						found.Year = DateTime.Now.Year;
+				}
+				// The time: T or spaces, then H:mm[:ss[.fffffff]] (AM or PM after spaces only).
+				bool iso = at < end && (t[at] == 'T' || t[at] == 't') && found.Year >= 0;
+				if (iso)
+					at++;
+				else
+				{
+					loop (at < end && t[at] == ' ')
+						at++;
+				}
+				i32 hourDigits = DigitCount(t, at, 2);
+				if (hourDigits > 0 && at + hourDigits < end && t[at + hourDigits] == ':')
+				{
+					found.HasTime = true;
+					found.Hour = (i32)Number(t, at, 1, hourDigits);
+					at += hourDigits + 1;
+					if (DigitCount(t, at, 2) != 2)
+						return false;
+					found.Minute = (i32)Number(t, at, 2, 2);
+					at += 2;
+					if (at < end && t[at] == ':')
+					{
+						if (DigitCount(t, at + 1, 2) != 2)
+							return false;
+						found.Second = (i32)Number(t, at + 1, 2, 2);
+						at += 3;
+						if (at < end && (t[at] == '.' || t[at] == ','))
+						{
+							i32 digits = DigitCount(t, at + 1, 40);
+							if (digits == 0)
+								return false;
+							i64 fraction = Number(t, at + 1, 1, digits > 7 ? 7 : digits);
+							loop (i32 k = digits; k < 7; k++)
+								fraction = fraction * 10;
+							// An 8th digit rounds (as .NET does).
+							if (digits > 7 && t[at + 8] >= '5')
+								fraction++;
+							found.Fraction = fraction;
+							at += digits + 1;
+						}
+					}
+					loop (at < end && t[at] == ' ')
+						at++;
+					if (!iso && at + 1 < end && (t[at] == 'A' || t[at] == 'a' || t[at] == 'P' || t[at] == 'p') && (t[at + 1] == 'M' || t[at + 1] == 'm'))
+					{
+						found.Half = t[at] == 'P' || t[at] == 'p' ? 1 : 0;
+						at += 2;
+					}
+				}
+				else if (found.Year < 0)
+					return false;
+				// The zone: Z, GMT, UTC, or an offset.
+				loop (at < end && t[at] == ' ')
+					at++;
+				if (at < end && (t[at] == 'Z' || t[at] == 'z'))
+				{
+					found.Utc = true;
+					at++;
+				}
+				else if (at + 2 < end && t[at] == 'G' && t[at + 1] == 'M' && t[at + 2] == 'T' || at + 2 < end && t[at] == 'U' && t[at + 1] == 'T' && t[at + 2] == 'C')
+				{
+					found.Utc = true;
+					at += 3;
+					at += Zone(t, at, found);
+				}
+				else
+					at += Zone(t, at, found);
+				return at == end;
+			}
+
+			/// A year written with `digits` digits (two: 1950–2049).
+			Year(i32 value, i32 digits) : i32 => digits <= 2 ? (value < 50 ? 2000 + value : 1900 + value) : value;
+	}
+}

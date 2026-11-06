@@ -1,0 +1,532 @@
+// Mathematics on numbers. Every function takes any number (`T : number`, INumber<T>; Abs a signed one, `T : snumber`,
+// ISignedNumber<T>): the primitives (i8 … i256, u8 … u256, f16 … f256) and a program's own. Each use is compiled for
+// its own type, with the type's own operations: the same code as one written for it.
+// Three ways, chosen for each type when the function is compiled for it (both tests are constants for a type):
+// one half is zero for integers only; one plus 2^-53 is above one only for floats more exact than f64.
+// - integers (`T.One / (T.One + T.One) == T.Zero`: one half is zero): exact in the type (Floor and the rest give the
+//   integer back, Sqrt is the integer square root, Pow squares, the logarithms count divisions);
+// - numbers no more exact than f64 (f16, f32, f64, a program's own): the runtime's f64 functions
+//   (the C library's, or the instruction), reached through FromF64/ToF64, which for f64 are nothing at all;
+// - wider floats (f128: 113 bits, f256: 237): computed in the type itself, from an f64 estimate refined by Newton's
+//   method or from series with the argument reduced (π and ln 2 worked out in the type), so no digit is lost to f64.
+
+into namespace System
+{
+	public static class Math
+	{
+		extern("math.sqrt") SqrtOf(f64 x) : f64;
+		extern("math.sin") SinOf(f64 x) : f64;
+		extern("math.cos") CosOf(f64 x) : f64;
+		extern("math.tan") TanOf(f64 x) : f64;
+		extern("math.asin") AsinOf(f64 x) : f64;
+		extern("math.acos") AcosOf(f64 x) : f64;
+		extern("math.atan") AtanOf(f64 x) : f64;
+		extern("math.atan2") Atan2Of(f64 y, f64 x) : f64;
+		extern("math.exp") ExpOf(f64 x) : f64;
+		extern("math.log") LogOf(f64 x) : f64;
+		extern("math.log10") Log10Of(f64 x) : f64;
+		extern("math.pow") PowOf(f64 x, f64 y) : f64;
+		extern("math.floor") FloorOf(f64 x) : f64;
+		extern("math.ceil") CeilingOf(f64 x) : f64;
+
+		/// The nearest integer; halves go to the even one.
+		RoundOf(f64 x) : f64
+		{
+			f64 low = FloorOf(x);
+			f64 rest = x - low;
+			if (rest > 0.5)
+				return low + 1;
+			if (rest < 0.5)
+				return low;
+			return FloorOf(low / 2) * 2 == low ? low : low + 1;
+		}
+
+		/// How many times `x` divides by `by` before it is below it (x >= 1, by >= 2): the integer logarithm.
+		Divisions<T : number>(T x, T by) : T
+		{
+			T count = T.Zero;
+			loop (!(x < by))
+			{
+				x = x / by;
+				count = count + T.One;
+			}
+			return count;
+		}
+
+		// ── Wider floats, in the type ───────────────────
+
+		// `T.One < T.One + T.FromF64(2^-53)`: T is more exact than f64 (f128, f256). Written where it is asked (a constant
+		// once the function is compiled for T, folded there: no call), as the integer test is.
+
+		/// Whether an f64 is neither NaN nor infinite.
+		Finite(f64 v) : bool => v - v == 0;
+
+		/// `x` times 2^n, exactly (n beyond f64's exponents too).
+		Scaled<T : number>(T x, i32 n) : T
+		{
+			loop (n > 1000)
+			{
+				x = x * T.FromF64(1.0715086071862673e301);
+				n = n - 1000;
+			}
+			loop (n < -1000)
+			{
+				x = x * T.FromF64(9.332636185032189e-302);
+				n = n + 1000;
+			}
+			return x * T.FromF64(PowOf(2, n));
+		}
+
+		/// `x` to an integer power, by squaring (a negative one is the reciprocal's).
+		PowInteger<T : number>(T x, i64 n) : T
+		{
+			bool inverse = n < 0;
+			if (inverse)
+				n = -n;
+			T result = T.One;
+			T factor = x;
+			loop (n > 0)
+			{
+				if (n % 2 == 1)
+					result = result * factor;
+				n = n / 2;
+				if (n > 0)
+					factor = factor * factor;
+			}
+			return inverse ? T.One / result : result;
+		}
+
+		/// The largest integer not above `x`: the f64-sized parts taken off one at a time (each is exact), the last below
+		/// 2^52 floored and corrected by one if its f64 rounded across an integer.
+		FloorWide<T : number>(T x) : T
+		{
+			if (!Finite(T.ToF64(x)))
+				return x; // NaN, an infinity, or beyond f64's range: whole already
+			T big = T.FromF64(4503599627370496.0);
+			T result = T.Zero;
+			T rest = x;
+			loop (!(rest < big) || !(T.Zero - big < rest))
+			{
+				T part = T.FromF64(T.ToF64(rest));
+				result = result + part;
+				rest = rest - part;
+			}
+			T low = T.FromF64(FloorOf(T.ToF64(rest)));
+			if (rest < low)
+				low = low - T.One;
+			else if (!(rest < low + T.One))
+				low = low + T.One;
+			return result + low;
+		}
+
+		CeilingWide<T : number>(T x) : T => T.Zero - FloorWide(T.Zero - x);
+
+		RoundWide<T : number>(T x) : T
+		{
+			T two = T.One + T.One;
+			T low = FloorWide(x);
+			T rest = x - low;
+			T half = T.One / two;
+			if (half < rest)
+				return low + T.One;
+			if (rest < half)
+				return low;
+			return FloorWide(low / two) * two == low ? low : low + T.One;
+		}
+
+		/// Newton's method from the f64 root (doubling the exact bits each step), in f64's range by an even power of two.
+		SqrtWide<T : number>(T x) : T
+		{
+			if (!(T.Zero < x) || !Finite(T.ToF64(x)) && x == x + x)
+				return T.FromF64(SqrtOf(T.ToF64(x))); // zero, negative (NaN), NaN, an infinity
+			i32 scale = 0;
+			loop (!Finite(T.ToF64(x)))
+			{
+				x = Scaled(x, -1000);
+				scale = scale + 500;
+			}
+			loop (T.ToF64(x) < 1e-300)
+			{
+				x = Scaled(x, 1000);
+				scale = scale - 500;
+			}
+			T two = T.One + T.One;
+			T root = T.FromF64(SqrtOf(T.ToF64(x)));
+			loop (i32 i = 0..8)
+			{
+				T next = (root + x / root) / two;
+				if (next == root)
+					break;
+				root = next;
+			}
+			return Scaled(root, scale);
+		}
+
+		/// ln 2 = 2 atanh(1/3), its series summed until a term no longer changes the sum.
+		Ln2<T : number>(T unit) : T
+		{
+			T z = T.One / T.FromF64(3);
+			T z2 = z * z;
+			T term = z;
+			T sum = T.Zero;
+			i32 n = 1;
+			loop (i32 i = 0..2000)
+			{
+				T next = sum + term / T.FromF64(n);
+				if (next == sum)
+					break;
+				sum = next;
+				term = term * z2;
+				n = n + 2;
+			}
+			return sum + sum;
+		}
+
+		/// atan(1/k), its series.
+		AtanInverse<T : number>(T unit, i32 k) : T
+		{
+			T z = T.One / T.FromF64(k);
+			T z2 = z * z;
+			T term = z;
+			T sum = T.Zero;
+			i32 n = 1;
+			bool add = true;
+			loop (i32 i = 0..2000)
+			{
+				T part = term / T.FromF64(n);
+				T next = add ? sum + part : sum - part;
+				if (next == sum)
+					break;
+				sum = next;
+				term = term * z2;
+				n = n + 2;
+				add = !add;
+			}
+			return sum;
+		}
+
+		/// π by Machin's formula: 16 atan(1/5) − 4 atan(1/239).
+		PiOf<T : number>(T unit) : T => T.FromF64(16) * AtanInverse(unit, 5) - T.FromF64(4) * AtanInverse(unit, 239);
+
+		/// e^x: x − k ln 2 (|r| ≤ ½ ln 2), its series, times 2^k.
+		ExpWide<T : number>(T x) : T
+		{
+			f64 v = T.ToF64(x);
+			if (!Finite(v) || v > 1e7 || v < -1e7)
+				return T.FromF64(ExpOf(v)); // NaN, overflow, underflow
+			f64 k = RoundOf(v / 0.6931471805599453);
+			T r = x - T.FromF64(k) * Ln2(x);
+			T term = T.One;
+			T sum = T.One;
+			loop (i32 n = 1..1000)
+			{
+				term = term * r / T.FromF64(n);
+				T next = sum + term;
+				if (next == sum)
+					break;
+				sum = next;
+			}
+			return Scaled(sum, (i32)k);
+		}
+
+		/// ln x: x = m·2^e (m in f64's range), Halley's method on e^y = m from the f64 logarithm, plus e ln 2.
+		LogWide<T : number>(T x) : T
+		{
+			if (!(T.Zero < x) || !Finite(T.ToF64(x)) && x == x + x)
+				return T.FromF64(LogOf(T.ToF64(x)));
+			i32 e = 0;
+			loop (!Finite(T.ToF64(x)))
+			{
+				x = Scaled(x, -1000);
+				e = e + 1000;
+			}
+			loop (T.ToF64(x) < 1e-300)
+			{
+				x = Scaled(x, 1000);
+				e = e - 1000;
+			}
+			T two = T.One + T.One;
+			T y = T.FromF64(LogOf(T.ToF64(x)));
+			loop (i32 i = 0..6)
+			{
+				T ey = ExpWide(y);
+				T next = y + two * (x - ey) / (x + ey);
+				if (next == y)
+					break;
+				y = next;
+			}
+			return e == 0 ? y : y + T.FromF64(e) * Ln2(x);
+		}
+
+		SinSeries<T : number>(T r) : T
+		{
+			T r2 = r * r;
+			T term = r;
+			T sum = r;
+			i32 n = 1;
+			loop (i32 i = 0..1000)
+			{
+				term = T.Zero - term * r2 / T.FromF64((n + 1) * (n + 2));
+				n = n + 2;
+				T next = sum + term;
+				if (next == sum)
+					break;
+				sum = next;
+			}
+			return sum;
+		}
+
+		CosSeries<T : number>(T r) : T
+		{
+			T r2 = r * r;
+			T term = T.One;
+			T sum = T.One;
+			i32 n = 0;
+			loop (i32 i = 0..1000)
+			{
+				term = T.Zero - term * r2 / T.FromF64((n + 1) * (n + 2));
+				n = n + 2;
+				T next = sum + term;
+				if (next == sum)
+					break;
+				sum = next;
+			}
+			return sum;
+		}
+
+		/// sin x (cosine: shift 1): x − q π/2 (|r| ≤ π/4), the series of sin or cos of r by the quadrant.
+		SinCosWide<T : number>(T x, i64 shift) : T
+		{
+			f64 v = T.ToF64(x);
+			if (!Finite(v))
+				return T.FromF64(shift == 0 ? SinOf(v) : CosOf(v));
+			f64 q = RoundOf(v / 1.5707963267948966);
+			T r = x - T.FromF64(q) * (PiOf(x) / (T.One + T.One));
+			i64 quadrant = (((i64)q + shift) % 4 + 4) % 4;
+			if (quadrant == 0)
+				return SinSeries(r);
+			if (quadrant == 1)
+				return CosSeries(r);
+			if (quadrant == 2)
+				return T.Zero - SinSeries(r);
+			return T.Zero - CosSeries(r);
+		}
+
+		/// atan x: Newton's method on tan y = x from the f64 arctangent.
+		AtanWide<T : number>(T x) : T
+		{
+			if (!Finite(T.ToF64(x)) && x == x + x || x != x)
+				return T.FromF64(AtanOf(T.ToF64(x)));
+			T y = T.FromF64(AtanOf(T.ToF64(x)));
+			loop (i32 i = 0..4)
+			{
+				T s = SinCosWide(y, 0);
+				T c = SinCosWide(y, 1);
+				T next = y - c * (s - x * c);
+				if (next == y)
+					break;
+				y = next;
+			}
+			return y;
+		}
+
+		Atan2Wide<T : number>(T y, T x) : T
+		{
+			if (T.Zero < x)
+				return AtanWide(y / x);
+			T pi = PiOf(x);
+			if (x < T.Zero)
+				return y < T.Zero ? AtanWide(y / x) - pi : AtanWide(y / x) + pi;
+			if (x == T.Zero && y == y)
+				return T.Zero < y ? pi / (T.One + T.One) : y < T.Zero ? T.Zero - pi / (T.One + T.One) : T.Zero;
+			return T.FromF64(Atan2Of(T.ToF64(y), T.ToF64(x)));
+		}
+
+		PowWide<T : number>(T x, T y) : T
+		{
+			f64 n = T.ToF64(y);
+			if (FloorWide(y) == y && Finite(n) && n < 4e18 && n > -4e18)
+				return PowInteger(x, (i64)n);
+			if (!(T.Zero < x))
+				return T.FromF64(PowOf(T.ToF64(x), n));
+			return ExpWide(y * LogWide(x));
+		}
+
+		public:
+			static f64 PI { get => 3.141592653589793; }
+			static f64 E { get => 2.718281828459045; }
+			static f64 Tau { get => 6.283185307179586; }
+
+			/// The square root; of an integer, the largest integer whose square is at most `x` (ISqrt).
+			[Inline] Sqrt<T : number>(T x) : T => T.One / (T.One + T.One) == T.Zero ? ISqrt(x) : T.One < T.One + T.FromF64(1.1102230246251565e-16) ? SqrtWide(x) : T.FromF64(SqrtOf(T.ToF64(x)));
+
+			Sin<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? SinCosWide(x, 0) : T.FromF64(SinOf(T.ToF64(x)));
+			Cos<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? SinCosWide(x, 1) : T.FromF64(CosOf(T.ToF64(x)));
+			Tan<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? SinCosWide(x, 0) / SinCosWide(x, 1) : T.FromF64(TanOf(T.ToF64(x)));
+			Asin<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? Atan2Wide(x, SqrtWide(T.One - x * x)) : T.FromF64(AsinOf(T.ToF64(x)));
+			Acos<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? Atan2Wide(SqrtWide(T.One - x * x), x) : T.FromF64(AcosOf(T.ToF64(x)));
+			Atan<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? AtanWide(x) : T.FromF64(AtanOf(T.ToF64(x)));
+			Atan2<T : number>(T y, T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? Atan2Wide(y, x) : T.FromF64(Atan2Of(T.ToF64(y), T.ToF64(x)));
+			Exp<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? ExpWide(x) : T.FromF64(ExpOf(T.ToF64(x)));
+
+			/// The natural logarithm.
+			Log<T : number>(T x) : T => T.One < T.One + T.FromF64(1.1102230246251565e-16) ? LogWide(x) : T.FromF64(LogOf(T.ToF64(x)));
+
+			/// The logarithm in `newBase`; of integers, the largest power of `newBase` not above `x` (exact: 1000 in base
+			/// 10 is 3, where a floating-point quotient would give 2.9999...).
+			Log<T : number>(T x, T newBase) : T
+			{
+				T two = T.One + T.One;
+				if (T.One / two == T.Zero && !(x < T.One) && !(newBase < two))
+					return Divisions(x, newBase);
+				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
+					return LogWide(x) / LogWide(newBase);
+				return T.FromF64(LogOf(T.ToF64(x)) / LogOf(T.ToF64(newBase)));
+			}
+
+			/// The logarithm in base 10 (of an integer, exact, as `Log(x, 10)`).
+			Log10<T : number>(T x) : T
+			{
+				if (T.One / (T.One + T.One) == T.Zero && !(x < T.One))
+					return Divisions(x, T.FromF64(10));
+				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
+					return LogWide(x) / LogWide(T.FromF64(10));
+				return T.FromF64(Log10Of(T.ToF64(x)));
+			}
+
+			/// The logarithm in base 2 (of an integer, exact, as `Log(x, 2)`).
+			Log2<T : number>(T x) : T
+			{
+				T two = T.One + T.One;
+				if (T.One / two == T.Zero && !(x < T.One))
+					return Divisions(x, two);
+				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
+					return LogWide(x) / Ln2(x);
+				return T.FromF64(LogOf(T.ToF64(x)) / 0.6931471805599453);
+			}
+
+			/// `x` to the power `y`; of integers with `y >= 0`, exact in the type (squaring, as many multiplications as
+			/// `y` has bits), where f64 would round past 2^53.
+			Pow<T : number>(T x, T y) : T
+			{
+				T two = T.One + T.One;
+				if (T.One / two == T.Zero && !(y < T.Zero))
+				{
+					T result = T.One;
+					T factor = x;
+					T rest = y;
+					loop (rest > T.Zero)
+					{
+						if (rest % two == T.One)
+							result = result * factor;
+						rest = rest / two;
+						if (rest > T.Zero)
+							factor = factor * factor;
+					}
+					return result;
+				}
+				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
+					return PowWide(x, y);
+				return T.FromF64(PowOf(T.ToF64(x), T.ToF64(y)));
+			}
+
+			/// The largest integer not above `x` (an integer is its own).
+			[Inline] Floor<T : number>(T x) : T => T.One / (T.One + T.One) == T.Zero ? x : T.One < T.One + T.FromF64(1.1102230246251565e-16) ? FloorWide(x) : T.FromF64(FloorOf(T.ToF64(x)));
+
+			/// The smallest integer not below `x` (an integer is its own).
+			[Inline] Ceiling<T : number>(T x) : T => T.One / (T.One + T.One) == T.Zero ? x : T.One < T.One + T.FromF64(1.1102230246251565e-16) ? CeilingWide(x) : T.FromF64(CeilingOf(T.ToF64(x)));
+
+			/// The integer part, toward zero (an integer is its own).
+			Truncate<T : number>(T x) : T
+			{
+				if (T.One / (T.One + T.One) == T.Zero)
+					return x;
+				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
+					return x < T.Zero ? CeilingWide(x) : FloorWide(x);
+				f64 v = T.ToF64(x);
+				if (v < 0)
+					return T.FromF64(CeilingOf(v));
+				return T.FromF64(FloorOf(v));
+			}
+
+			/// The nearest integer; halves go to the even one (an integer is its own).
+			Round<T : number>(T x) : T => T.One / (T.One + T.One) == T.Zero ? x : T.One < T.One + T.FromF64(1.1102230246251565e-16) ? RoundWide(x) : T.FromF64(RoundOf(T.ToF64(x)));
+
+			/// Rounded to `digits` decimal places (an integer is its own).
+			Round<T : number>(T x, i32 digits) : T
+			{
+				if (T.One / (T.One + T.One) == T.Zero)
+					return x;
+				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
+				{
+					T scale = PowInteger(T.FromF64(10), digits);
+					return RoundWide(x * scale) / scale;
+				}
+				f64 factor = PowOf(10, digits);
+				return T.FromF64(RoundOf(T.ToF64(x) * factor) / factor);
+			}
+
+			/// `x` without its sign.
+			Abs<T : snumber>(T x) : T => x < T.Zero ? -x : x;
+
+			/// The smaller of two numbers.
+			Min<T : number>(T a, T b) : T => a < b ? a : b;
+
+			/// The larger of two numbers.
+			Max<T : number>(T a, T b) : T => a > b ? a : b;
+
+			/// `value` within `low` … `high`.
+			Clamp<T : number>(T value, T low, T high) : T => value < low ? low : value > high ? high : value;
+
+			/// -1, 0 or 1: the sign of `x`.
+			Sign<T : number>(T x) : i32 => x < T.Zero ? -1 : x > T.Zero ? 1 : 0;
+
+			/// The largest integer whose square is at most `x` (x >= 0). Up to 64 bits, the f64 root corrected by division
+			/// (not by squaring, which would overflow near the type's largest value). Wider, the f64 root is only close to
+			/// 53 bits: from just above it Newton's method in the type comes down to the root in a few steps.
+			ISqrt<T : number>(T x) : T
+			{
+				T two = T.One + T.One;
+				if (x < two)
+					return x;
+				T root = T.FromF64(FloorOf(SqrtOf(T.ToF64(x))));
+				if (T.ToF64(x) > 20282409603651670423947251286016.0)
+				{
+					// Past 2^104 the f64 root is off by more than a few: from just above it (the estimate is off by less than
+					// one part in 2^52) Newton's method in the type comes down to the root in a few steps.
+					root = root + root / T.FromF64(1099511627776.0) + T.One;
+					loop (true)
+					{
+						T next = (root + x / root) / two;
+						if (!(next < root))
+							break;
+						root = next;
+					}
+					return root;
+				}
+				if (root < T.One)
+					root = T.One;
+				loop (root > T.One && root > x / root)
+					root = root - T.One;
+				loop (!(x / (root + T.One) < root + T.One))
+					root = root + T.One;
+				return root;
+			}
+
+			/// The greatest common divisor (of the numbers without their sign).
+			Gcd<T : number>(T a, T b) : T
+			{
+				if (a < T.Zero)
+					a = T.Zero - a;
+				if (b < T.Zero)
+					b = T.Zero - b;
+				loop (b != T.Zero)
+				{
+					T rest = a % b;
+					a = b;
+					b = rest;
+				}
+				return a;
+			}
+	}
+}

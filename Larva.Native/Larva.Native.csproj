@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefineConstants>$(DefineConstants);LARVA_NATIVE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The stream intrinsics, shared with the VM (internal here: this project depends on nothing). -->
+    <Compile Include="..\Larva.IR\HostStreams.cs" Link="HostStreams.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The C runtime of native executables, compiled when a program is linked. -->
+    <EmbeddedResource Include="Runtime/larva_rt.c" LogicalName="Larva.Native.Runtime.larva_rt.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Larva.IR\SoftFloat.cs" Link="SoftFloat.cs" />
+  </ItemGroup>
+
+</Project>

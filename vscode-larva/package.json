@@ -1,0 +1,215 @@
+{
+  "name": "larva",
+  "displayName": "Larva",
+  "description": "The Larva toolchain in VS Code: the language server (larva lsp) for every language installed in Larva, .queen projects, and commands to create, run, check and build projects and to bind native libraries.",
+  "version": "0.8.0",
+  "publisher": "larva",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "larva",
+    "queen",
+    "hive",
+    "compiler",
+    "bindings"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "workspaceContains:**/*.queen",
+    "onLanguage:queen",
+    "onLanguage:larva-bind"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "queen",
+        "aliases": [
+          "Queen project",
+          "queen"
+        ],
+        "extensions": [
+          ".queen"
+        ],
+        "configuration": "./queen-configuration.json",
+        "icon": {
+          "light": "./images/queen-file.svg",
+          "dark": "./images/queen-file.svg"
+        }
+      },
+      {
+        "id": "larva-bind",
+        "aliases": [
+          "Larva binding description"
+        ],
+        "extensions": [
+          ".bind"
+        ],
+        "icon": {
+          "light": "./images/bind-file.svg",
+          "dark": "./images/bind-file.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "queen",
+        "scopeName": "source.queen",
+        "path": "./syntaxes/queen.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "larva.newProject",
+        "title": "New Project from a Template",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.run",
+        "title": "Run",
+        "category": "Larva",
+        "icon": "$(play)"
+      },
+      {
+        "command": "larva.check",
+        "title": "Check",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.buildExe",
+        "title": "Build Native Executable",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.buildWasm",
+        "title": "Build WebAssembly",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.bind",
+        "title": "Bind a Native Library (C header or .bind)",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.bindProfile",
+        "title": "Generate Bindings from the Profile Open (larva bind --profile)",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.bindList",
+        "title": "List a Native Library's Exports",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.showType",
+        "title": "Show Type (decompiled)",
+        "category": "Larva"
+      },
+      {
+        "command": "larva.restartServer",
+        "title": "Restart Language Server",
+        "category": "Larva"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "larva.run",
+          "when": "resourceLangId in larva.languages || resourceExtname == .queen"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "larva.run",
+          "when": "editorLangId in larva.languages || resourceExtname == .queen"
+        },
+        {
+          "command": "larva.check",
+          "when": "editorLangId in larva.languages || resourceExtname == .queen"
+        },
+        {
+          "command": "larva.buildExe",
+          "when": "editorLangId in larva.languages || resourceExtname == .queen"
+        },
+        {
+          "command": "larva.buildWasm",
+          "when": "editorLangId in larva.languages || resourceExtname == .queen"
+        },
+        {
+          "command": "larva.bindProfile",
+          "when": "editorLangId in larva.languages"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "larva.run",
+        "key": "ctrl+f5",
+        "when": "editorLangId in larva.languages || resourceExtname == .queen"
+      }
+    ],
+    "configuration": {
+      "title": "Larva",
+      "properties": {
+        "larva.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "The `larva` command (`larva.exe`, `larva`, or `larva.dll`): `larva lsp` is the language server, and **Larva: Run**, **Check** and **Build** call `larva build`. Empty: `LARVA_HOME`, then where the Larva installer puts it (`%LOCALAPPDATA%\\Programs\\Larva`; `~/.local/share/larva` on Linux, `~/Library/Application Support/Larva` on macOS), then `larva` on the PATH. Larva is installed on its own, not with the extension."
+        },
+        "larva.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Logs the messages between VS Code and the language server (Output panel, Larva)."
+        }
+      }
+    },
+    "semanticTokenTypes": [
+      {
+        "id": "genericBracket",
+        "superType": "type",
+        "description": "The angle brackets of type parameters and type arguments (List<T>)."
+      },
+      {
+        "id": "field",
+        "superType": "property",
+        "description": "A field of a type (properties are `property`; a constant is a `variable` that is `readonly` and `static`)."
+      },
+      {
+        "id": "exception",
+        "superType": "class",
+        "description": "A class derived from System.Exception."
+      },
+      {
+        "id": "attribute",
+        "superType": "class",
+        "description": "A class derived from System.Attribute, where it is named and where it is applied."
+      },
+      {
+        "id": "bitflags",
+        "superType": "enum",
+        "description": "An enum of flags."
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.2.1"
+  },
+  "scripts": {
+    "package": "vsce package --allow-missing-repository --skip-license"
+  },
+  "icon": "images/larva.png"
+}

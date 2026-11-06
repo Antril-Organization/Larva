@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Hive</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Larva.Tests" />
+    <InternalsVisibleTo Include="Larva.Hir.Tests" />
+    <InternalsVisibleTo Include="Larva.Build.Tests" />
+    <InternalsVisibleTo Include="Larva.Bindings.Tests" />
+    <InternalsVisibleTo Include="Antril.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.Build\Larva.Build.csproj" />
+  </ItemGroup>
+
+</Project>

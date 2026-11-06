@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Queen project",
+  "scopeName": "source.queen",
+  "patterns": [
+    { "name": "comment.line.double-slash.queen", "match": "(?<![:\\w])//.*$" },
+    { "name": "comment.block.queen", "begin": "/\\*", "end": "\\*/" },
+    {
+      "match": "^\\s*(queen)\\s+([\\d.]+)\\s*(;)",
+      "captures": {
+        "1": { "name": "keyword.other.queen" },
+        "2": { "name": "constant.numeric.queen" },
+        "3": { "name": "punctuation.terminator.queen" }
+      }
+    },
+    {
+      "match": "^\\s*(chunk)\\s+([A-Z][A-Z0-9_]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "keyword.other.queen" },
+        "2": { "name": "entity.name.section.queen" },
+        "3": { "name": "punctuation.separator.queen" }
+      }
+    },
+    {
+      "match": "(?<=^|[\\s,])([A-Za-z_][\\w.]*)\\s*(:)(?!//)",
+      "captures": {
+        "1": { "name": "variable.other.property.queen" },
+        "2": { "name": "punctuation.separator.key-value.queen" }
+      }
+    },
+    {
+      "name": "meta.embedded.expression.queen",
+      "begin": "\\$\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.queen" } },
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.queen" } },
+      "contentName": "source.embedded.queen"
+    },
+    { "name": "string.quoted.double.queen", "begin": "\"", "end": "\"" },
+    { "name": "constant.language.queen", "match": "\\b(true|false)\\b" },
+    { "name": "constant.numeric.queen", "match": "(?<![\\w.])v?-?\\d+(\\.\\d+)*\\b" },
+    { "name": "punctuation.separator.comma.queen", "match": "," }
+  ]
+}

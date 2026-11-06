@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    LarvaSetup.exe: the Larva toolchain's installer for Windows. It carries larva (and System.Core's source) as a zip
+    (payload.zip, embedded at publish: -p:Payload=path/to/payload.zip) and installs it for the current user. Built by
+    tools/build-installer.ps1.
+  -->
+  <PropertyGroup>
+    <!-- A window, not a console: the wizard. The command line (silent setup, help) attaches to the caller's console. -->
+    <OutputType>WinExe</OutputType>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>larva.ico</ApplicationIcon>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>LarvaSetup</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version>0.8.0</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- What Windows shows in the file's Properties > Details. -->
+    <Product>Larva</Product>
+    <Company>Larva</Company>
+    <AssemblyTitle>Larva Setup</AssemblyTitle>
+    <Description>Larva Setup</Description>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(Payload)' != ''">
+    <EmbeddedResource Include="$(Payload)" LogicalName="payload.zip" />
+  </ItemGroup>
+
+</Project>

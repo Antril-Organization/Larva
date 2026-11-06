@@ -1,0 +1,684 @@
+// Tuples: `(i32, str)` is ValueTuple<i32, str>, and `(1, "a")` makes one. ValueTuple is a value whose items can be
+// changed; Tuple is a class whose items are fixed once it is made. Both hold their items as Item1, Item2… and are
+// records: `==` compares the items, `with` copies one with some replaced, `t is (var a, var b)` takes them in order,
+// ToString() shows `(1, a)`, and Equals/Hash() make them keys of a Dictionary. 1 to 16 items are written out below;
+// more come from the variadic ValueTuple<TArgs...> and Tuple<TArgs...> at the end, made for the sizes a program uses.
+
+into namespace System
+{
+	/// 1 item in a value: Item1, which can be changed.
+	public record value ValueTuple<T1>
+	{
+		public:
+			T1 Item1;
+
+			new(T1 Item1);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1> => new Tuple<T1>(Item1);
+	}
+
+	/// 1 item in an object: Item1, fixed when it is made.
+	public record class Tuple<T1>
+	{
+		public:
+			readonly T1 Item1;
+
+			new(T1 Item1);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1> => new ValueTuple<T1>(Item1);
+	}
+
+	/// 2 items in a value: Item1…Item2, which can be changed.
+	public record value ValueTuple<T1, T2>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+
+			new(T1 Item1, T2 Item2);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2> => new Tuple<T1, T2>(Item1, Item2);
+	}
+
+	/// 2 items in an object: Item1…Item2, fixed when it is made.
+	public record class Tuple<T1, T2>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+
+			new(T1 Item1, T2 Item2);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2> => new ValueTuple<T1, T2>(Item1, Item2);
+	}
+
+	/// 3 items in a value: Item1…Item3, which can be changed.
+	public record value ValueTuple<T1, T2, T3>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+
+			new(T1 Item1, T2 Item2, T3 Item3);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3> => new Tuple<T1, T2, T3>(Item1, Item2, Item3);
+	}
+
+	/// 3 items in an object: Item1…Item3, fixed when it is made.
+	public record class Tuple<T1, T2, T3>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+
+			new(T1 Item1, T2 Item2, T3 Item3);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3> => new ValueTuple<T1, T2, T3>(Item1, Item2, Item3);
+	}
+
+	/// 4 items in a value: Item1…Item4, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4> => new Tuple<T1, T2, T3, T4>(Item1, Item2, Item3, Item4);
+	}
+
+	/// 4 items in an object: Item1…Item4, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4> => new ValueTuple<T1, T2, T3, T4>(Item1, Item2, Item3, Item4);
+	}
+
+	/// 5 items in a value: Item1…Item5, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5> => new Tuple<T1, T2, T3, T4, T5>(Item1, Item2, Item3, Item4, Item5);
+	}
+
+	/// 5 items in an object: Item1…Item5, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5> => new ValueTuple<T1, T2, T3, T4, T5>(Item1, Item2, Item3, Item4, Item5);
+	}
+
+	/// 6 items in a value: Item1…Item6, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6> => new Tuple<T1, T2, T3, T4, T5, T6>(Item1, Item2, Item3, Item4, Item5, Item6);
+	}
+
+	/// 6 items in an object: Item1…Item6, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6> => new ValueTuple<T1, T2, T3, T4, T5, T6>(Item1, Item2, Item3, Item4, Item5, Item6);
+	}
+
+	/// 7 items in a value: Item1…Item7, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7> => new Tuple<T1, T2, T3, T4, T5, T6, T7>(Item1, Item2, Item3, Item4, Item5, Item6, Item7);
+	}
+
+	/// 7 items in an object: Item1…Item7, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7>(Item1, Item2, Item3, Item4, Item5, Item6, Item7);
+	}
+
+	/// 8 items in a value: Item1…Item8, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8);
+	}
+
+	/// 8 items in an object: Item1…Item8, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8);
+	}
+
+	/// 9 items in a value: Item1…Item9, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9);
+	}
+
+	/// 9 items in an object: Item1…Item9, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9);
+	}
+
+	/// 10 items in a value: Item1…Item10, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10);
+	}
+
+	/// 10 items in an object: Item1…Item10, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10);
+	}
+
+	/// 11 items in a value: Item1…Item11, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+			T11 Item11;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11);
+	}
+
+	/// 11 items in an object: Item1…Item11, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+			readonly T11 Item11;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11);
+	}
+
+	/// 12 items in a value: Item1…Item12, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+			T11 Item11;
+			T12 Item12;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12);
+	}
+
+	/// 12 items in an object: Item1…Item12, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+			readonly T11 Item11;
+			readonly T12 Item12;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12);
+	}
+
+	/// 13 items in a value: Item1…Item13, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+			T11 Item11;
+			T12 Item12;
+			T13 Item13;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13);
+	}
+
+	/// 13 items in an object: Item1…Item13, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+			readonly T11 Item11;
+			readonly T12 Item12;
+			readonly T13 Item13;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13);
+	}
+
+	/// 14 items in a value: Item1…Item14, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+			T11 Item11;
+			T12 Item12;
+			T13 Item13;
+			T14 Item14;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13, T14 Item14);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13, Item14);
+	}
+
+	/// 14 items in an object: Item1…Item14, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+			readonly T11 Item11;
+			readonly T12 Item12;
+			readonly T13 Item13;
+			readonly T14 Item14;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13, T14 Item14);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13, Item14);
+	}
+
+	/// 15 items in a value: Item1…Item15, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+			T11 Item11;
+			T12 Item12;
+			T13 Item13;
+			T14 Item14;
+			T15 Item15;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13, T14 Item14, T15 Item15);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13, Item14, Item15);
+	}
+
+	/// 15 items in an object: Item1…Item15, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+			readonly T11 Item11;
+			readonly T12 Item12;
+			readonly T13 Item13;
+			readonly T14 Item14;
+			readonly T15 Item15;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13, T14 Item14, T15 Item15);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13, Item14, Item15);
+	}
+
+	/// 16 items in a value: Item1…Item16, which can be changed.
+	public record value ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>
+	{
+		public:
+			T1 Item1;
+			T2 Item2;
+			T3 Item3;
+			T4 Item4;
+			T5 Item5;
+			T6 Item6;
+			T7 Item7;
+			T8 Item8;
+			T9 Item9;
+			T10 Item10;
+			T11 Item11;
+			T12 Item12;
+			T13 Item13;
+			T14 Item14;
+			T15 Item15;
+			T16 Item16;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13, T14 Item14, T15 Item15, T16 Item16);
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> => new Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13, Item14, Item15, Item16);
+	}
+
+	/// 16 items in an object: Item1…Item16, fixed when it is made.
+	public record class Tuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>
+	{
+		public:
+			readonly T1 Item1;
+			readonly T2 Item2;
+			readonly T3 Item3;
+			readonly T4 Item4;
+			readonly T5 Item5;
+			readonly T6 Item6;
+			readonly T7 Item7;
+			readonly T8 Item8;
+			readonly T9 Item9;
+			readonly T10 Item10;
+			readonly T11 Item11;
+			readonly T12 Item12;
+			readonly T13 Item13;
+			readonly T14 Item14;
+			readonly T15 Item15;
+			readonly T16 Item16;
+
+			new(T1 Item1, T2 Item2, T3 Item3, T4 Item4, T5 Item5, T6 Item6, T7 Item7, T8 Item8, T9 Item9, T10 Item10, T11 Item11, T12 Item12, T13 Item13, T14 Item14, T15 Item15, T16 Item16);
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16> => new ValueTuple<T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16>(Item1, Item2, Item3, Item4, Item5, Item6, Item7, Item8, Item9, Item10, Item11, Item12, Item13, Item14, Item15, Item16);
+	}
+
+	/// More than 16 items in a value: Item1, Item2… for each type of the pack (each size a program uses is made from this).
+	public record value ValueTuple<TArgs...>
+	{
+		public:
+			static loop (T in TArgs from 1)
+			{
+				T Item;
+			}
+
+			new(TArgs item)
+			{
+				static loop (T in TArgs)
+					Item = item;
+			}
+
+			/// The items of a Tuple.
+			new(Tuple<TArgs> items)
+			{
+				static loop (T in TArgs)
+					Item = items.Item;
+			}
+
+			/// The same items in a Tuple (a class).
+			ToTuple() : Tuple<TArgs> => new Tuple<TArgs>(this);
+	}
+
+	/// More than 16 items in an object: Item1, Item2… for each type of the pack, fixed when it is made.
+	public record class Tuple<TArgs...>
+	{
+		public:
+			static loop (T in TArgs from 1)
+			{
+				readonly T Item;
+			}
+
+			new(TArgs item)
+			{
+				static loop (T in TArgs)
+					Item = item;
+			}
+
+			/// The items of a ValueTuple.
+			new(ValueTuple<TArgs> items)
+			{
+				static loop (T in TArgs)
+					Item = items.Item;
+			}
+
+			/// The same items in a ValueTuple.
+			ToValueTuple() : ValueTuple<TArgs> => new ValueTuple<TArgs>(this);
+	}
+}

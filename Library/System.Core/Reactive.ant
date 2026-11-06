@@ -1,0 +1,231 @@
+// Automatic signals. A `reactive` field is a Source: reading it inside an effect makes the effect depend on it, and
+// assigning it runs those effects again. `effect { … }` runs now and whenever something it read changes, and gives the
+// Effect (Dispose stops it). A `reacts` method of a class runs as an effect once its object is constructed.
+// `Reactive.Batch(f)` gathers the changes `f` makes and runs each effect once at the end. An effect does not run again
+// while it runs, so one that writes what it reads does not loop. A `computed` property is a Computed<T>: its value is
+// kept until something it read changes (then it is stale, and whoever read it is notified); it is computed again only
+// when it is read next. Each run of an effect starts from no dependencies: a Source it stops reading stops running it.
+
+into namespace System.Reactive
+{
+	/// What effects depend on: tracked when read inside one, notifying its observers when written.
+	public final class Source
+	{
+		List<Effect> observers = new List<Effect>();
+
+		public:
+			/// Makes the running effect (if any) an observer.
+			Track()
+			{
+				if (Reactive.Current is Effect current)
+				{
+					loop (i32 i = 0..observers.Count)
+					{
+						if (observers[i] == current)
+							return;
+					}
+					observers.Add(current);
+					current.Watching(this);
+				}
+			}
+
+			/// The number of effects it runs.
+			i32 Observers { get => observers.Count; }
+
+		internal Forget(Effect effect)
+		{
+			loop (i32 i = 0..observers.Count)
+			{
+				if (observers[i] == effect)
+				{
+					observers.RemoveAt(i);
+					return;
+				}
+			}
+		}
+
+			/// Runs every observer again (once each, at the end of a batch).
+			Notify()
+			{
+				Effect[] running = observers.ToArray();
+				loop (i32 i = 0..running.Length)
+					Reactive.Schedule(running[i]);
+			}
+	}
+
+	/// A computation that runs again whenever a Source it read notifies, until disposed.
+	public final class Effect
+	{
+		func<> : void body;
+		bool running;
+		bool disposed;
+		List<Source> sources = new List<Source>();
+
+		internal bool Pending;
+
+		/// A lazy effect (a Computed's) does not run when notified: it goes stale, and tells `Dependents`.
+		internal bool Lazy;
+		internal bool Stale;
+		internal Source? Dependents;
+
+		internal Watching(Source source)
+		{
+			sources.Add(source);
+		}
+
+		Release()
+		{
+			loop (i32 i = 0..sources.Count)
+				sources[i].Forget(this);
+			sources.Clear();
+		}
+
+		public:
+			new(func<> : void body)
+			{
+				this.body = body;
+			}
+
+			/// Runs the computation, tracking what it reads (not while it already runs, nor once disposed). It starts
+			/// from no dependencies: only what this run reads keeps running it.
+			Run()
+			{
+				if (running || disposed)
+					return;
+				running = true;
+				Release();
+				Effect? previous = Reactive.Current;
+				Reactive.Current = this;
+				body();
+				Reactive.Current = previous;
+				running = false;
+				Stale = false;
+			}
+
+			/// What a change does to it: runs it, or (lazy) marks it stale once and notifies what depends on it.
+			Trigger()
+			{
+				if (!Lazy)
+				{
+					Run();
+					return;
+				}
+				if (Stale || disposed)
+					return;
+				Stale = true;
+				if (Dependents is Source dependents)
+					dependents.Notify();
+			}
+
+			/// Stops it: it never runs again, and no Source keeps it.
+			Dispose()
+			{
+				disposed = true;
+				Release();
+			}
+
+			/// How many sources its last run read.
+			i32 Sources { get => sources.Count; }
+
+			bool Disposed { get => disposed; }
+	}
+
+	/// A value computed from reactive ones, kept until one of them changes: what `computed T P => e;` makes.
+	public final class Computed<T>
+	{
+		func<> : T compute;
+		T value;
+		Source source = new Source();
+		Effect tracker;
+
+		Refresh()
+		{
+			value = compute();
+		}
+
+		public:
+			new(func<> : T compute)
+			{
+				this.compute = compute;
+				tracker = new Effect(Refresh);
+				tracker.Lazy = true;
+				tracker.Stale = true;
+				tracker.Dependents = source;
+			}
+
+			/// The value (computed now when stale); reading it inside an effect makes the effect depend on it.
+			T Value
+			{
+				get
+				{
+					source.Track();
+					if (tracker.Stale)
+						tracker.Run();
+					return value;
+				}
+			}
+
+			/// Whether the next read computes it again.
+			bool Stale { get => tracker.Stale; }
+
+			/// Stops tracking: it keeps its last value and no Source invalidates it again.
+			Dispose()
+			{
+				tracker.Dispose();
+			}
+	}
+
+	public static class Reactive
+	{
+		static i32 depth;
+		static List<Effect> pending = new List<Effect>();
+
+		public:
+			/// The effect running now (what a Source being read should track), or null.
+			static Effect? Current;
+
+			/// Runs `body` now, and again whenever a reactive value it read changes.
+			static Watch(func<> : void body) : Effect
+			{
+				Effect effect = new Effect(body);
+				effect.Run();
+				return effect;
+			}
+
+			/// Runs `body`; the effects its changes trigger run once each when it is done.
+			static Batch(func<> : void body)
+			{
+				depth++;
+				body();
+				depth--;
+				if (depth == 0)
+					Flush();
+			}
+
+			/// Runs an effect now, or once at the end of the batch in progress.
+			static Schedule(Effect effect)
+			{
+				if (depth == 0)
+				{
+					effect.Trigger();
+					return;
+				}
+				if (!effect.Pending)
+				{
+					effect.Pending = true;
+					pending.Add(effect);
+				}
+			}
+
+		static Flush()
+		{
+			List<Effect> due = pending;
+			pending = new List<Effect>();
+			loop (i32 i = 0..due.Count)
+			{
+				due[i].Pending = false;
+				due[i].Trigger();
+			}
+		}
+	}
+}

@@ -1,0 +1,10 @@
+into namespace App
+{
+	/// What the library offers: a greeting.
+	public class Greeter
+	{
+		public:
+			/// A greeting for `name`.
+			static Greet(str name) : str => "Hello, " + name + "!";
+	}
+}

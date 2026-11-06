@@ -1,0 +1,24 @@
+// What every bitflag enum can do: test and change its bits. An extension of the type parameter constrained to
+// `bitflag enum`, so `perm.HasFlag(Perm.Read)` works for every bitflag enum of the program.
+
+into namespace System
+{
+	ext<T : bitflag enum>(T flags)
+	{
+		public:
+			/// Whether every bit of `x` is set (`(flags & x) == x`).
+			HasFlag(T x) : bool => (flags & x) == x;
+
+			/// Whether any bit of `x` is set.
+			HasAny(T x) : bool => (flags & x) != default(T);
+
+			/// The flags with the bits of `x` set.
+			With(T x) : T => flags | x;
+
+			/// The flags with the bits of `x` cleared.
+			Without(T x) : T => flags & ~x;
+
+			/// The flags with the bits of `x` flipped.
+			Toggle(T x) : T => flags ^ x;
+	}
+}

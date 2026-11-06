@@ -1,0 +1,71 @@
+// Text as bytes: UTF-8 (what files, the console and `str` use). Bytes that are not UTF-8 become U+FFFD.
+
+into namespace System.Text
+{
+	public final class UTF8Encoding
+	{
+		/// Whether `count` bytes from `start` are well-formed UTF-8.
+		static IsValid(u8[] bytes, i32 start, i32 count) : bool
+		{
+			i32 i = start;
+			i32 end = start + count;
+			loop (i < end)
+			{
+				u32 b = bytes[i];
+				if (b < 0x80)
+				{
+					i++;
+					continue;
+				}
+				i32 extra = b >= 0xF5 ? 0 : b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC2 ? 1 : 0;
+				if (extra == 0 || i + extra >= end)
+					return false;
+				u32 point = b & (extra == 1 ? 0x1F : extra == 2 ? 0x0F : 0x07);
+				loop (i32 k = 1..=extra)
+				{
+					u32 next = bytes[i + k];
+					if ((next & 0xC0) != 0x80)
+						return false;
+					point = point << 6 | next & 0x3F;
+				}
+				if (extra == 2 && (point < 0x800 || point >= 0xD800 && point <= 0xDFFF) || extra == 3 && (point < 0x10000 || point > 0x10FFFF))
+					return false;
+				i += extra + 1;
+			}
+			return true;
+		}
+
+		public:
+			/// How many bytes `text` takes in UTF-8 (a str is UTF-8 already: its length).
+			GetByteCount(str text) : i32 => text.Length;
+
+			/// The bytes of `text` (a copy: strings do not change).
+			GetBytes(str text) : u8[]
+			{
+				u8[] units = text.Units();
+				u8[] bytes = new u8[units.Length];
+				loop (i32 i = 0..units.Length)
+					bytes[i] = units[i];
+				return bytes;
+			}
+
+			GetString(u8[] bytes) : str => GetString(bytes, 0, bytes.Length);
+
+			/// The text of `count` bytes from `start` (sequences that are not UTF-8 become U+FFFD).
+			GetString(u8[] bytes, i32 start, i32 count) : str
+			{
+				u8[] copy = new u8[count];
+				loop (i32 i = 0..count)
+					copy[i] = bytes[start + i];
+				if (IsValid(copy, 0, count))
+					return new String<u8>(copy);
+				return new String<u8>(Unicode.Encode<u8>(Unicode.Decode(copy)));
+			}
+	}
+
+	public static class Encoding
+	{
+		public:
+			static UTF8Encoding UTF8 { get => new UTF8Encoding(); }
+	}
+}

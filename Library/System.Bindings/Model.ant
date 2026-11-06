@@ -1,0 +1,432 @@
+// What a binding profile works on: the settings of the binding, and the declarations larva read from the C headers
+// (functions, structs and unions, enums, constants), each with its C name and the name, place and types it will have.
+
+import System;
+import System.IO;
+
+into namespace System.Bindings
+{
+	/// How the source of the binding is split into files.
+	public enum SplitBy
+	{
+		/// One file (the class's name).
+		None,
+		/// One file per C header.
+		Header,
+		/// One file per namespace.
+		Namespace,
+		/// One file per kind: enums, structs, and each class of functions and constants.
+		Kind,
+	}
+
+	/// What happens to a function the headers declare and the library does not export.
+	public enum ExportCheck
+	{
+		/// It is left out (headers declare more than a build exports: other platforms, inline helpers).
+		Keep,
+		/// It is an error.
+		Check,
+	}
+
+	/// What a name is (what `Name` is asked about).
+	public enum NameKind
+	{
+		Type,
+		Function,
+		Constant,
+		Field,
+		Parameter,
+		EnumMember,
+	}
+
+	/// The binding's settings: what is read, where it goes, and the rules every name follows unless a hook says otherwise.
+	/// `Configure` fills them; what the command line names (libraries, headers, -I, -o) comes on top.
+	public final class BindingSettings
+	{
+		public:
+			/// The native libraries (paths from the profile's folder, or names in the system's folder: `kernel32.dll`).
+			/// The first is the one the functions are imported from.
+			List<str> Libraries = new List<str>();
+
+			/// The C headers read (through clang when it is installed).
+			List<str> Headers = new List<str>();
+
+			/// Folders the headers' `#include`s are found in; their `#define`s become constants.
+			List<str> Includes = new List<str>();
+
+			/// The root namespace of the binding.
+			str Namespace = "Bindings";
+
+			/// The static class of the functions and constants (by default: the library's name).
+			str Class = "";
+
+			/// The assembly's name (by default: the class + `Bindings`).
+			str Assembly = "";
+
+			/// The Larva library written (by default: the assembly's name, `.dll`, next to the profile).
+			str Output = "";
+
+			/// The folder the source of the binding is written to ("": none, unless the command line says `--source`).
+			str Source = "";
+
+			/// How the source is split into files.
+			SplitBy Split = SplitBy.None;
+
+			/// Functions the library does not export.
+			ExportCheck Exports = ExportCheck.Keep;
+
+			/// The size of C's `long` in bits: 32 (Windows) or 64 (Linux, macOS).
+			i32 LongBits = 32;
+
+			/// Every declaration read, or (false) only what the headers and include folders declare and the system types they use.
+			bool AllHeaders = false;
+
+			/// C enums become enums (else their values are constants).
+			bool EnumsFromC = true;
+
+			/// An enum whose values are distinct bits (three or more) is a bitflag enum.
+			bool AutoFlags = true;
+
+			/// Each header's declarations go to a sub-namespace named after it (`SDL3.Video`).
+			bool NamespaceByHeader = false;
+
+			/// Each header's functions and constants go to a class named after it (`Video`).
+			bool ClassByHeader = false;
+
+			/// Prefixes stripped from the stem of a header where it names a namespace, class or file (`lib_` of `lib_core.h`; none: `Strip`).
+			List<str> HeaderStrip = new List<str>();
+
+			/// Prefixes stripped from every C name (the longest that fits first), and from each kind's.
+			List<str> Strip = new List<str>();
+			List<str> StripTypes = new List<str>();
+			List<str> StripFunctions = new List<str>();
+			List<str> StripConstants = new List<str>();
+
+			/// The case of each kind of name.
+			NameCase TypeCase = NameCase.Keep;
+			NameCase FunctionCase = NameCase.Keep;
+			NameCase ConstantCase = NameCase.Keep;
+			NameCase FieldCase = NameCase.Keep;
+			NameCase ParameterCase = NameCase.Keep;
+			NameCase MemberCase = NameCase.Pascal;
+
+			/// Enum members lose the prefix they share (`SDL_INIT_VIDEO` → `Video` in `InitFlags`).
+			bool StripMemberPrefix = true;
+	}
+
+	/// A C type as the binding writes it (`i32`, `u8*`, `SDL_Rect*`, `func*<void*> : i32`), and the typedef C wrote it with.
+	public final class CType
+	{
+		public:
+			/// The type in the binding (names of structs and enums are their C names until the end: the runner renames them).
+			str Text;
+
+			/// The C typedef it was written with (`SDL_InitFlags`), or "".
+			str Typedef;
+
+			new(str text, str typedef)
+			{
+				Text = text;
+				Typedef = typedef;
+			}
+
+			/// Whether it is a pointer (`T*`).
+			IsPointer() : bool => Text.EndsWith("*");
+
+			/// Whether it is a number type (`i8` … `u64`, `f32`, `f64`), without pointers.
+			IsNumber() : bool =>
+				Text == "i8" || Text == "u8" || Text == "i16" || Text == "u16" || Text == "i32" || Text == "u32"
+				|| Text == "i64" || Text == "u64" || Text == "f32" || Text == "f64";
+	}
+
+	/// A parameter of a C function.
+	public final class CParameter
+	{
+		public:
+			str CName;
+			/// Its name in the binding.
+			str Name;
+			CType Type;
+
+			new(str cName, CType type)
+			{
+				CName = cName;
+				Name = cName;
+				Type = type;
+			}
+	}
+
+	/// A C function the library exports: an `[Import]` of the binding.
+	public final class CFunction
+	{
+		public:
+			/// The C symbol (what the library exports; never changed).
+			str Entry;
+			/// Its name in the binding.
+			str Name;
+			/// The header that declares it ("" when not known).
+			str Header;
+			/// Where it goes: "" is the settings' (or the header's, with NamespaceByHeader / ClassByHeader).
+			str Namespace = "";
+			str Class = "";
+			str File = "";
+			List<CParameter> Parameters = new List<CParameter>();
+			CType Result;
+
+			new(str entry, str header, CType result)
+			{
+				Entry = entry;
+				Name = entry;
+				Header = header;
+				Result = result;
+			}
+
+			/// Adds a parameter (the model is built this way).
+			Add(str cName, str type, str typedef) : CFunction
+			{
+				Parameters.Add(new CParameter(cName, new CType(type, typedef)));
+				return this;
+			}
+
+			/// The parameter named `cName` in C.
+			Parameter(str cName) : CParameter? => Parameters.Any(p => p.CName == cName) ? Parameters.First(p => p.CName == cName) : null;
+	}
+
+	/// A field of a struct or union.
+	public final class CField
+	{
+		public:
+			str CName;
+			str Name;
+			CType Type;
+
+			new(str cName, CType type)
+			{
+				CName = cName;
+				Name = cName;
+				Type = type;
+			}
+	}
+
+	/// A C struct (or union) with its layout: a value type of the binding.
+	public final class CStruct
+	{
+		public:
+			str CName;
+			str Name;
+			str Header;
+			str Namespace = "";
+			str File = "";
+			bool IsUnion;
+			/// C's `#pragma pack` (0: natural alignment).
+			i32 Pack;
+			List<CField> Fields = new List<CField>();
+
+			new(str cName, str header, bool isUnion, i32 pack)
+			{
+				CName = cName;
+				Name = cName;
+				Header = header;
+				IsUnion = isUnion;
+				Pack = pack;
+			}
+
+			Add(str cName, str type, str typedef) : CStruct
+			{
+				Fields.Add(new CField(cName, new CType(type, typedef)));
+				return this;
+			}
+	}
+
+	/// A member of an enum.
+	public final class CEnumMember
+	{
+		public:
+			str CName;
+			str Name;
+			i64 Value;
+
+			new(str cName, i64 value)
+			{
+				CName = cName;
+				Name = cName;
+				Value = value;
+			}
+	}
+
+	/// An enum (or bitflag enum): from a C enum, or made from constants (`BindingModel.Enum`).
+	public final class CEnum
+	{
+		public:
+			/// Its C name (the C enum's, or the name a profile gave it).
+			str CName;
+			str Name;
+			str Header;
+			str Namespace = "";
+			str File = "";
+			/// Its number type (`i32`, `u32`…).
+			str Underlying;
+			bool IsFlags;
+			List<CEnumMember> Members = new List<CEnumMember>();
+			/// C typedefs whose parameters, results and fields take this enum (`SDL_InitFlags`).
+			List<str> Typedefs = new List<str>();
+			/// The prefix its members lose ("": the one they share, when the settings say so).
+			str MemberPrefix = "";
+
+			new(str cName, str header, str underlying, bool isFlags)
+			{
+				CName = cName;
+				Name = cName;
+				Header = header;
+				Underlying = underlying;
+				IsFlags = isFlags;
+			}
+
+			Add(str cName, i64 value) : CEnum
+			{
+				Members.Add(new CEnumMember(cName, value));
+				return this;
+			}
+
+			/// Takes a typedef: what C wrote with it takes this enum.
+			Typedef(str typedef) : CEnum
+			{
+				Typedefs.Add(typedef);
+				return this;
+			}
+	}
+
+	/// An integer constant (a `#define`, or an enum value no enum took): a `const` of a static class.
+	public final class CConstant
+	{
+		public:
+			str CName;
+			str Name;
+			str Header;
+			str Namespace = "";
+			str Class = "";
+			str File = "";
+			i64 Value;
+
+			new(str cName, str header, i64 value)
+			{
+				CName = cName;
+				Name = cName;
+				Header = header;
+				Value = value;
+			}
+	}
+
+	/// Every declaration of the binding, in the order C declared them, and its settings.
+	public final class BindingModel
+	{
+		public:
+			BindingSettings Settings;
+			List<CFunction> Functions = new List<CFunction>();
+			List<CStruct> Structs = new List<CStruct>();
+			List<CEnum> Enums = new List<CEnum>();
+			List<CConstant> Constants = new List<CConstant>();
+
+			new(BindingSettings settings) { Settings = settings; }
+
+			/// The model larva wrote to `path` for the profile: a declaration a line, its fields between tabs (`E` an enum,
+			/// `M` its member, `T` its typedef; `S` a struct, `F` its field; `C` a constant; `U` a function, `P` its parameter).
+			static Read(BindingSettings settings, str path) : BindingModel
+			{
+				BindingModel model = new BindingModel(settings);
+				// What the member, field and parameter lines belong to (placeholders before the first).
+				CEnum lastEnum = new CEnum("", "", "i32", false);
+				CStruct lastStruct = new CStruct("", "", false, 0);
+				CFunction lastFunction = new CFunction("", "", new CType("void", ""));
+				loop (str line in File.ReadAllLines(path))
+				{
+					if (line.Length < 2)
+						continue;
+					List<str> f = line.Split('\t');
+					str kind = f[0];
+					if (kind == "E")
+						lastEnum = model.AddEnum(f[1], f[2], f[3], f[4] == "1");
+					else if (kind == "M")
+						lastEnum.Add(f[1], Int64.Parse(f[2]));
+					else if (kind == "T")
+						lastEnum.Typedef(f[1]);
+					else if (kind == "S")
+						lastStruct = model.AddStruct(f[1], f[2], f[3] == "1", Int32.Parse(f[4]));
+					else if (kind == "F")
+						lastStruct.Add(f[1], f[2], f[3]);
+					else if (kind == "C")
+						model.AddConstant(f[1], f[2], Int64.Parse(f[3]));
+					else if (kind == "U")
+						lastFunction = model.AddFunction(f[1], f[2], f[3], f[4]);
+					else if (kind == "P")
+						lastFunction.Add(f[1], f[2], f[3]);
+				}
+				return model;
+			}
+
+			AddFunction(str entry, str header, str result, str typedef) : CFunction
+			{
+				CFunction function = new CFunction(entry, header, new CType(result, typedef));
+				Functions.Add(function);
+				return function;
+			}
+
+			AddStruct(str cName, str header, bool isUnion, i32 pack) : CStruct
+			{
+				CStruct structure = new CStruct(cName, header, isUnion, pack);
+				Structs.Add(structure);
+				return structure;
+			}
+
+			AddEnum(str cName, str header, str underlying, bool isFlags) : CEnum
+			{
+				CEnum made = new CEnum(cName, header, underlying, isFlags);
+				Enums.Add(made);
+				return made;
+			}
+
+			AddConstant(str cName, str header, i64 value) : CConstant
+			{
+				CConstant constant = new CConstant(cName, header, value);
+				Constants.Add(constant);
+				return constant;
+			}
+
+			/// The function whose C symbol is `entry`, or null.
+			Function(str entry) : CFunction? => Functions.Any(f => f.Entry == entry) ? Functions.First(f => f.Entry == entry) : null;
+
+			/// The struct named `cName` in C, or null.
+			Struct(str cName) : CStruct? => Structs.Any(s => s.CName == cName) ? Structs.First(s => s.CName == cName) : null;
+
+			/// The enum named `cName`, or null.
+			Enum(str cName) : CEnum? => Enums.Any(e => e.CName == cName) ? Enums.First(e => e.CName == cName) : null;
+
+			/// The constant named `cName` in C, or null.
+			Constant(str cName) : CConstant? => Constants.Any(c => c.CName == cName) ? Constants.First(c => c.CName == cName) : null;
+
+			/// An enum made from the constants whose C names match `pattern` (`SDL_INIT_*`): they leave the constants. Its
+			/// number type is the smallest that holds them; `flags` says whether it is a bitflag enum.
+			MakeEnum(str name, str pattern, bool flags) : CEnum => MakeEnum(name, pattern, "", flags);
+
+			/// An enum made from the constants that match `pattern` and not `except` (`SDL_WINDOW_*`, `SDL_WINDOW_SURFACE_*`).
+			MakeEnum(str name, str pattern, str except, bool flags) : CEnum
+			{
+				List<CConstant> taken = Constants.Where(c => Names.Matches(c.CName, pattern) && (except.Length == 0 || !Names.Matches(c.CName, except)));
+				CEnum made = new CEnum(name, taken.Count > 0 ? taken[0].Header : "", "i32", flags);
+				i64 low = 0;
+				i64 high = 0;
+				loop (CConstant c in taken)
+				{
+					made.Add(c.CName, c.Value);
+					if (c.Value < low)
+						low = c.Value;
+					if (c.Value > high)
+						high = c.Value;
+				}
+				made.Underlying = low < 0 ? (low >= -2147483648 && high <= 2147483647 ? "i32" : "i64") : high <= 2147483647 ? "i32" : high <= 4294967295 ? "u32" : "u64";
+				Constants.RemoveAll(c => Names.Matches(c.CName, pattern) && (except.Length == 0 || !Names.Matches(c.CName, except)));
+				Enums.Add(made);
+				return made;
+			}
+	}
+}

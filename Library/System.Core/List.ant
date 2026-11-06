@@ -1,0 +1,397 @@
+// A growing array: Add, `list[i]`, Insert, RemoveAt, and `loop (T x in list)`.
+
+into namespace System
+{
+	public class List<T>
+	{
+		T[] items;
+		i32 count;
+
+		[NoInline]
+		Grow(i32 needed)
+		{
+			i32 capacity = items.Length == 0 ? 4 : items.Length * 2;
+			if (capacity < needed)
+				capacity = needed;
+			T[] bigger = new T[capacity];
+			loop (i32 i = 0..count)
+				bigger[i] = items[i];
+			items = bigger;
+		}
+
+		public:
+			new() { items = new T[4]; }
+
+			new(i32 capacity) { items = new T[capacity < 1 ? 1 : capacity]; }
+
+			i32 Count { get => count; }
+
+			bool IsEmpty { get => count == 0; }
+
+			/// Adds `item` at the end.
+			Add(T item)
+			{
+				if (count == items.Length)
+					Grow(count + 1);
+				items[count] = item;
+				count++;
+			}
+
+			/// The item at `index` (`list[index]`).
+			At(i32 index) : T
+			{
+				if ((u32)index >= (u32)count)
+					Fail.Index();
+				return items[index];
+			}
+
+			/// Replaces the item at `index` (`list[index] = item`).
+			SetAt(i32 index, T item)
+			{
+				if ((u32)index >= (u32)count)
+					Fail.Index();
+				items[index] = item;
+			}
+
+			/// Puts `item` at `index`, moving the rest one place on.
+			Insert(i32 index, T item)
+			{
+				if ((u32)index > (u32)count)
+					Fail.Index();
+				if (count == items.Length)
+					Grow(count + 1);
+				i32 i = count;
+				loop (i > index)
+				{
+					items[i] = items[i - 1];
+					i--;
+				}
+				items[index] = item;
+				count++;
+			}
+
+			/// Takes out the item at `index` and gives it.
+			RemoveAt(i32 index) : T
+			{
+				if ((u32)index >= (u32)count)
+					Fail.Index();
+				T removed = items[index];
+				loop (i32 i = index..count - 1)
+					items[i] = items[i + 1];
+				count--;
+				return removed;
+			}
+
+			/// The last item, taken out.
+			Pop() : T
+			{
+				if (count == 0)
+					throw new InvalidOperationError("Pop on an empty list");
+				count--;
+				return items[count];
+			}
+
+			Clear() { count = 0; }
+
+			/// The items in a new array.
+			ToArray() : T[]
+			{
+				T[] copy = new T[count];
+				loop (i32 i = 0..count)
+					copy[i] = items[i];
+				return copy;
+			}
+
+			/// Adds every item of `other` at the end.
+			AddRange(List<T> other)
+			{
+				i32 more = other.count;
+				if (count + more > items.Length)
+					Grow(count + more);
+				T[] theirs = other.items;
+				loop (i32 i = 0..more)
+					items[count + i] = theirs[i];
+				count += more;
+			}
+
+			/// The items in reverse order, in place.
+			Reverse()
+			{
+				i32 i = 0;
+				i32 j = count - 1;
+				loop (i < j)
+				{
+					T kept = items[i];
+					items[i] = items[j];
+					items[j] = kept;
+					i++;
+					j--;
+				}
+			}
+
+			/// A new list with `length` items from `start`.
+			GetRange(i32 start, i32 length) : List<T>
+			{
+				if (start < 0 || length < 0 || start + length > count)
+					Fail.Index();
+				List<T> range = new List<T>(length);
+				loop (i32 i = 0..length)
+					range.Add(items[start + i]);
+				return range;
+			}
+
+			/// Sorts the items in place by `order` (negative: a goes first; not stable).
+			Sort(func<T, T> : i32 order) { Array.Sort(items, 0, count, order); }
+
+			/// A new list with the items `match` accepts, in order.
+			Where(func<T> : bool match) : List<T>
+			{
+				List<T> kept = new List<T>();
+				loop (i32 i = 0..count)
+				{
+					T item = items[i];
+					if (match(item))
+						kept.Add(item);
+				}
+				return kept;
+			}
+
+			/// A new list with `convert` of each item.
+			Select<R>(func<T> : R convert) : List<R>
+			{
+				List<R> made = new List<R>(count);
+				loop (i32 i = 0..count)
+					made.Add(convert(items[i]));
+				return made;
+			}
+
+			/// Whether some item is accepted by `match`.
+			Any(func<T> : bool match) : bool => FindIndex(match) >= 0;
+
+			/// Whether every item is accepted by `match`.
+			All(func<T> : bool match) : bool
+			{
+				loop (i32 i = 0..count)
+				{
+					if (!match(items[i]))
+						return false;
+				}
+				return true;
+			}
+
+			/// How many items `match` accepts.
+			CountWhere(func<T> : bool match) : i32
+			{
+				i32 found = 0;
+				loop (i32 i = 0..count)
+				{
+					if (match(items[i]))
+						found++;
+				}
+				return found;
+			}
+
+			/// Where the first item that `match` accepts is, or -1.
+			FindIndex(func<T> : bool match) : i32
+			{
+				loop (i32 i = 0..count)
+				{
+					if (match(items[i]))
+						return i;
+				}
+				return -1;
+			}
+
+			/// The first item that `match` accepts (InvalidOperationError when there is none).
+			First(func<T> : bool match) : T
+			{
+				i32 at = FindIndex(match);
+				if (at < 0)
+					throw new InvalidOperationError("First: no item matches");
+				return items[at];
+			}
+
+			/// Runs `action` on each item, in order.
+			ForEach(func<T> action)
+			{
+				loop (i32 i = 0..count)
+					action(items[i]);
+			}
+
+			/// Takes out every item `match` accepts; how many it took.
+			RemoveAll(func<T> : bool match) : i32
+			{
+				i32 kept = 0;
+				loop (i32 i = 0..count)
+				{
+					T item = items[i];
+					if (!match(item))
+					{
+						items[kept] = item;
+						kept++;
+					}
+				}
+				i32 removed = count - kept;
+				count = kept;
+				return removed;
+			}
+
+			/// `seed` combined with each item in turn (`Aggregate(0, (sum, x) => sum + x)`).
+			Aggregate<A>(A seed, func<A, T> : A combine) : A
+			{
+				A result = seed;
+				loop (i32 i = 0..count)
+					result = combine(result, items[i]);
+				return result;
+			}
+
+			/// The array the items are kept in (its first Count elements are the items; shared, not copied).
+			Items() : T[] => items;
+
+			/// `loop (T item in list)` (over the items the list has when the loop starts).
+			Iterator() : ListIterator<T> => new ListIterator<T>(items, count);
+	}
+
+	/// The items of a list, in order.
+	public value ListIterator<T>
+	{
+		T[] items;
+		i32 count;
+		i32 index;
+
+		public:
+			new(T[] items, i32 count) { this.items = items; this.count = count; index = -1; }
+
+			Next() : bool
+			{
+				index++;
+				return index < count;
+			}
+
+			T Current { get => items[index]; }
+	}
+
+	/// First in, first out: Enqueue at the end, Dequeue from the front (a ring buffer).
+	public class Queue<T>
+	{
+		T[] items;
+		i32 head;
+		i32 count;
+
+		[NoInline]
+		Grow()
+		{
+			T[] bigger = new T[items.Length * 2];
+			loop (i32 i = 0..count)
+				bigger[i] = items[(head + i) % items.Length];
+			items = bigger;
+			head = 0;
+		}
+
+		public:
+			new() { items = new T[8]; }
+
+			i32 Count { get => count; }
+
+			bool IsEmpty { get => count == 0; }
+
+			Enqueue(T item)
+			{
+				if (count == items.Length)
+					Grow();
+				i32 at = head + count;
+				if (at >= items.Length)
+					at -= items.Length;
+				items[at] = item;
+				count++;
+			}
+
+			Dequeue() : T
+			{
+				if (count == 0)
+					throw new InvalidOperationError("Dequeue on an empty queue");
+				T item = items[head];
+				head++;
+				if (head == items.Length)
+					head = 0;
+				count--;
+				return item;
+			}
+
+			Peek() : T
+			{
+				if (count == 0)
+					throw new InvalidOperationError("Peek on an empty queue");
+				return items[head];
+			}
+
+			Clear()
+			{
+				head = 0;
+				count = 0;
+			}
+	}
+
+	/// Last in, first out: Push and Pop at the top.
+	public class Stack<T>
+	{
+		T[] items;
+		i32 count;
+
+		[NoInline]
+		Grow()
+		{
+			T[] bigger = new T[items.Length * 2];
+			loop (i32 i = 0..count)
+				bigger[i] = items[i];
+			items = bigger;
+		}
+
+		public:
+			new() { items = new T[8]; }
+
+			i32 Count { get => count; }
+
+			bool IsEmpty { get => count == 0; }
+
+			Push(T item)
+			{
+				if (count == items.Length)
+					Grow();
+				items[count] = item;
+				count++;
+			}
+
+			Pop() : T
+			{
+				if (count == 0)
+					throw new InvalidOperationError("Pop on an empty stack");
+				count--;
+				return items[count];
+			}
+
+			Peek() : T
+			{
+				if (count == 0)
+					throw new InvalidOperationError("Peek on an empty stack");
+				return items[count - 1];
+			}
+
+			Clear() { count = 0; }
+	}
+
+	/// Throws the library's errors from one place, so the methods that check stay small (and are inlined).
+	public static class Fail
+	{
+		public:
+			[NoInline]
+			Index() { throw new IndexError(); }
+
+			[NoInline]
+			KeyNotFound() { throw new KeyNotFoundError(); }
+
+			/// What `checked` arithmetic calls when a result does not fit.
+			[NoInline]
+			Overflow() { throw new OverflowError(); }
+	}
+}

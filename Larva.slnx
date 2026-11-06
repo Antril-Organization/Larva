@@ -1,0 +1,26 @@
+<Solution>
+  <Project Path="Larva.IL/Larva.IL.csproj" />
+  <Project Path="Larva.Hir/Larva.Hir.csproj" />
+  <Project Path="Larva.Hir.Lowering/Larva.Hir.Lowering.csproj" />
+  <Project Path="Larva.Hir.Services/Larva.Hir.Services.csproj" />
+  <Project Path="Larva.IR/Larva.IR.csproj" />
+  <Project Path="Larva.Runtime/Larva.Runtime.csproj" />
+  <Project Path="Larva.Native/Larva.Native.csproj" />
+  <Project Path="Larva.Llvm/Larva.Llvm.csproj" />
+  <Project Path="Larva.Wasm/Larva.Wasm.csproj" />
+  <Project Path="Larva.X64/Larva.X64.csproj" />
+  <Project Path="Larva.Driver/Larva.Driver.csproj" />
+  <Project Path="Larva.Cli/Larva.Cli.csproj" />
+  <Project Path="Larva.Setup/Larva.Setup.csproj" />
+  <Project Path="Larva.Build/Larva.Build.csproj" />
+  <Project Path="Larva.Bindings/Larva.Bindings.csproj" />
+  <Project Path="Hive.Core/Hive.Core.csproj" />
+  <Folder Name="/tests/">
+    <Project Path="tests/Larva.Tests/Larva.Tests.csproj" />
+    <Project Path="tests/Larva.Hir.Tests/Larva.Hir.Tests.csproj" />
+    <Project Path="tests/Larva.Build.Tests/Larva.Build.Tests.csproj" />
+    <Project Path="tests/Larva.Bindings.Tests/Larva.Bindings.Tests.csproj" />
+    <Project Path="tests/Larva.Cli.Tests/Larva.Cli.Tests.csproj" />
+    <Project Path="tests/FakeOpt/FakeOpt.csproj" />
+  </Folder>
+</Solution>

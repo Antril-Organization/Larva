@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Larva HIR: its model, text and binary forms, linking, and its lowering to IR. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Larva.Hir\Larva.Hir.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir.Services\Larva.Hir.Services.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir.Lowering\Larva.Hir.Lowering.csproj" />
+    <ProjectReference Include="..\..\Larva.IR\Larva.IR.csproj" />
+    <ProjectReference Include="..\..\Larva.IL\Larva.IL.csproj" />
+    <ProjectReference Include="..\..\Larva.Runtime\Larva.Runtime.csproj" />
+    <!-- The backends the lowered programs run on, and the driver that builds them as executables. -->
+    <ProjectReference Include="..\..\Larva.Native\Larva.Native.csproj" />
+    <ProjectReference Include="..\..\Larva.X64\Larva.X64.csproj" />
+    <ProjectReference Include="..\..\Larva.Llvm\Larva.Llvm.csproj" />
+    <ProjectReference Include="..\..\Larva.Driver\Larva.Driver.csproj" />
+  </ItemGroup>
+
+</Project>

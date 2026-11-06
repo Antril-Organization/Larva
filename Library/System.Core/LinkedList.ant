@@ -1,0 +1,222 @@
+// A doubly linked list: nodes that stay where they are while others come and go around them.
+
+into namespace System
+{
+	/// A node of a LinkedList: its value, and its neighbours (null at the ends, and once it has been removed).
+	public final class LinkedListNode<T>
+	{
+		LinkedListNode<T>? next;
+		LinkedListNode<T>? previous;
+		LinkedList<T>? list;
+
+		public:
+			T Value;
+
+			new(T value) { Value = value; }
+
+			LinkedListNode<T>? Next { get => next; }
+			LinkedListNode<T>? Previous { get => previous; }
+
+			/// The list it is in (null once removed).
+			LinkedList<T>? List { get => list; }
+
+			/// The links (for LinkedList).
+			Link(LinkedList<T>? owner, LinkedListNode<T>? before, LinkedListNode<T>? after)
+			{
+				list = owner;
+				previous = before;
+				next = after;
+			}
+
+			SetNext(LinkedListNode<T>? node) { next = node; }
+			SetPrevious(LinkedListNode<T>? node) { previous = node; }
+	}
+
+	/// A doubly linked list: adding and removing at either end, or next to a node, costs the same at any size.
+	/// `loop (T x in list)` walks it from the first node.
+	public class LinkedList<T>
+	{
+		LinkedListNode<T>? first;
+		LinkedListNode<T>? last;
+		i32 count;
+
+		[NoInline]
+		static NotHere() { throw new InvalidOperationError("the node is not in this list"); }
+
+		Owns(LinkedListNode<T> node)
+		{
+			if (node.List is not LinkedList<T> owner || owner != this)
+				NotHere();
+		}
+
+		public:
+			i32 Count { get => count; }
+			LinkedListNode<T>? First { get => first; }
+			LinkedListNode<T>? Last { get => last; }
+
+			AddFirst(T value) : LinkedListNode<T>
+			{
+				LinkedListNode<T> node = new LinkedListNode<T>(value);
+				node.Link(this, null, first);
+				if (first is LinkedListNode<T> old)
+					old.SetPrevious(node);
+				else
+					last = node;
+				first = node;
+				count++;
+				return node;
+			}
+
+			AddLast(T value) : LinkedListNode<T>
+			{
+				LinkedListNode<T> node = new LinkedListNode<T>(value);
+				node.Link(this, last, null);
+				if (last is LinkedListNode<T> old)
+					old.SetNext(node);
+				else
+					first = node;
+				last = node;
+				count++;
+				return node;
+			}
+
+			/// A new node with `value` just before `node`.
+			AddBefore(LinkedListNode<T> node, T value) : LinkedListNode<T>
+			{
+				Owns(node);
+				if (node.Previous is not LinkedListNode<T> before)
+					return AddFirst(value);
+				LinkedListNode<T> made = new LinkedListNode<T>(value);
+				made.Link(this, before, node);
+				before.SetNext(made);
+				node.SetPrevious(made);
+				count++;
+				return made;
+			}
+
+			/// A new node with `value` just after `node`.
+			AddAfter(LinkedListNode<T> node, T value) : LinkedListNode<T>
+			{
+				Owns(node);
+				if (node.Next is not LinkedListNode<T> after)
+					return AddLast(value);
+				LinkedListNode<T> made = new LinkedListNode<T>(value);
+				made.Link(this, node, after);
+				node.SetNext(made);
+				after.SetPrevious(made);
+				count++;
+				return made;
+			}
+
+			/// Takes `node` out of the list.
+			Remove(LinkedListNode<T> node)
+			{
+				Owns(node);
+				LinkedListNode<T>? before = node.Previous, after = node.Next;
+				if (before is LinkedListNode<T> b)
+					b.SetNext(after);
+				else
+					first = after;
+				if (after is LinkedListNode<T> a)
+					a.SetPrevious(before);
+				else
+					last = before;
+				node.Link(null, null, null);
+				count--;
+			}
+
+			/// Takes the first node out; its value.
+			RemoveFirst() : T
+			{
+				if (first is LinkedListNode<T> node)
+				{
+					Remove(node);
+					return node.Value;
+				}
+				throw new InvalidOperationError("the list is empty");
+			}
+
+			/// Takes the last node out; its value.
+			RemoveLast() : T
+			{
+				if (last is LinkedListNode<T> node)
+				{
+					Remove(node);
+					return node.Value;
+				}
+				throw new InvalidOperationError("the list is empty");
+			}
+
+			/// The first node whose value `match` accepts (null when none does).
+			Find(func<T> : bool match) : LinkedListNode<T>?
+			{
+				LinkedListNode<T>? at = first;
+				loop (at is LinkedListNode<T> node)
+				{
+					if (match(node.Value))
+						return node;
+					at = node.Next;
+				}
+				return null;
+			}
+
+			Clear()
+			{
+				LinkedListNode<T>? at = first;
+				loop (at is LinkedListNode<T> node)
+				{
+					at = node.Next;
+					node.Link(null, null, null);
+				}
+				first = null;
+				last = null;
+				count = 0;
+			}
+
+			/// The values in order, as an array.
+			ToArray() : T[]
+			{
+				T[] items = new T[count];
+				i32 i = 0;
+				LinkedListNode<T>? at = first;
+				loop (at is LinkedListNode<T> node)
+				{
+					items[i] = node.Value;
+					i++;
+					at = node.Next;
+				}
+				return items;
+			}
+
+			Iterator() : LinkedListIterator<T> => new LinkedListIterator<T>(first);
+	}
+
+	/// The values of a linked list, from the first.
+	public value LinkedListIterator<T>
+	{
+		LinkedListNode<T>? next;
+		LinkedListNode<T>? current;
+
+		public:
+			new(LinkedListNode<T>? first) { next = first; }
+
+			Next() : bool
+			{
+				if (next is not LinkedListNode<T> node)
+					return false;
+				current = node;
+				next = node.Next;
+				return true;
+			}
+
+			T Current
+			{
+				get
+				{
+					if (current is LinkedListNode<T> node)
+						return node.Value;
+					throw new InvalidOperationError("the iterator is not on a value");
+				}
+			}
+	}
+}

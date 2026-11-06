@@ -1,0 +1,8 @@
+{
+  "name": "Console App",
+  "description": "A program for the console: its Main prints a greeting",
+  "author": "Larva",
+  "version": "1.0.0",
+  "type": "exe",
+  "namespace": "App"
+}

@@ -1,0 +1,147 @@
+// The program's text output (the runtime's standard output), and the console's input, output and error as streams.
+
+import System.IO;
+
+into namespace System
+{
+	public static class Console
+	{
+		extern("print.utf8") PrintUtf8(u8[] bytes);
+		extern("print.i64") PrintInteger(i64 value);
+		extern("print.u64") PrintUnsigned(u64 value);
+		extern("print.f64") PrintFloat(f64 value);
+		extern("print.bool") PrintBool(bool value);
+		extern("print.line") PrintLine();
+		extern("read.line") ReadInto() : i64;
+		extern("read.unit") ReadUnit(i64 index) : i64;
+
+		static StreamWriter? output;
+		static StreamWriter? error;
+		static StreamReader? input;
+
+		public:
+			/// The standard input as a stream of bytes (do not mix it with ReadLine, which reads it on its own).
+			OpenStandardInput() : Stream => new HandleStream(0, "the standard input", true, false);
+
+			/// The standard output as a stream of bytes (what goes through it and through Write keeps its order).
+			OpenStandardOutput() : Stream => new HandleStream(1, "the standard output", false, true);
+
+			OpenStandardError() : Stream => new HandleStream(2, "the standard error", false, true);
+
+			/// The standard output as a TextWriter (it flushes after every write).
+			static TextWriter Out
+			{
+				get
+				{
+					if (output is StreamWriter writer)
+						return writer;
+					StreamWriter made = new StreamWriter(OpenStandardOutput(), 256);
+					made.AutoFlush = true;
+					output = made;
+					return made;
+				}
+			}
+
+			/// The standard error as a TextWriter (it flushes after every write).
+			static TextWriter Error
+			{
+				get
+				{
+					if (error is StreamWriter writer)
+						return writer;
+					StreamWriter made = new StreamWriter(OpenStandardError(), 256);
+					made.AutoFlush = true;
+					error = made;
+					return made;
+				}
+			}
+
+			/// The standard input as a TextReader.
+			static TextReader In
+			{
+				get
+				{
+					if (input is StreamReader reader)
+						return reader;
+					StreamReader made = new StreamReader(OpenStandardInput());
+					input = made;
+					return made;
+				}
+			}
+
+			// Each primitive has its own Write and WriteLine: no boxing (Write(any)), no ambiguity between widenings.
+			Write(str text) { PrintUtf8(text.Units()); }
+			Write(i8 value) { PrintInteger(value); }
+			Write(i16 value) { PrintInteger(value); }
+			Write(i32 value) { PrintInteger(value); }
+			Write(i64 value) { PrintInteger(value); }
+			Write(i128 value) { PrintUtf8(value.ToString().Units()); }
+			Write(i256 value) { PrintUtf8(value.ToString().Units()); }
+			Write(u8 value) { PrintUnsigned(value); }
+			Write(u16 value) { PrintUnsigned(value); }
+			Write(u32 value) { PrintUnsigned(value); }
+			Write(u64 value) { PrintUnsigned(value); }
+			Write(u128 value) { PrintUtf8(value.ToString().Units()); }
+			Write(u256 value) { PrintUtf8(value.ToString().Units()); }
+			Write(f16 value) { PrintUtf8(value.ToString().Units()); }
+			Write(f32 value) { PrintUtf8(value.ToString().Units()); }
+			Write(f64 value) { PrintFloat(value); }
+			Write(f128 value) { PrintUtf8(value.ToString().Units()); }
+			Write(f256 value) { PrintUtf8(value.ToString().Units()); }
+			Write(bool value) { PrintBool(value); }
+
+			/// Any object or boxed value: its text when it has one of its own (IToString), else its class's.
+			Write(any value)
+			{
+				if (value is IToString own)
+					PrintUtf8(own.ToString().Units());
+				else
+					PrintUtf8(value.ToString().Units());
+			}
+
+			/// The next line of the standard input (without its line break), or null at its end.
+			ReadLine() : str?
+			{
+				i64 length = ReadInto();
+				if (length < 0)
+					return null;
+				u16[] units = new u16[(i32)length];
+				loop (i32 i = 0..units.Length)
+					units[i] = (u16)ReadUnit(i);
+				return Unicode.FromUtf16(units);
+			}
+
+			WriteLine() { PrintLine(); }
+
+			WriteLine(str text)
+			{
+				PrintUtf8(text.Units());
+				PrintLine();
+			}
+
+			WriteLine(i8 value) { PrintInteger(value); PrintLine(); }
+			WriteLine(i16 value) { PrintInteger(value); PrintLine(); }
+			WriteLine(i32 value) { PrintInteger(value); PrintLine(); }
+			WriteLine(i64 value) { PrintInteger(value); PrintLine(); }
+			WriteLine(i128 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(i256 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(u8 value) { PrintUnsigned(value); PrintLine(); }
+			WriteLine(u16 value) { PrintUnsigned(value); PrintLine(); }
+			WriteLine(u32 value) { PrintUnsigned(value); PrintLine(); }
+			WriteLine(u64 value) { PrintUnsigned(value); PrintLine(); }
+			WriteLine(u128 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(u256 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(f16 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(f32 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(f64 value) { PrintFloat(value); PrintLine(); }
+			WriteLine(f128 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(f256 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
+			WriteLine(bool value) { PrintBool(value); PrintLine(); }
+
+			WriteLine(any value)
+			{
+				Write(value);
+				PrintLine();
+			}
+	}
+}

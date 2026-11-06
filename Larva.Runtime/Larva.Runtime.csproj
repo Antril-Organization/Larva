@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.IR\Larva.IR.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Larva.IR\SoftFloat.cs" Link="SoftFloat.cs" />
+  </ItemGroup>
+
+</Project>

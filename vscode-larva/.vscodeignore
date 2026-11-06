@@ -1,0 +1,5 @@
+# What the .vsix leaves out (larva itself is installed on its own: the server is `larva lsp`).
+**/*.map
+.vscode/**
+node_modules/@vscode/vsce/**
+*.vsix

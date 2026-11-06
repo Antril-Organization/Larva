@@ -1,0 +1,8 @@
+into namespace App
+{
+	/// The program's entry.
+	Main()
+	{
+		System.Console.WriteLine("Hello from Larva!");
+	}
+}

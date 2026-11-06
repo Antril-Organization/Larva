@@ -1,0 +1,68 @@
+// Exceptions: everything thrown derives from Exception.
+
+into namespace System
+{
+	public class Exception
+	{
+		str message;
+
+		public:
+			new() { message = ""; }
+
+			new(str message) { this.message = message; }
+
+			str Message { get => message; }
+
+			override ToString() : str => message.Length == 0 ? "System.Exception" : "System.Exception: " + message;
+	}
+
+	/// An argument out of what the method takes.
+	public class ArgumentError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// An argument outside the values it may take.
+	public class ArgumentOutOfRangeError : ArgumentError
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// An index outside a collection.
+	public class IndexError : Exception
+	{
+		public:
+			new() : base("the index is outside the collection") { }
+	}
+
+	/// A key a dictionary does not have.
+	public class KeyNotFoundError : Exception
+	{
+		public:
+			new() : base("the key is not in the dictionary") { }
+	}
+
+	/// Something the object cannot do in its state (an empty list's last element…).
+	public class InvalidOperationError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// A number too big (or too small) for its type, in `checked` arithmetic or a `checked` conversion.
+	public class OverflowError : Exception
+	{
+		public:
+			new() : base("the number does not fit its type") { }
+			new(str message) : base(message) { }
+	}
+
+	/// Text that is not what it should be (a number to parse…).
+	public class FormatError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+}

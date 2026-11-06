@@ -1,0 +1,66 @@
+# Larva's installers, each built on its own system (NativeAOT compiles for the system it runs on only):
+#   Windows   LarvaSetup-<version>-win-x64.exe and Larva-<version>-win-x64.zip   (tools/build-installer.ps1)
+#   Linux     Larva-<version>-linux-x64.tar.gz                                    (tools/build-installer.sh)
+#   macOS     Larva-<version>-osx-arm64.tar.gz                                    (tools/build-installer.sh)
+# The language packs shipped are built from their own repositories first (Antril: tools/publish-pack), next to Larva.
+# Each build also tries its installer (in a registry file or a home of its own) before uploading it.
+# The language packs are signed with the LARVA_SIGNING_KEY secret (a PEM file's text) when it is set.
+name: installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            pack: pwsh -File Antril/tools/publish-pack.ps1
+            script: pwsh -File Larva/tools/build-installer.ps1
+          - os: ubuntu-latest
+            pack: sh Antril/tools/publish-pack.sh
+            script: sh Larva/tools/build-installer.sh
+          - os: macos-latest
+            pack: sh Antril/tools/publish-pack.sh
+            script: sh Larva/tools/build-installer.sh
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Larva and Antril side by side, as the build scripts expect them (../Antril from Larva, ../Larva from Antril).
+      - uses: actions/checkout@v4
+        with:
+          path: Larva
+      - uses: actions/checkout@v4
+        with:
+          repository: Antril-Organization/Antril
+          path: Antril
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: NativeAOT prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: Signing key
+        shell: bash
+        env:
+          KEY: ${{ secrets.LARVA_SIGNING_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            printf '%s\n' "$KEY" > "$RUNNER_TEMP/languages.pem"
+            echo "LARVA_SIGNING_KEY=$RUNNER_TEMP/languages.pem" >> "$GITHUB_ENV"
+          fi
+      - name: Antril's language pack
+        run: ${{ matrix.pack }}
+      - name: Build the installer
+        run: ${{ matrix.script }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: larva-${{ runner.os }}
+          path: |
+            Larva/artifacts/installer/*.exe
+            Larva/artifacts/installer/*.zip
+            Larva/artifacts/installer/*.tar.gz
+          if-no-files-found: error

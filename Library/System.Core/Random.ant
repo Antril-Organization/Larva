@@ -1,0 +1,207 @@
+// Pseudo-random numbers: xoshiro256** (fast, 256 bits of state), seeded through SplitMix64.
+
+into namespace System
+{
+	/// Pseudo-random numbers. `new Random(seed)` gives the same numbers for the same seed; `new Random()` and
+	/// `Random.Shared` are seeded from the clock (and a counter, so two made at once differ). Not for secrets.
+	public class Random
+	{
+		u64 s0;
+		u64 s1;
+		u64 s2;
+		u64 s3;
+
+		static u64 made;
+		static Random? shared;
+
+		/// SplitMix64: spreads a seed over the four words of the state (never all zero).
+		Seed(u64 seed)
+		{
+			u64 x = seed;
+			x += 0x9E3779B97F4A7C15;
+			s0 = Mix(x);
+			x += 0x9E3779B97F4A7C15;
+			s1 = Mix(x);
+			x += 0x9E3779B97F4A7C15;
+			s2 = Mix(x);
+			x += 0x9E3779B97F4A7C15;
+			s3 = Mix(x);
+		}
+
+		static Mix(u64 z) : u64
+		{
+			z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+			z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+			return z ^ (z >> 31);
+		}
+
+		/// Values below `bound` (> 0), all as likely: the high half of a 64-bit product (Lemire), retried in the rare
+		/// band that would favour some values.
+		Below(u32 bound) : u32
+		{
+			u64 product = (u64)(u32)(NextUInt64() >> 32) * bound;
+			u32 low = (u32)product;
+			if (low < bound)
+			{
+				u32 threshold = (0 - bound) % bound;
+				loop (low < threshold)
+				{
+					product = (u64)(u32)(NextUInt64() >> 32) * bound;
+					low = (u32)product;
+				}
+			}
+			return (u32)(product >> 32);
+		}
+
+		/// Values below `bound` (> 0), all as likely: masked draws, retried when past the bound.
+		Below64(u64 bound) : u64
+		{
+			u64 mask = bound - 1;
+			mask |= mask >> 1;
+			mask |= mask >> 2;
+			mask |= mask >> 4;
+			mask |= mask >> 8;
+			mask |= mask >> 16;
+			mask |= mask >> 32;
+			u64 value = NextUInt64() & mask;
+			loop (value >= bound)
+				value = NextUInt64() & mask;
+			return value;
+		}
+
+		public:
+			/// Seeded from the clock.
+			new()
+			{
+				made++;
+				Seed((u64)Environment.TickCount64 * 0x2545F4914F6CDD1D ^ made * 0x9E3779B97F4A7C15);
+			}
+
+			/// The same numbers for the same seed.
+			new(i32 seed) { Seed((u64)(i64)seed); }
+
+			/// One shared generator (seeded from the clock).
+			static Random Shared
+			{
+				get
+				{
+					if (shared is Random known)
+						return known;
+					Random fresh = new Random();
+					shared = fresh;
+					return fresh;
+				}
+			}
+
+			/// 64 random bits.
+			NextUInt64() : u64
+			{
+				u64 result = s1 * 5;
+				result = ((result << 7) | (result >> 57)) * 9;
+				u64 t = s1 << 17;
+				s2 ^= s0;
+				s3 ^= s1;
+				s1 ^= s2;
+				s0 ^= s3;
+				s2 ^= t;
+				s3 = (s3 << 45) | (s3 >> 19);
+				return result;
+			}
+
+			/// From 0 up to (not including) Int32.MaxValue.
+			Next() : i32
+			{
+				u32 value = (u32)(NextUInt64() >> 33);
+				loop (value == 2147483647)
+					value = (u32)(NextUInt64() >> 33);
+				return (i32)value;
+			}
+
+			/// From 0 up to (not including) `max` (0 when max is 0).
+			Next(i32 max) : i32
+			{
+				if (max < 0)
+					throw new ArgumentError("Random.Next: the maximum is negative");
+				return max <= 1 ? 0 : (i32)Below((u32)max);
+			}
+
+			/// From `min` up to (not including) `max` (min when they are equal).
+			Next(i32 min, i32 max) : i32
+			{
+				if (min > max)
+					throw new ArgumentError("Random.Next: the minimum is past the maximum");
+				u32 range = (u32)((i64)max - min);
+				return range <= 1 ? min : (i32)((i64)min + Below(range));
+			}
+
+			/// From 0 up to (not including) Int64.MaxValue.
+			NextInt64() : i64
+			{
+				u64 value = NextUInt64() >> 1;
+				loop (value == 9223372036854775807)
+					value = NextUInt64() >> 1;
+				return (i64)value;
+			}
+
+			/// From 0 up to (not including) `max`.
+			NextInt64(i64 max) : i64
+			{
+				if (max < 0)
+					throw new ArgumentError("Random.NextInt64: the maximum is negative");
+				return max <= 1 ? 0 : (i64)Below64((u64)max);
+			}
+
+			/// From `min` up to (not including) `max`.
+			NextInt64(i64 min, i64 max) : i64
+			{
+				if (min > max)
+					throw new ArgumentError("Random.NextInt64: the minimum is past the maximum");
+				u64 range = (u64)max - (u64)min;
+				return range <= 1 ? min : (i64)((u64)min + Below64(range));
+			}
+
+			/// From 0 up to (not including) 1, in steps of 2^-53.
+			NextDouble() : f64 => (f64)(NextUInt64() >> 11) * 1.1102230246251565e-16;
+
+			/// From 0 up to (not including) 1, in steps of 2^-24.
+			NextSingle() : f32 => (f32)(NextUInt64() >> 40) * (f32)5.9604644775390625e-8;
+
+			/// Fills `buffer` with random bytes.
+			NextBytes(u8[] buffer)
+			{
+				i32 i = 0;
+				loop (i + 8 <= buffer.Length)
+				{
+					u64 bits = NextUInt64();
+					loop (i32 k = 0..8)
+					{
+						buffer[i + k] = (u8)bits;
+						bits = bits >> 8;
+					}
+					i += 8;
+				}
+				if (i < buffer.Length)
+				{
+					u64 rest = NextUInt64();
+					loop (i < buffer.Length)
+					{
+						buffer[i] = (u8)rest;
+						rest = rest >> 8;
+						i++;
+					}
+				}
+			}
+
+			/// Puts the elements in a random order (Fisher–Yates: every order as likely).
+			Shuffle<T>(T[] items)
+			{
+				loop (i32 i = items.Length - 1; i > 0; i--)
+				{
+					i32 j = (i32)Below((u32)(i + 1));
+					T held = items[i];
+					items[i] = items[j];
+					items[j] = held;
+				}
+			}
+	}
+}

@@ -1,0 +1,23 @@
+// What a function with `yield` gives: its values one at a time, each time `Next()` is asked.
+
+into namespace System
+{
+	/// The values of a function with `yield`, made one at a time: each `Next()` runs the function on to its next
+	/// `yield`. `loop (T x in F())` walks them. An iterator runs once (call the function again to start over).
+	public base class Iterator<T>
+	{
+		inherited:
+			/// The value the last `yield` gave.
+			T current;
+
+		public:
+			/// The value `Next()` moved to.
+			T Current { get => current; }
+
+			/// Runs on to the next value: false when the function has ended (and from then on).
+			Next() : bool;
+
+			/// Itself: `loop (T x in iterator)` walks what is left of it.
+			Iterator() : Iterator<T> => this;
+	}
+}

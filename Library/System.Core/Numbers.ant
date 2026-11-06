@@ -1,0 +1,34 @@
+﻿// The numbers: what a generic function needs of a numeric type (`T : number`): arithmetic, the remainder, comparisons,
+// zero and one, and the way to and from f64; `!=` comes from `==` and `>` from `<` (the operands swapped).
+// The primitives implement these interfaces from the library (Primitives.ant); a program's own value can too, by
+// declaring the operators and the static properties. `T : snumber` asks for a sign as well: `-x` and minus one.
+
+into namespace System
+{
+	/// A number: `+`, `-`, `*`, `/`, `%`, `==` and `<` on two of them (so `!=` and `>` too), the constants Zero and
+	/// One, and FromF64/ToF64. `T : number`.
+	public interface INumber<TSelf : INumber<TSelf>, plain,
+		op +(TSelf, TSelf) : TSelf, op -(TSelf, TSelf) : TSelf, op *(TSelf, TSelf) : TSelf, op /(TSelf, TSelf) : TSelf,
+		op %(TSelf, TSelf) : TSelf, op ==(TSelf, TSelf) : bool, op <(TSelf, TSelf) : bool>
+	{
+		/// The number zero (what `default(T)` is too).
+		static TSelf Zero { base get; }
+
+		/// The number one.
+		static TSelf One { base get; }
+
+		/// `value` as this type of number (an integer drops the fraction): how Math reaches the floating-point
+		/// functions (Sqrt, Sin, Pow, ...) from any number.
+		static FromF64(f64 value) : TSelf;
+
+		/// The number as an f64.
+		static ToF64(TSelf value) : f64;
+	}
+
+	/// A number with a sign: negation and minus one. `T : snumber`. The signed integers and the floats implement it.
+	public interface ISignedNumber<TSelf : ISignedNumber<TSelf>, plain, left op -(TSelf) : TSelf> : INumber<TSelf>
+	{
+		/// The number minus one.
+		static TSelf NegativeOne { base get; }
+	}
+}

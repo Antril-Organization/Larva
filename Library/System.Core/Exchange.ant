@@ -1,0 +1,71 @@
+// Crossing GC domains. A library built for another GC (`gc:` in its .queen) has objects of its own: its `str`, its arrays
+// and its classes live in its collector, so no object crosses a call between domains; what crosses are numbers, bools and
+// packets. A packet is native memory, `[8 bytes: the length][the bytes]`, made by Pack on one side and taken on the other
+// by Text or Bytes, which copy it into that side's own objects and free it. Packets are not collected: every packet is
+// freed by the side that takes it (or by Free), and a packet is taken once.
+
+into namespace System
+{
+	public static class Exchange
+	{
+		unsafe extern("mem.alloc") static Allocate(i64 bytes) : u8*;
+		unsafe extern("mem.free") static Release(u8* block);
+
+		public:
+			/// A packet with a copy of `bytes`.
+			static PackBytes(u8[] bytes) : u8*
+			{
+				i64 n = bytes.Length;
+				unsafe
+				{
+					u8* packet = Allocate(8 + n);
+					loop (i32 i = 0..8)
+						packet[i] = (u8)(n >> (8 * i));
+					if (n > 0)
+						System.Runtime.InteropServices.Memory.Copy(packet + 8, &bytes[0], n);
+					return packet;
+				}
+			}
+
+			/// A packet with a copy of the text's UTF-8 bytes.
+			static Pack(str text) : u8* => PackBytes(text.Units());
+
+			/// How many bytes a packet carries.
+			static Length(u8* packet) : i32
+			{
+				i64 n = 0;
+				unsafe
+				{
+					loop (i32 i = 0..8)
+						n = n | ((i64)packet[i] << (8 * i));
+				}
+				return (i32)n;
+			}
+
+			/// The packet's bytes, copied into this domain; the packet is freed.
+			static Bytes(u8* packet) : u8[]
+			{
+				i32 n = Length(packet);
+				u8[] copy = new u8[n];
+				unsafe
+				{
+					if (n > 0)
+						System.Runtime.InteropServices.Memory.Copy(&copy[0], packet + 8, n);
+					Release(packet);
+				}
+				return copy;
+			}
+
+			/// The packet's bytes as text of this domain; the packet is freed.
+			static Text(u8* packet) : str => new String<u8>(Bytes(packet));
+
+			/// Frees a packet nobody takes.
+			static Free(u8* packet)
+			{
+				unsafe
+				{
+					Release(packet);
+				}
+			}
+	}
+}

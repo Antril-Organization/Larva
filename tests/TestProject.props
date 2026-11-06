@@ -1,0 +1,29 @@
+<Project>
+  <!--
+    What every test project shares (Larva's, and those of the languages built on it, which import this file):
+    xUnit v3, and the helpers in Shared/ (CheckedTest, TestEnvironment).
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Run by Microsoft.Testing.Platform (global.json): `dotnet test`, or the test executable itself. -->
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    <!-- JIT code raises SEH exceptions whose continuations are not CET-registered (see JitMemory). -->
+    <CETCompat>false</CETCompat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="4.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Shared\*.cs" Link="Shared\%(Filename)%(Extension)" />
+    <Using Include="Xunit" />
+    <Using Include="Larva.Testing" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,615 @@
+// Regular expressions, by backtracking over a text's UTF-8 units: literals, `.`, classes (`[a-z]`, `[^...]`, `\d \w \s`
+// and their negations), anchors `^` and `$`, groups (capturing, and `(?:...)`), alternatives `|`, and the quantifiers
+// `* + ? {n} {n,} {n,m}`, greedy or lazy with a trailing `?`. Matching works on bytes: multi-byte characters match
+// literally, and `.` or a class takes one byte of them.
+
+into namespace System.Text
+{
+	/// A node of a parsed pattern (Kind says which: see the constants), and, while matching, a continuation of a repeat.
+	public final class RegexNode
+	{
+		public:
+			i32 Kind;
+			u8 Literal;
+			u8[] Table;
+			List<RegexNode> Children;
+			RegexNode Child;
+			RegexNode Repeat;
+			i32 Index;
+			i32 Min;
+			i32 Max;
+			i32 Count;
+			bool Lazy;
+
+			new(i32 kind)
+			{
+				Kind = kind;
+				Table = new u8[0];
+				Children = new List<RegexNode>();
+				Child = this;
+				Repeat = this;
+				Max = -1;
+			}
+	}
+
+	/// What is left to match after a node: a list of nodes.
+	public final class RegexCont
+	{
+		public:
+			RegexNode Node;
+			RegexCont? Next;
+
+			new(RegexNode node, RegexCont? next)
+			{
+				Node = node;
+				Next = next;
+			}
+	}
+
+	/// A pattern's text to its nodes.
+	public final class RegexParser
+	{
+		u8[] p;
+		i32 at;
+		i32 groups;
+
+		Fail(str what) : RegexNode
+		{
+			throw new ArgumentError("regex: " + what);
+		}
+
+		ParseAlt() : RegexNode
+		{
+			RegexNode first = ParseSeq();
+			if (at < p.Length && p[at] == '|')
+			{
+				RegexNode alt = new RegexNode(5);
+				alt.Children.Add(first);
+				loop (at < p.Length && p[at] == '|')
+				{
+					at++;
+					alt.Children.Add(ParseSeq());
+				}
+				return alt;
+			}
+			return first;
+		}
+
+		ParseSeq() : RegexNode
+		{
+			RegexNode seq = new RegexNode(4);
+			loop (at < p.Length && p[at] != '|' && p[at] != ')')
+				seq.Children.Add(ParseQuantifier(ParseAtom()));
+			return seq;
+		}
+
+		ParseAtom() : RegexNode
+		{
+			u32 c = p[at];
+			if (c == '(')
+			{
+				at++;
+				if (at + 1 < p.Length && p[at] == '?' && p[at + 1] == ':')
+				{
+					at += 2;
+					RegexNode inner = ParseAlt();
+					Expect(')');
+					return inner;
+				}
+				groups = groups + 1;
+				RegexNode group = new RegexNode(6);
+				group.Index = groups;
+				group.Child = ParseAlt();
+				Expect(')');
+				return group;
+			}
+			if (c == '[')
+				return ParseClass();
+			if (c == '.')
+			{
+				at++;
+				return new RegexNode(3);
+			}
+			if (c == '^')
+			{
+				at++;
+				return new RegexNode(10);
+			}
+			if (c == '$')
+			{
+				at++;
+				return new RegexNode(11);
+			}
+			if (c == '\\')
+			{
+				at++;
+				if (at >= p.Length)
+					return Fail("the pattern ends after \\");
+				return ParseEscape();
+			}
+			if (c == '*' || c == '+' || c == '?')
+				return Fail("a quantifier with nothing before it");
+			at++;
+			RegexNode literal = new RegexNode(1);
+			literal.Literal = (u8)c;
+			return literal;
+		}
+
+		Expect(u32 c)
+		{
+			if (at >= p.Length || p[at] != c)
+				Fail("missing `" + new String<u8>([(u8)c]) + "`");
+			at++;
+		}
+
+		/// After `\`: a class escape (`\d` `\w` `\s` and the negations), or a character.
+		ParseEscape() : RegexNode
+		{
+			u32 c = p[at];
+			at++;
+			if (c == 'd' || c == 'w' || c == 's' || c == 'D' || c == 'W' || c == 'S')
+			{
+				RegexNode cls = new RegexNode(2);
+				cls.Table = new u8[256];
+				FillEscape(cls.Table, c);
+				return cls;
+			}
+			RegexNode literal = new RegexNode(1);
+			literal.Literal = (u8)EscapedUnit(c);
+			return literal;
+		}
+
+		static EscapedUnit(u32 c) : u32 => c == 'n' ? 10 : c == 't' ? 9 : c == 'r' ? 13 : c == 'f' ? 12 : c == 'v' ? 11 : c;
+
+		static FillEscape(u8[] table, u32 c)
+		{
+			u8[] own = new u8[256];
+			if (c == 'd' || c == 'D')
+			{
+				loop (i32 i = '0'..='9')
+					own[i] = 1;
+			}
+			else if (c == 'w' || c == 'W')
+			{
+				loop (i32 i = 'a'..='z')
+					own[i] = 1;
+				loop (i32 i = 'A'..='Z')
+					own[i] = 1;
+				loop (i32 i = '0'..='9')
+					own[i] = 1;
+				own['_'] = 1;
+			}
+			else
+			{
+				own[32] = 1;
+				own[9] = 1;
+				own[10] = 1;
+				own[13] = 1;
+				own[12] = 1;
+				own[11] = 1;
+			}
+			bool negate = c == 'D' || c == 'W' || c == 'S';
+			loop (i32 i = 0..256)
+			{
+				if ((own[i] != 0) != negate)
+					table[i] = 1;
+			}
+		}
+
+		ParseClass() : RegexNode
+		{
+			at++;
+			bool negate = at < p.Length && p[at] == '^';
+			if (negate)
+				at++;
+			RegexNode cls = new RegexNode(2);
+			cls.Table = new u8[256];
+			bool first = true;
+			loop (true)
+			{
+				if (at >= p.Length)
+					return Fail("missing `]`");
+				u32 c = p[at];
+				if (c == ']' && !first)
+					break;
+				first = false;
+				at++;
+				if (c == '\\')
+				{
+					if (at >= p.Length)
+						return Fail("the class ends after \\");
+					u32 e = p[at];
+					at++;
+					if (e == 'd' || e == 'w' || e == 's' || e == 'D' || e == 'W' || e == 'S')
+					{
+						FillEscape(cls.Table, e);
+						continue;
+					}
+					c = EscapedUnit(e);
+				}
+				u32 high = c;
+				if (at + 1 < p.Length && p[at] == '-' && p[at + 1] != ']')
+				{
+					at++;
+					high = p[at];
+					at++;
+					if (high == '\\' && at < p.Length)
+					{
+						high = EscapedUnit(p[at]);
+						at++;
+					}
+					if (high < c)
+						return Fail("a class range goes backwards");
+				}
+				loop (i32 i = (i32)c..=(i32)high)
+					cls.Table[i] = 1;
+			}
+			at++;
+			if (negate)
+			{
+				loop (i32 i = 0..256)
+					cls.Table[i] = cls.Table[i] != 0 ? (u8)0 : (u8)1;
+			}
+			return cls;
+		}
+
+		ParseQuantifier(RegexNode atom) : RegexNode
+		{
+			if (at >= p.Length)
+				return atom;
+			u32 c = p[at];
+			i32 min = 0;
+			i32 max = -1;
+			if (c == '*')
+				at++;
+			else if (c == '+')
+			{
+				at++;
+				min = 1;
+			}
+			else if (c == '?')
+			{
+				at++;
+				max = 1;
+			}
+			else if (c == '{')
+			{
+				i32 save = at;
+				at++;
+				i32 n = Digits();
+				if (n < 0)
+				{
+					at = save;
+					return atom;
+				}
+				min = n;
+				max = n;
+				if (at < p.Length && p[at] == ',')
+				{
+					at++;
+					max = Digits();
+				}
+				if (at >= p.Length || p[at] != '}')
+					return Fail("missing `}`");
+				at++;
+			}
+			else
+				return atom;
+			RegexNode repeat = new RegexNode(8);
+			repeat.Child = atom;
+			repeat.Min = min;
+			repeat.Max = max;
+			if (at < p.Length && p[at] == '?')
+			{
+				at++;
+				repeat.Lazy = true;
+			}
+			return repeat;
+		}
+
+		/// A decimal number at the position, or -1 when there is none.
+		Digits() : i32
+		{
+			i32 value = -1;
+			loop (at < p.Length && p[at] >= '0' && p[at] <= '9')
+			{
+				value = (value < 0 ? 0 : value) * 10 + (i32)(p[at] - '0');
+				at++;
+			}
+			return value;
+		}
+
+		public:
+			new(u8[] pattern)
+			{
+				p = pattern;
+			}
+
+			i32 Groups { get => groups; }
+
+			Parse() : RegexNode
+			{
+				RegexNode root = ParseAlt();
+				if (at < p.Length)
+					Fail("unexpected `)`");
+				return root;
+			}
+	}
+
+	/// A match: where it is, its text, and its groups (an unmatched group gives the empty text).
+	public final class Match
+	{
+		u8[] s;
+		i32[] starts;
+		i32[] ends;
+
+		public:
+			/// The text between two positions.
+			static Slice(u8[] s, i32 from, i32 to) : str
+			{
+				u8[] bytes = new u8[to - from];
+				Array.Copy(s, from, bytes, 0, to - from);
+				return new String<u8>(bytes);
+			}
+
+			bool Success;
+			i32 Index;
+			i32 Length;
+			str Value;
+
+			new(u8[] text, i32[] groupStarts, i32[] groupEnds, i32 index, i32 end)
+			{
+				s = text;
+				starts = groupStarts;
+				ends = groupEnds;
+				Success = index >= 0;
+				Index = index;
+				Length = Success ? end - index : 0;
+				Value = Success ? Slice(text, index, end) : "";
+			}
+
+			/// Group `i` (1-based; 0 is the whole match).
+			Group(i32 i) : str
+			{
+				if (i == 0)
+					return Value;
+				if (i < 0 || i >= starts.Length || starts[i] < 0 || ends[i] < 0)
+					return "";
+				return Slice(s, starts[i], ends[i]);
+			}
+
+			i32 GroupCount { get => starts.Length - 1; }
+	}
+
+	/// A compiled pattern.
+	public final class Regex
+	{
+		RegexNode root;
+		i32 groups;
+		str pattern;
+
+		// The matcher's state for one search: the text and the groups' bounds.
+		u8[] s;
+		i32[] starts;
+		i32[] ends;
+		i32 matchEnd;
+
+		Rest(i32 pos, RegexCont? rest) : i32
+		{
+			if (rest is RegexCont next)
+				return Run(next.Node, pos, next.Next);
+			return pos;
+		}
+
+		Run(RegexNode node, i32 pos, RegexCont? rest) : i32
+		{
+			i32 kind = node.Kind;
+			if (kind == 0)
+				return Rest(pos, rest);
+			if (kind == 1)
+				return pos < s.Length && s[pos] == node.Literal ? Rest(pos + 1, rest) : -1;
+			if (kind == 2)
+				return pos < s.Length && node.Table[s[pos]] != 0 ? Rest(pos + 1, rest) : -1;
+			if (kind == 3)
+				return pos < s.Length && s[pos] != 10 ? Rest(pos + 1, rest) : -1;
+			if (kind == 4)
+			{
+				RegexCont? chain = rest;
+				i32 i = node.Children.Count - 1;
+				loop (i >= 0)
+				{
+					chain = new RegexCont(node.Children[i], chain);
+					i--;
+				}
+				return Rest(pos, chain);
+			}
+			if (kind == 5)
+			{
+				loop (RegexNode option in node.Children)
+				{
+					i32 r = Run(option, pos, rest);
+					if (r >= 0)
+						return r;
+				}
+				return -1;
+			}
+			if (kind == 6)
+			{
+				i32 oldStart = starts[node.Index];
+				i32 oldEnd = ends[node.Index];
+				starts[node.Index] = pos;
+				RegexNode close = new RegexNode(7);
+				close.Index = node.Index;
+				i32 r = Run(node.Child, pos, new RegexCont(close, rest));
+				if (r < 0)
+				{
+					starts[node.Index] = oldStart;
+					ends[node.Index] = oldEnd;
+				}
+				return r;
+			}
+			if (kind == 7)
+			{
+				i32 old = ends[node.Index];
+				ends[node.Index] = pos;
+				i32 r = Rest(pos, rest);
+				if (r < 0)
+					ends[node.Index] = old;
+				return r;
+			}
+			if (kind == 8)
+				return RunRepeat(node, pos, 0, -1, rest);
+			if (kind == 9)
+				return RunRepeat(node.Repeat, pos, node.Count, node.Index, rest);
+			if (kind == 10)
+				return pos == 0 ? Rest(pos, rest) : -1;
+			if (kind == 11)
+				return pos == s.Length ? Rest(pos, rest) : -1;
+			return -1;
+		}
+
+		/// `count` iterations of a repeat are done; `lastPos` is where the last one started (-1 at first).
+		RunRepeat(RegexNode node, i32 pos, i32 count, i32 lastPos, RegexCont? rest) : i32
+		{
+			// Another iteration is allowed under the maximum, and only if the last one made progress (an empty match
+			// could repeat forever).
+			bool more = (node.Max < 0 || count < node.Max) && !(count > node.Min && lastPos == pos);
+			if (!node.Lazy)
+			{
+				if (more)
+				{
+					i32 r = Run(node.Child, pos, new RegexCont(Again(node, count, pos), rest));
+					if (r >= 0)
+						return r;
+				}
+				return count >= node.Min ? Rest(pos, rest) : -1;
+			}
+			if (count >= node.Min)
+			{
+				i32 r = Rest(pos, rest);
+				if (r >= 0)
+					return r;
+			}
+			return more ? Run(node.Child, pos, new RegexCont(Again(node, count, pos), rest)) : -1;
+		}
+
+		static Again(RegexNode repeat, i32 count, i32 pos) : RegexNode
+		{
+			RegexNode again = new RegexNode(9);
+			again.Repeat = repeat;
+			again.Count = count + 1;
+			again.Index = pos;
+			return again;
+		}
+
+		/// The first match from `from` on: its start (-1 when none); its end in matchEnd.
+		Search(u8[] text, i32 from) : i32
+		{
+			s = text;
+			starts = new i32[groups + 1];
+			ends = new i32[groups + 1];
+			loop (i32 start = from..=text.Length)
+			{
+				loop (i32 g = 0..starts.Length)
+				{
+					starts[g] = -1;
+					ends[g] = -1;
+				}
+				i32 r = Run(root, start, null);
+				if (r >= 0)
+				{
+					matchEnd = r;
+					return start;
+				}
+			}
+			matchEnd = -1;
+			return -1;
+		}
+
+		public:
+			new(str pattern)
+			{
+				this.pattern = pattern;
+				RegexParser parser = new RegexParser(pattern.Units());
+				root = parser.Parse();
+				groups = parser.Groups;
+				s = new u8[0];
+				starts = new i32[0];
+				ends = new i32[0];
+			}
+
+			str Pattern { get => pattern; }
+
+			/// Whether the pattern matches somewhere in `input`.
+			IsMatch(str input) : bool
+			{
+				return Search(input.Units(), 0) >= 0;
+			}
+
+			static IsMatch(str input, str pattern) : bool => new Regex(pattern).IsMatch(input);
+
+			/// The first match in `input` (Success false when there is none).
+			Match(str input) : Match => Match(input, 0);
+
+			/// The first match in `input` at or after `from`.
+			Match(str input, i32 from) : Match
+			{
+				u8[] text = input.Units();
+				i32 start = Search(text, from);
+				return new Match(text, starts, ends, start, matchEnd);
+			}
+
+			/// Every match in `input`, left to right (an empty match moves on by one unit).
+			Matches(str input) : List<Match>
+			{
+				List<Match> found = new List<Match>();
+				u8[] text = input.Units();
+				i32 from = 0;
+				loop (from <= text.Length)
+				{
+					i32 start = Search(text, from);
+					i32 end = matchEnd;
+					if (start < 0)
+						break;
+					found.Add(new Match(text, starts, ends, start, end));
+					from = end > start ? end : start + 1;
+				}
+				return found;
+			}
+
+			/// `input` with every match replaced by `replacement` (`$1`…`$9` in it stand for the groups, `$0` for the match).
+			Replace(str input, str replacement) : str
+			{
+				u8[] text = input.Units();
+				u8[] with = replacement.Units();
+				StringBuilder result = new StringBuilder();
+				i32 from = 0;
+				i32 copied = 0;
+				loop (from <= text.Length)
+				{
+					i32 start = Search(text, from);
+					i32 end = matchEnd;
+					if (start < 0)
+						break;
+					Match match = new Match(text, starts, ends, start, end);
+					result.Append(Match.Slice(text, copied, start));
+					i32 i = 0;
+					loop (i < with.Length)
+					{
+						if (with[i] == '$' && i + 1 < with.Length && with[i + 1] >= '0' && with[i + 1] <= '9')
+						{
+							result.Append(match.Group((i32)(with[i + 1] - '0')));
+							i += 2;
+							continue;
+						}
+						result.Append(new String<u8>([with[i]]));
+						i++;
+					}
+					copied = end;
+					from = end > start ? end : start + 1;
+				}
+				result.Append(Match.Slice(text, copied, text.Length));
+				return result.ToString();
+			}
+	}
+}

@@ -1,0 +1,9 @@
+{
+  "name": "Library",
+  "description": "A library other projects use: a class with a method",
+  "author": "Larva",
+  "version": "1.0.0",
+  "type": "library",
+  "namespace": "App",
+  "files": { "App.Greeter": "Greeter" }
+}

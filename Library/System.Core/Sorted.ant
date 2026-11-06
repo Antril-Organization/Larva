@@ -1,0 +1,441 @@
+// Sorted maps and sets: a balanced binary tree (AVL) whose nodes live in arrays (a node is an index: no object per
+// node, and neighbours close in memory). Keys are IComparable; `loop` walks them in order.
+
+into namespace System
+{
+	/// A map from keys to values kept in key order: Set, Get, `map[key]`, TryGet, ContainsKey, Remove, MinKey, MaxKey,
+	/// and `loop (KeyValuePair<K, V> pair in map)` from the smallest key.
+	public class SortedDictionary<K : IComparable<K>, V>
+	{
+		// Node n: keys[n], values[n], its children left[n] and right[n] (0: none), height[n] (0 for node 0, "none").
+		K[] keys;
+		V[] values;
+		i32[] left;
+		i32[] right;
+		i32[] height;
+		i32 root;
+		i32 count;
+		/// The next node never used; removed nodes are reused first (a list through `left`).
+		i32 used;
+		i32 free;
+		/// What the last insertion or removal did, and whether the heights above still need fixing (once a subtree keeps
+		/// its height, nothing above it changes).
+		bool changed;
+		bool reshape;
+
+		[NoInline]
+		Grow()
+		{
+			i32 size = keys.Length * 2;
+			K[] k = new K[size];
+			V[] v = new V[size];
+			i32[] l = new i32[size];
+			i32[] r = new i32[size];
+			i32[] h = new i32[size];
+			loop (i32 i = 0..used)
+			{
+				k[i] = keys[i];
+				v[i] = values[i];
+				l[i] = left[i];
+				r[i] = right[i];
+				h[i] = height[i];
+			}
+			keys = k;
+			values = v;
+			left = l;
+			right = r;
+			height = h;
+		}
+
+		Node(K key, V value) : i32
+		{
+			i32 n = free;
+			if (n != 0)
+			{
+				free = left[n];
+			}
+			else
+			{
+				if (used == keys.Length)
+					Grow();
+				n = used;
+				used++;
+			}
+			keys[n] = key;
+			values[n] = value;
+			left[n] = 0;
+			right[n] = 0;
+			height[n] = 1;
+			return n;
+		}
+
+		Release(i32 n)
+		{
+			left[n] = free;
+			free = n;
+		}
+
+		Fix(i32 n)
+		{
+			i32 a = height[left[n]], b = height[right[n]];
+			height[n] = (a > b ? a : b) + 1;
+		}
+
+		RotateRight(i32 n) : i32
+		{
+			i32 l = left[n];
+			left[n] = right[l];
+			right[l] = n;
+			Fix(n);
+			Fix(l);
+			return l;
+		}
+
+		RotateLeft(i32 n) : i32
+		{
+			i32 r = right[n];
+			right[n] = left[r];
+			left[r] = n;
+			Fix(n);
+			Fix(r);
+			return r;
+		}
+
+		/// The subtree at n with its heights fixed and, when one side grew two taller, rotated back into balance.
+		Balance(i32 n) : i32
+		{
+			i32 l = left[n], r = right[n];
+			i32 skew = height[l] - height[r];
+			if (skew > 1)
+			{
+				if (height[left[l]] < height[right[l]])
+					left[n] = RotateLeft(l);
+				return RotateRight(n);
+			}
+			if (skew < -1)
+			{
+				if (height[right[r]] < height[left[r]])
+					right[n] = RotateRight(r);
+				return RotateLeft(n);
+			}
+			Fix(n);
+			return n;
+		}
+
+		/// Puts key → value under n (replacing a value when `replace`); the subtree's new root.
+		Insert(i32 n, K key, V value, bool replace) : i32
+		{
+			if (n == 0)
+			{
+				changed = true;
+				reshape = true;
+				return Node(key, value);
+			}
+			i32 order = key.CompareTo(keys[n]);
+			if (order == 0)
+			{
+				changed = false;
+				reshape = false;
+				if (replace)
+					values[n] = value;
+				return n;
+			}
+			// The child is computed first: making a node may grow the arrays.
+			if (order < 0)
+			{
+				i32 child = Insert(left[n], key, value, replace);
+				left[n] = child;
+			}
+			else
+			{
+				i32 child = Insert(right[n], key, value, replace);
+				right[n] = child;
+			}
+			return Rebalanced(n);
+		}
+
+		/// Takes key out from under n; the subtree's new root.
+		Delete(i32 n, K key) : i32
+		{
+			if (n == 0)
+			{
+				changed = false;
+				reshape = false;
+				return 0;
+			}
+			i32 order = key.CompareTo(keys[n]);
+			if (order < 0)
+			{
+				i32 child = Delete(left[n], key);
+				left[n] = child;
+			}
+			else if (order > 0)
+			{
+				i32 child = Delete(right[n], key);
+				right[n] = child;
+			}
+			else
+			{
+				changed = true;
+				reshape = true;
+				i32 l = left[n], r = right[n];
+				if (l == 0 || r == 0)
+				{
+					Release(n);
+					return l != 0 ? l : r;
+				}
+				// Two children: the next key takes this node's place.
+				i32 next = r;
+				loop (left[next] != 0)
+					next = left[next];
+				keys[n] = keys[next];
+				values[n] = values[next];
+				i32 rest = DeleteSmallest(r);
+				right[n] = rest;
+			}
+			return Rebalanced(n);
+		}
+
+		/// n after a change below it: rebalanced while the change still moves heights (then nothing above moves).
+		Rebalanced(i32 n) : i32
+		{
+			if (!reshape)
+				return n;
+			i32 before = height[n];
+			i32 root = Balance(n);
+			if (height[root] == before)
+				reshape = false;
+			return root;
+		}
+
+		DeleteSmallest(i32 n) : i32
+		{
+			if (left[n] == 0)
+			{
+				i32 r = right[n];
+				Release(n);
+				return r;
+			}
+			i32 child = DeleteSmallest(left[n]);
+			left[n] = child;
+			return Rebalanced(n);
+		}
+
+		Find(K key) : i32
+		{
+			i32 n = root;
+			loop (n != 0)
+			{
+				i32 order = key.CompareTo(keys[n]);
+				if (order == 0)
+					return n;
+				n = order < 0 ? left[n] : right[n];
+			}
+			return 0;
+		}
+
+		[NoInline]
+		static Missing() { throw new KeyNotFoundError(); }
+
+		[NoInline]
+		static Empty() { throw new InvalidOperationError("the map is empty"); }
+
+		public:
+			new()
+			{
+				keys = new K[8];
+				values = new V[8];
+				left = new i32[8];
+				right = new i32[8];
+				height = new i32[8];
+				used = 1;
+			}
+
+			i32 Count { get => count; }
+
+			bool IsEmpty { get => count == 0; }
+
+			/// Gives `key` the value `value` (adding it, or replacing its value).
+			Set(K key, V value)
+			{
+				root = Insert(root, key, value, true);
+				if (changed)
+					count++;
+			}
+
+			/// Adds `key`; an ArgumentError when it is there already.
+			Add(K key, V value)
+			{
+				root = Insert(root, key, value, false);
+				if (!changed)
+					throw new ArgumentError("the key is in the map already");
+				count++;
+			}
+
+			/// The value of `key`; a KeyNotFoundError when there is none.
+			Get(K key) : V
+			{
+				i32 n = Find(key);
+				if (n == 0)
+					Missing();
+				return values[n];
+			}
+
+			At(K key) : V => Get(key);
+			SetAt(K key, V value) { Set(key, value); }
+
+			/// The value of `key`, or `fallback` when there is none.
+			TryGet(K key, V fallback) : V
+			{
+				i32 n = Find(key);
+				return n == 0 ? fallback : values[n];
+			}
+
+			ContainsKey(K key) : bool => Find(key) != 0;
+
+			/// Takes `key` out; false when it was not there.
+			Remove(K key) : bool
+			{
+				root = Delete(root, key);
+				if (changed)
+					count--;
+				return changed;
+			}
+
+			Clear()
+			{
+				root = 0;
+				count = 0;
+				used = 1;
+				free = 0;
+			}
+
+			/// The smallest and largest keys (an InvalidOperationError when the map is empty).
+			MinKey() : K
+			{
+				if (root == 0)
+					Empty();
+				i32 n = root;
+				loop (left[n] != 0)
+					n = left[n];
+				return keys[n];
+			}
+
+			MaxKey() : K
+			{
+				if (root == 0)
+					Empty();
+				i32 n = root;
+				loop (right[n] != 0)
+					n = right[n];
+				return keys[n];
+			}
+
+			/// The keys and the values, in key order.
+			Keys() : List<K>
+			{
+				List<K> list = new List<K>(count);
+				loop (KeyValuePair<K, V> pair in this)
+					list.Add(pair.Key);
+				return list;
+			}
+
+			Values() : List<V>
+			{
+				List<V> list = new List<V>(count);
+				loop (KeyValuePair<K, V> pair in this)
+					list.Add(pair.Value);
+				return list;
+			}
+
+			Iterator() : SortedIterator<K, V> => new SortedIterator<K, V>(this);
+
+			/// The tree (for the iterator).
+			i32 Root { get => root; }
+			LeftOf(i32 n) : i32 => left[n];
+			RightOf(i32 n) : i32 => right[n];
+			KeyAt(i32 n) : K => keys[n];
+			ValueAt(i32 n) : V => values[n];
+	}
+
+	/// The pairs of a sorted map, from the smallest key: an in-order walk with its own stack.
+	public value SortedIterator<K : IComparable<K>, V>
+	{
+		SortedDictionary<K, V> map;
+		i32[] stack;
+		i32 depth;
+		i32 current;
+
+		Descend(i32 n)
+		{
+			loop (n != 0)
+			{
+				stack[depth] = n;
+				depth++;
+				n = map.LeftOf(n);
+			}
+		}
+
+		public:
+			new(SortedDictionary<K, V> map)
+			{
+				this.map = map;
+				// An AVL tree of 2^31 nodes is under 46 levels deep.
+				stack = new i32[48];
+				Descend(map.Root);
+			}
+
+			Next() : bool
+			{
+				if (depth == 0)
+					return false;
+				depth--;
+				current = stack[depth];
+				Descend(map.RightOf(current));
+				return true;
+			}
+
+			KeyValuePair<K, V> Current { get => new KeyValuePair<K, V>(map.KeyAt(current), map.ValueAt(current)); }
+			K Key { get => map.KeyAt(current); }
+	}
+
+	/// A set kept in order: Add, Contains, Remove, Min, Max, and `loop (T item in set)` from the smallest.
+	public class SortedSet<T : IComparable<T>>
+	{
+		SortedDictionary<T, bool> tree;
+
+		public:
+			new() { tree = new SortedDictionary<T, bool>(); }
+
+			i32 Count { get => tree.Count; }
+			bool IsEmpty { get => tree.Count == 0; }
+
+			/// Adds `item`; false when it was there already.
+			Add(T item) : bool
+			{
+				i32 before = tree.Count;
+				tree.Set(item, true);
+				return tree.Count != before;
+			}
+
+			Contains(T item) : bool => tree.ContainsKey(item);
+			Remove(T item) : bool => tree.Remove(item);
+			Clear() { tree.Clear(); }
+
+			/// The smallest and largest items (an InvalidOperationError when the set is empty).
+			T Min { get => tree.MinKey(); }
+			T Max { get => tree.MaxKey(); }
+
+			Iterator() : SortedSetIterator<T> => new SortedSetIterator<T>(tree.Iterator());
+	}
+
+	public value SortedSetIterator<T : IComparable<T>>
+	{
+		SortedIterator<T, bool> inner;
+
+		public:
+			new(SortedIterator<T, bool> inner) { this.inner = inner; }
+			Next() : bool => inner.Next();
+			T Current { get => inner.Key; }
+	}
+}

@@ -1,0 +1,737 @@
+// Text: an immutable sequence of code units of one encoding. String<u8> is UTF-8 (what `str` names: literals, `+`,
+// `==` and `s[i]`, a byte, are built into the language), String<u16> UTF-16 and String<u32> UTF-32. Every algorithm is
+// written once over the unit type; conversions between the encodings go through code points.
+
+into namespace System
+{
+	public final class String<T : [u8, u16, u32]> : IHashable<String<T>>, IComparable<String<T>>, IToString
+	{
+		/// The hash, once computed (0: not yet).
+		u64 hash;
+		/// The code units, kept in the object itself (one allocation per string).
+		fixed T[] units;
+
+		/// A string of `length` zero units, filled by the method that made it.
+		new(i32 length) : fixed(length) { }
+
+		/// Up to this many units, a loop copies or compares faster than a call into the runtime.
+		const i32 Short = 24;
+
+		/// `count` units from `from[at]` into `to[offset]` (the ranges already checked): one copy in memory.
+		static Move(String<T> to, i32 offset, String<T> from, i32 at, i32 count)
+		{
+			if (count <= Short)
+			{
+				loop (i32 i = 0..count)
+					to.units[offset + i] = from.units[at + i];
+			}
+			else
+			{
+				unsafe
+				{
+					System.Runtime.InteropServices.Memory.Copy((u8*)&to.units[offset], (u8*)&from.units[at], (i64)count * (i64)sizeof(T));
+				}
+			}
+		}
+
+		/// `count` units from the array `from[at]` into `to[offset]` (the ranges already checked).
+		static MoveIn(String<T> to, i32 offset, T[] from, i32 at, i32 count)
+		{
+			if (count <= Short)
+			{
+				loop (i32 i = 0..count)
+					to.units[offset + i] = from[at + i];
+			}
+			else
+			{
+				unsafe
+				{
+					System.Runtime.InteropServices.Memory.Copy((u8*)&to.units[offset], (u8*)&from[at], (i64)count * (i64)sizeof(T));
+				}
+			}
+		}
+
+		/// Whether `part` is at `start` (the range already checked): a plain loop, small enough to inline where it is asked at every position.
+		MatchesAt(i32 start, String<T> part) : bool
+		{
+			i32 count = part.units.Length;
+			loop (i32 i = 0..count)
+			{
+				if (units[start + i] != part.units[i])
+					return false;
+			}
+			return true;
+		}
+
+		/// The decimal digits of `magnitude`, after a '-' when `negative`, written straight into a new string (what the
+		/// integers' ToString gives: no array of digits first).
+		internal static Decimal(u64 magnitude, bool negative) : String<u8>
+		{
+			i32 count = 1;
+			u64 rest = magnitude;
+			loop (rest >= 10)
+			{
+				rest = rest / 10;
+				count++;
+			}
+			i32 length = negative ? count + 1 : count;
+			String<u8> text = new String<u8>(length);
+			if (negative)
+				text.units[0] = 45;
+			i32 at = length;
+			do
+			{
+				at--;
+				text.units[at] = (u8)(48 + magnitude % 10);
+				magnitude = magnitude / 10;
+			}
+			loop (magnitude > 0);
+			return text;
+		}
+
+		static IsSpace(T unit) : bool => unit == 32 || unit == 9 || unit == 10 || unit == 13;
+
+		static Empty() : String<T> => new String<T>(0);
+
+		/// `length` units from `start`, the range already checked.
+		Slice(i32 start, i32 length) : String<T>
+		{
+			String<T> copy = new String<T>(length);
+			Move(copy, 0, this, start, length);
+			return copy;
+		}
+
+		public:
+			/// A string of a copy of the code units.
+			new(T[] codeUnits) : fixed(codeUnits.Length) { MoveIn(this, 0, codeUnits, 0, codeUnits.Length); }
+
+			/// A string of a copy of `count` code units of `codeUnits` from `start`.
+			new(T[] codeUnits, i32 start, i32 count) : fixed(count < 0 ? 0 : count)
+			{
+				if (start < 0 || count < 0 || start > codeUnits.Length - count)
+					throw new ArgumentError("String: the range is outside the array");
+				MoveIn(this, 0, codeUnits, start, count);
+			}
+
+			/// How many code units (bytes in a str).
+			i32 Length { get => units.Length; }
+
+			bool IsEmpty { get => units.Length == 0; }
+
+			/// The code unit at `index`.
+			At(i32 index) : T => units[index];
+
+			/// The same code units as `other`.
+			Equals(String<T> other) : bool
+			{
+				i32 count = units.Length;
+				if (other.units.Length != count)
+					return false;
+				if (count == 0 || hash != 0 && other.hash != 0 && hash != other.hash)
+					return count == 0;
+				if (count <= Short)
+				{
+					loop (i32 i = 0..count)
+					{
+						if (units[i] != other.units[i])
+							return false;
+					}
+					return true;
+				}
+				unsafe
+				{
+					return System.Runtime.InteropServices.Memory.Compare((u8*)&units[0], (u8*)&other.units[0], (i64)count * (i64)sizeof(T)) == 0;
+				}
+			}
+
+			/// FNV-1a over the code units (computed once: strings do not change).
+			override Hash() : u64
+			{
+				if (hash != 0)
+					return hash;
+				u64 h = 14695981039346656037;
+				loop (i32 i = 0..units.Length)
+				{
+					h = h ^ (u64)units[i];
+					h = h * 1099511628211;
+				}
+				hash = h | 1;
+				return hash;
+			}
+
+			/// Code unit order: -1, 0 or 1 (in UTF-8 and UTF-32 that is code point order).
+			CompareTo(String<T> other) : i32
+			{
+				i32 mine = units.Length;
+				i32 theirs = other.units.Length;
+				i32 common = mine < theirs ? mine : theirs;
+				loop (i32 i = 0..common)
+				{
+					if (units[i] != other.units[i])
+						return units[i] < other.units[i] ? -1 : 1;
+				}
+				return mine < theirs ? -1 : mine > theirs ? 1 : 0;
+			}
+
+			/// The text in UTF-8.
+			override ToString() : str => ToUtf8();
+
+			/// The text from `start` to the end.
+			Substring(i32 start) : String<T> => Substring(start, units.Length - start);
+
+			/// `length` code units from `start`.
+			Substring(i32 start, i32 length) : String<T>
+			{
+				if (start < 0 || length < 0 || start > units.Length - length)
+					throw new ArgumentError("Substring: the range is outside the string");
+				return Slice(start, length);
+			}
+
+			/// Where `unit` first appears, or -1.
+			IndexOf(T unit) : i32
+			{
+				loop (i32 i = 0..units.Length)
+				{
+					if (units[i] == unit)
+						return i;
+				}
+				return -1;
+			}
+
+			/// Where `part` first appears, or -1.
+			IndexOf(String<T> part) : i32
+			{
+				loop (i32 i = 0..units.Length - part.units.Length + 1)
+				{
+					if (MatchesAt(i, part))
+						return i;
+				}
+				return -1;
+			}
+
+			Contains(String<T> part) : bool => IndexOf(part) >= 0;
+
+			StartsWith(String<T> prefix) : bool => prefix.units.Length <= units.Length && MatchesAt(0, prefix);
+
+			EndsWith(String<T> suffix) : bool => suffix.units.Length <= units.Length && MatchesAt(units.Length - suffix.units.Length, suffix);
+
+			/// ASCII letters in upper case.
+			ToUpper() : String<T>
+			{
+				String<T> copy = new String<T>(units.Length);
+				loop (i32 i = 0..units.Length)
+				{
+					T unit = units[i];
+					copy.units[i] = unit >= 97 && unit <= 122 ? unit - 32 : unit;
+				}
+				return copy;
+			}
+
+			/// ASCII letters in lower case.
+			ToLower() : String<T>
+			{
+				String<T> copy = new String<T>(units.Length);
+				loop (i32 i = 0..units.Length)
+				{
+					T unit = units[i];
+					copy.units[i] = unit >= 65 && unit <= 90 ? unit + 32 : unit;
+				}
+				return copy;
+			}
+
+			/// Without the spaces, tabs and line breaks at both ends.
+			Trim() : String<T>
+			{
+				i32 start = 0;
+				i32 end = units.Length;
+				loop (start < end && IsSpace(units[start]))
+					start++;
+				loop (end > start && IsSpace(units[end - 1]))
+					end--;
+				return start == 0 && end == units.Length ? this : Slice(start, end - start);
+			}
+
+			/// The pieces between each `separator`.
+			Split(T separator) : List<String<T>>
+			{
+				// As many places in the list as pieces: no growing.
+				List<String<T>> pieces = new List<String<T>>(Count(separator) + 1);
+				i32 start = 0;
+				loop (i32 i = 0..units.Length)
+				{
+					if (units[i] == separator)
+					{
+						pieces.Add(Slice(start, i - start));
+						start = i + 1;
+					}
+				}
+				pieces.Add(Slice(start, units.Length - start));
+				return pieces;
+			}
+
+			/// Every `old` replaced by `replacement`.
+			Replace(String<T> old, String<T> replacement) : String<T>
+			{
+				i32 width = old.units.Length;
+				if (width == 0)
+					return this;
+				// Count the matches, then fill the result once.
+				i32 found = 0;
+				i32 i = 0;
+				loop (i + width <= units.Length)
+				{
+					if (MatchesAt(i, old))
+					{
+						found++;
+						i += width;
+					}
+					else
+						i++;
+				}
+				if (found == 0)
+					return this;
+				i32 with = replacement.units.Length;
+				String<T> result = new String<T>(units.Length + found * (with - width));
+				i32 at = 0;
+				i = 0;
+				loop (i < units.Length)
+				{
+					if (i + width <= units.Length && MatchesAt(i, old))
+					{
+						Move(result, at, replacement, 0, with);
+						at += with;
+						i += width;
+					}
+					else
+					{
+						result.units[at] = units[i];
+						at++;
+						i++;
+					}
+				}
+				return result;
+			}
+
+			/// `a` followed by `b` (what `a + b` does).
+			static Concat(String<T> a, String<T> b) : String<T>
+			{
+				i32 left = a.units.Length;
+				i32 right = b.units.Length;
+				if (left == 0)
+					return b;
+				if (right == 0)
+					return a;
+				String<T> joined = new String<T>(left + right);
+				Move(joined, 0, a, 0, left);
+				Move(joined, left, b, 0, right);
+				return joined;
+			}
+
+			/// The pieces with `separator` between them.
+			static Join(String<T> separator, List<String<T>> pieces) : String<T>
+			{
+				i32 total = 0;
+				loop (i32 i = 0..pieces.Count)
+					total += pieces[i].units.Length;
+				i32 gap = separator.units.Length;
+				if (pieces.Count > 1)
+					total += gap * (pieces.Count - 1);
+				String<T> joined = new String<T>(total);
+				i32 at = 0;
+				loop (i32 i = 0..pieces.Count)
+				{
+					if (i > 0)
+					{
+						Move(joined, at, separator, 0, gap);
+						at += gap;
+					}
+					String<T> piece = pieces[i];
+					Move(joined, at, piece, 0, piece.units.Length);
+					at += piece.units.Length;
+				}
+				return joined;
+			}
+
+			/// Where `unit` last appears, or -1.
+			LastIndexOf(T unit) : i32
+			{
+				i32 i = units.Length - 1;
+				loop (i >= 0)
+				{
+					if (units[i] == unit)
+						return i;
+					i--;
+				}
+				return -1;
+			}
+
+			/// At least `width` units: spaces (or `pad`) before the text.
+			PadLeft(i32 width) : String<T> => PadLeft(width, ' ');
+			PadLeft(i32 width, T pad) : String<T>
+			{
+				if (width <= units.Length)
+					return this;
+				String<T> padded = new String<T>(width);
+				i32 before = width - units.Length;
+				loop (i32 i = 0..before)
+					padded.units[i] = pad;
+				Move(padded, before, this, 0, units.Length);
+				return padded;
+			}
+
+			/// At least `width` units: spaces (or `pad`) after the text.
+			PadRight(i32 width) : String<T> => PadRight(width, ' ');
+			PadRight(i32 width, T pad) : String<T>
+			{
+				if (width <= units.Length)
+					return this;
+				String<T> padded = new String<T>(width);
+				Move(padded, 0, this, 0, units.Length);
+				loop (i32 i = units.Length..width)
+					padded.units[i] = pad;
+				return padded;
+			}
+
+			/// The text `times` times.
+			Repeat(i32 times) : String<T>
+			{
+				if (times <= 0)
+					return Empty();
+				i32 n = units.Length;
+				String<T> repeated = new String<T>(n * times);
+				loop (i32 t = 0..times)
+					Move(repeated, t * n, this, 0, n);
+				return repeated;
+			}
+
+			/// `text` put in at `index`.
+			Insert(i32 index, String<T> text) : String<T> => Concat(Concat(Substring(0, index), text), Substring(index));
+
+			/// Without `count` units from `start`.
+			Remove(i32 start, i32 count) : String<T> => Concat(Substring(0, start), Substring(start + count));
+
+			/// A copy of the code units.
+			ToCharArray() : T[]
+			{
+				T[] copy = new T[units.Length];
+				CopyTo(0, copy, 0, units.Length);
+				return copy;
+			}
+
+			/// `count` code units from `start` into `target` at `at`.
+			CopyTo(i32 start, T[] target, i32 at, i32 count)
+			{
+				if (start < 0 || count < 0 || at < 0 || start > units.Length - count || at > target.Length - count)
+					throw new ArgumentError("CopyTo: the range is outside the string or the array");
+				if (count <= Short)
+				{
+					loop (i32 i = 0..count)
+						target[at + i] = units[start + i];
+				}
+				else
+				{
+					unsafe
+					{
+						System.Runtime.InteropServices.Memory.Copy((u8*)&target[at], (u8*)&units[start], (i64)count * (i64)sizeof(T));
+					}
+				}
+			}
+
+			/// How many times `unit` appears.
+			Count(T unit) : i32
+			{
+				i32 found = 0;
+				loop (i32 i = 0..units.Length)
+				{
+					if (units[i] == unit)
+						found++;
+				}
+				return found;
+			}
+
+			/// The pieces between each `separator` (a string).
+			Split(String<T> separator) : List<String<T>>
+			{
+				i32 width = separator.units.Length;
+				List<String<T>> pieces = new List<String<T>>();
+				if (width == 0)
+				{
+					pieces.Add(this);
+					return pieces;
+				}
+				i32 start = 0;
+				i32 i = 0;
+				loop (i + width <= units.Length)
+				{
+					if (MatchesAt(i, separator))
+					{
+						pieces.Add(Slice(start, i - start));
+						i += width;
+						start = i;
+					}
+					else
+					{
+						i++;
+					}
+				}
+				pieces.Add(Slice(start, units.Length - start));
+				return pieces;
+			}
+
+			/// The lines of the text (split at line feeds; a carriage return before one is dropped).
+			Lines() : List<String<T>>
+			{
+				List<String<T>> lines = new List<String<T>>();
+				i32 start = 0;
+				loop (i32 i = 0..units.Length)
+				{
+					if (units[i] == 10)
+					{
+						i32 end = i > start && units[i - 1] == 13 ? i - 1 : i;
+						lines.Add(Slice(start, end - start));
+						start = i + 1;
+					}
+				}
+				if (start < units.Length)
+					lines.Add(Slice(start, units.Length - start));
+				return lines;
+			}
+
+			/// A string of a copy of `codeUnits`.
+			static FromUnits(T[] codeUnits) : String<T> => new String<T>(codeUnits);
+
+			static IsNullOrEmpty(String<T>? text) : bool
+			{
+				if (text is String<T> value)
+					return value.Length == 0;
+				return true;
+			}
+
+			/// Ordinal order: -1, 0 or 1.
+			static Compare(String<T> a, String<T> b) : i32 => a.CompareTo(b);
+
+			/// `loop (T unit in text)`.
+			Iterator() : StringIterator<T> => new StringIterator<T>(this);
+
+			/// A copy of the code units (the string keeps its own, in place).
+			Units() : T[] => ToCharArray();
+
+			// ── Code points and the other encodings ──
+
+			/// The Unicode code points (malformed sequences become U+FFFD).
+			CodePoints() : u32[] => Unicode.Decode(Units());
+
+			/// How many code points the text has.
+			CodePointCount() : i32 => Unicode.Decode(Units()).Length;
+
+			/// The text in UTF-8 (`str`).
+			ToUtf8() : String<u8>
+			{
+				if (sizeof(T) == 1)
+				{
+					String<u8> bytes = new String<u8>(units.Length);
+					unsafe
+					{
+						if (units.Length > 0)
+							System.Runtime.InteropServices.Memory.Copy((u8*)&bytes.units[0], (u8*)&units[0], (i64)units.Length);
+					}
+					return bytes;
+				}
+				return new String<u8>(Unicode.Encode<u8>(Unicode.Decode(Units())));
+			}
+
+			/// The text in UTF-16.
+			ToUtf16() : String<u16>
+			{
+				if (sizeof(T) == 2)
+				{
+					String<u16> same = new String<u16>(units.Length);
+					unsafe
+					{
+						if (units.Length > 0)
+							System.Runtime.InteropServices.Memory.Copy((u8*)&same.units[0], (u8*)&units[0], (i64)units.Length * 2);
+					}
+					return same;
+				}
+				return new String<u16>(Unicode.Encode<u16>(Unicode.Decode(Units())));
+			}
+
+			/// The text in UTF-32 (one unit per code point).
+			ToUtf32() : String<u32> => new String<u32>(Unicode.Decode(Units()));
+	}
+
+	/// The code units of a string, in order.
+	public value StringIterator<T : [u8, u16, u32]>
+	{
+		String<T> text;
+		i32 index;
+
+		public:
+			new(String<T> text) { this.text = text; index = -1; }
+
+			Next() : bool
+			{
+				index++;
+				return index < text.Length;
+			}
+
+			T Current { get => text.At(index); }
+	}
+
+	/// Code points to and from UTF-8, UTF-16 and UTF-32 units (the unit type says which).
+	public static class Unicode
+	{
+		public:
+			/// The code points of `units` (UTF-8 for u8, UTF-16 for u16, UTF-32 for u32); malformed ones become U+FFFD.
+			Decode<T : [u8, u16, u32]>(T[] units) : u32[]
+			{
+				u32[] points = new u32[units.Length];
+				i32 count = 0;
+				i32 i = 0;
+				loop (i < units.Length)
+				{
+					u32 c = (u32)units[i];
+					if (sizeof(T) == 4 || c < 0x80)
+					{
+						points[count] = sizeof(T) == 4 && (c > 0x10FFFF || c >= 0xD800 && c <= 0xDFFF) ? 0xFFFD : c;
+						count++;
+						i++;
+						continue;
+					}
+					if (sizeof(T) == 2)
+					{
+						if (c >= 0xD800 && c <= 0xDBFF && i + 1 < units.Length && (u32)units[i + 1] >= 0xDC00 && (u32)units[i + 1] <= 0xDFFF)
+						{
+							points[count] = 0x10000 + ((c - 0xD800) << 10) + ((u32)units[i + 1] - 0xDC00);
+							i += 2;
+						}
+						else
+						{
+							points[count] = c >= 0xD800 && c <= 0xDFFF ? 0xFFFD : c;
+							i++;
+						}
+						count++;
+						continue;
+					}
+					// UTF-8: a lead byte and its continuation bytes.
+					i32 extra = c >= 0xF8 ? 0 : c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC2 ? 1 : 0;
+					if (extra == 0 || i + extra >= units.Length)
+					{
+						points[count] = 0xFFFD;
+						count++;
+						i++;
+						continue;
+					}
+					u32 point = c & (extra == 1 ? 0x1F : extra == 2 ? 0x0F : 0x07);
+					bool valid = true;
+					loop (i32 k = 1..=extra)
+					{
+						u32 next = (u32)units[i + k];
+						if ((next & 0xC0) != 0x80)
+							valid = false;
+						point = point << 6 | next & 0x3F;
+					}
+					if (!valid || extra == 2 && (point < 0x800 || point >= 0xD800 && point <= 0xDFFF) || extra == 3 && (point < 0x10000 || point > 0x10FFFF))
+					{
+						points[count] = 0xFFFD;
+						count++;
+						i++;
+						continue;
+					}
+					points[count] = point;
+					count++;
+					i += extra + 1;
+				}
+				return count == points.Length ? points : Array.Resize(points, count);
+			}
+
+			/// How many units of T `points` take.
+			EncodedLength<T : [u8, u16, u32]>(u32[] points) : i32
+			{
+				i32 length = 0;
+				loop (i32 i = 0..points.Length)
+				{
+					u32 c = points[i];
+					if (sizeof(T) == 4)
+						length += 1;
+					else if (sizeof(T) == 2)
+						length += c >= 0x10000 ? 2 : 1;
+					else
+						length += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+				}
+				return length;
+			}
+
+			/// `points` as units of T (UTF-8, UTF-16 or UTF-32).
+			Encode<T : [u8, u16, u32]>(u32[] points) : T[]
+			{
+				T[] units = new T[EncodedLength<T>(points)];
+				i32 at = 0;
+				loop (i32 i = 0..points.Length)
+				{
+					u32 c = points[i];
+					if (sizeof(T) == 4)
+					{
+						units[at] = (T)c;
+						at++;
+					}
+					else if (sizeof(T) == 2)
+					{
+						if (c >= 0x10000)
+						{
+							u32 rest = c - 0x10000;
+							units[at] = (T)(0xD800 + (rest >> 10));
+							units[at + 1] = (T)(0xDC00 + (rest & 0x3FF));
+							at += 2;
+						}
+						else
+						{
+							units[at] = (T)c;
+							at++;
+						}
+					}
+					else if (c < 0x80)
+					{
+						units[at] = (T)c;
+						at++;
+					}
+					else if (c < 0x800)
+					{
+						units[at] = (T)(0xC0 | c >> 6);
+						units[at + 1] = (T)(0x80 | c & 0x3F);
+						at += 2;
+					}
+					else if (c < 0x10000)
+					{
+						units[at] = (T)(0xE0 | c >> 12);
+						units[at + 1] = (T)(0x80 | c >> 6 & 0x3F);
+						units[at + 2] = (T)(0x80 | c & 0x3F);
+						at += 3;
+					}
+					else
+					{
+						units[at] = (T)(0xF0 | c >> 18);
+						units[at + 1] = (T)(0x80 | c >> 12 & 0x3F);
+						units[at + 2] = (T)(0x80 | c >> 6 & 0x3F);
+						units[at + 3] = (T)(0x80 | c & 0x3F);
+						at += 4;
+					}
+				}
+				return units;
+			}
+
+			/// Text from UTF-16 units (what the runtime's services give): in UTF-8.
+			FromUtf16(u16[] units) : str => new String<u8>(Encode<u8>(Decode(units)));
+
+			/// A str's text as UTF-16 units (what the runtime's services take).
+			ToUtf16(str text) : u16[] => Encode<u16>(Decode(text.Units()));
+
+			/// One code point as a str.
+			ToString(u32 point) : str
+			{
+				u32[] one = new u32[1];
+				one[0] = point;
+				return new String<u8>(Encode<u8>(one));
+			}
+	}
+}

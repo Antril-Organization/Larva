@@ -1,0 +1,82 @@
+// What the compiler writes for a record's fields: its `Equals`, `Hash()` and `ToString()` compare, hash and show an array
+// element by element and a value of a type parameter by what its type has (nullable fields are handled inline: null is
+// "null", hashes to 0 and equals null).
+
+into namespace System
+{
+	public static class Records
+	{
+		public:
+			/// Whether two arrays hold equal elements in the same order.
+			static Equal<T : IHashable<T>>(T[] a, T[] b) : bool
+			{
+				if (a.Length != b.Length)
+					return false;
+				loop (i32 i = 0..a.Length)
+				{
+					if (!a[i].Equals(b[i]))
+						return false;
+				}
+				return true;
+			}
+
+			/// A hash of the elements in order (equal arrays hash alike).
+			static Hash<T : IHashable<T>>(T[] a) : u64
+			{
+				u64 h = (u64)a.Length;
+				loop (i32 i = 0..a.Length)
+					h = h * 31 + a[i].Hash();
+				return h;
+			}
+
+			/// `[a, b, c]`.
+			static Text<T : IToString>(T[] a) : str
+			{
+				StringBuilder text = new StringBuilder();
+				text.Append("[");
+				loop (i32 i = 0..a.Length)
+				{
+					if (i > 0)
+						text.Append(", ");
+					text.Append(a[i].ToString());
+				}
+				text.Append("]");
+				return text.ToString();
+			}
+
+			// Fields of a type parameter (a generic record, a tuple): what the type given has, called directly once the
+			// type is known. The compiler calls these for any type: one without Equals, Hash() or ToString() gets what
+			// the lowering registers for it (an object: the same object, any's Hash() and ToString(); else NoSame,
+			// NoHash, NoText).
+
+			/// Whether two values are equal (the type's Equals).
+			static Same<T : IHashable<T>>(T a, T b) : bool => a.Equals(b);
+
+			/// The value's Hash().
+			static HashOf<T : IHashable<T>>(T value) : u64 => value.Hash();
+
+			/// The value's ToString().
+			static TextOf<T : IToString>(T value) : str => value.ToString();
+
+			/// An object without Equals: equal to itself only.
+			static SameObject(any a, any b) : bool => a == b;
+
+			/// An object without IHashable: any's Hash().
+			static ObjectHash(any value) : u64 => value.Hash();
+
+			/// An object without IToString: any's ToString() (its class's name unless the class says otherwise).
+			static ObjectText(any value) : str => value.ToString();
+
+			/// A value without Equals: never equal to another.
+			static NoSame<T>(T a, T b) : bool => false;
+
+			/// A value without Hash(): 0.
+			static NoHash<T>(T value) : u64 => 0;
+
+			/// A value without ToString().
+			static NoText<T>(T value) : str => "?";
+
+			/// What a null object shows as.
+			static NullText() : str => "null";
+	}
+}

@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LLVMSharp.Interop" Version="22.1.8" />
+  </ItemGroup>
+
+  <!-- LLVM's native libraries, for the platform larva is built on (consumers need no RuntimeIdentifier). -->
+  <PropertyGroup>
+    <LlvmPlatform Condition="$([MSBuild]::IsOSPlatform('Windows'))">win-x64</LlvmPlatform>
+    <LlvmPlatform Condition="$([MSBuild]::IsOSPlatform('Linux'))">linux-x64</LlvmPlatform>
+    <LlvmPlatform Condition="$([MSBuild]::IsOSPlatform('OSX'))">osx-arm64</LlvmPlatform>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="libLLVM.runtime.$(LlvmPlatform)" Version="22.1.8" />
+    <PackageReference Include="libLLVMSharp.runtime.$(LlvmPlatform)" Version="22.1.8.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Runtime\wasm_heap.ll" LogicalName="wasm_heap.ll" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.IR\Larva.IR.csproj" />
+    <ProjectReference Include="..\Larva.Native\Larva.Native.csproj" />
+  </ItemGroup>
+
+</Project>

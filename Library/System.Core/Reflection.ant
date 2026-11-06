@@ -1,0 +1,1040 @@
+// Reflection: a program's types and their members at run time, modelled on .NET's (Type, FieldInfo, PropertyInfo,
+// MethodInfo, ConstructorInfo, Activator). When a program uses `typeof` or `GetType()`, the compiler describes each
+// type: its Type has a name, a namespace and a kind, and a describer (a class the compiler writes per type) gives the
+// rest the first time it is asked for: base type, type arguments, interfaces, members, and access to those members.
+
+import System.Collections.Generic;
+import System.Reflection;
+import System.Threading;
+
+into namespace System
+{
+	/// A type at run time: `typeof(T)` and `x.GetType()` give the same object for the same type (compare with `==`).
+	public final class Type
+	{
+		readonly str name;
+		readonly str space;
+		readonly i32 flags;
+		readonly TypeDescriber describer;
+		/// Base, arguments, interfaces and element: from the describer, once.
+		bool described;
+		Type? baseType;
+		Type[] arguments;
+		Type[] interfaces;
+		Type? element;
+		i32 rank;
+		FieldInfo[]? fields;
+		PropertyInfo[]? properties;
+		MethodInfo[]? methods;
+		ConstructorInfo[]? constructors;
+		/// The public constructor without parameters (Activator), once found.
+		ConstructorInfo? plain;
+		bool plainLooked;
+		/// Types made from this one (T[], T*, T?), once each.
+		Type? arrayType;
+		Type? pointerType;
+		Type? nullableType;
+		List<Type>? grids;
+
+		/// What makes each type's Type once, even with threads (the slow path of typeof only).
+		static Reentrant sync = new Reentrant();
+		/// Types that are not one of the program's (functions, the unknown): by full name.
+		static Dictionary<str, Type>? made;
+
+		/// What `flags` says.
+		static ClassFlag() : i32 => 1;
+		static ValueFlag() : i32 => 2;
+		static InterfaceFlag() : i32 => 4;
+		static EnumFlag() : i32 => 8;
+		static PrimitiveFlag() : i32 => 16;
+		static ArrayFlag() : i32 => 32;
+		static GenericFlag() : i32 => 64;
+		static AbstractFlag() : i32 => 128;
+		static FinalFlag() : i32 => 256;
+		static PointerFlag() : i32 => 512;
+		static NullableFlag() : i32 => 1024;
+		static FunctionFlag() : i32 => 2048;
+		static StaticFlag() : i32 => 4096;
+		static PublicFlag() : i32 => 8192;
+		static BitflagsFlag() : i32 => 16384;
+
+		Has(i32 flag) : bool => (flags & flag) != 0;
+
+		Describe()
+		{
+			if (described)
+				return;
+			sync.Enter();
+			if (!described)
+			{
+				baseType = describer.Base();
+				arguments = describer.Arguments();
+				interfaces = describer.Interfaces();
+				element = describer.Element();
+				rank = describer.Rank();
+				described = true;
+			}
+			sync.Exit();
+		}
+
+		static Made(str key, str name, str space, i32 flags, TypeDescriber describer) : Type
+		{
+			sync.Enter();
+			if (made == null)
+				made = new Dictionary<str, Type>();
+			Dictionary<str, Type> all = made ?? new Dictionary<str, Type>();
+			Type result = all.ContainsKey(key) ? all.Get(key) : new Type(name, space, flags, describer);
+			all.Set(key, result);
+			sync.Exit();
+			return result;
+		}
+
+		static Join(Type[] parts) : str
+		{
+			str text = "";
+			loop (i32 i = 0..parts.Length)
+				text = i == 0 ? parts[i].FullName : text + ", " + parts[i].FullName;
+			return text;
+		}
+
+		static Holds(List<Type> types, Type type) : bool
+		{
+			loop (Type t in types)
+			{
+				if (t == type)
+					return true;
+			}
+			return false;
+		}
+
+		/// A property of a class below with the same name was found first.
+		static Shadowed(List<PropertyInfo> found, str name) : bool
+		{
+			loop (PropertyInfo p in found)
+			{
+				if (p.Name == name)
+					return true;
+			}
+			return false;
+		}
+
+		/// The same method of a class below (its override) was found first.
+		static Overridden(List<MethodInfo> found, MethodInfo method) : bool
+		{
+			loop (MethodInfo m in found)
+			{
+				if (m.SameAs(method))
+					return true;
+			}
+			return false;
+		}
+
+		Matches(BindingFlags wanted, bool isPublic, bool isStatic) : bool
+		{
+			if (wanted == BindingFlags.Default)
+				wanted = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public;
+			bool access = isPublic ? (wanted & BindingFlags.Public) != BindingFlags.Default : (wanted & BindingFlags.NonPublic) != BindingFlags.Default;
+			bool where = isStatic ? (wanted & BindingFlags.Static) != BindingFlags.Default : (wanted & BindingFlags.Instance) != BindingFlags.Default;
+			return access && where;
+		}
+
+		internal OwnFields() : FieldInfo[]
+		{
+			if (fields is FieldInfo[] known)
+				return known;
+			FieldInfo[] list = describer.Fields(this);
+			fields = list;
+			return list;
+		}
+
+		internal OwnProperties() : PropertyInfo[]
+		{
+			if (properties is PropertyInfo[] known)
+				return known;
+			PropertyInfo[] list = describer.Properties(this);
+			properties = list;
+			return list;
+		}
+
+		internal OwnMethods() : MethodInfo[]
+		{
+			if (methods is MethodInfo[] known)
+				return known;
+			MethodInfo[] list = describer.Methods(this);
+			methods = list;
+			return list;
+		}
+
+		internal OwnConstructors() : ConstructorInfo[]
+		{
+			if (constructors is ConstructorInfo[] known)
+				return known;
+			ConstructorInfo[] list = describer.Constructors(this);
+			constructors = list;
+			return list;
+		}
+
+		/// What Activator.CreateInstance(type) uses: the public constructor without parameters (null: none).
+		internal PlainConstructor() : ConstructorInfo?
+		{
+			if (plainLooked)
+				return plain;
+			loop (ConstructorInfo c in OwnConstructors())
+			{
+				if (c.IsPublic && c.GetParameters().Length == 0)
+					plain = c;
+			}
+			plainLooked = true;
+			return plain;
+		}
+
+		/// A new value of a value type with no constructor: its zero value.
+		internal ZeroValue() : any => describer.Construct(-1, Activator.None);
+
+		/// Called by the compiler's code: a type it describes.
+		internal new(str name, str space, i32 flags, TypeDescriber describer)
+		{
+			this.name = name;
+			this.space = space;
+			this.flags = flags;
+			this.describer = describer;
+			arguments = [];
+			interfaces = [];
+		}
+
+		/// The reflection lock (taken while a type's Type is made).
+		internal static Enter() { sync.Enter(); }
+		internal static Exit() { sync.Exit(); }
+
+		/// `T[]` (`rank` 1) or `T[,]`…
+		internal static ArrayOf(Type element, i32 rank) : Type => rank == 1 ? element.MakeArrayType() : element.MakeArrayType(rank);
+
+		internal static PointerOf(Type target) : Type => target.MakePointerType();
+
+		/// A nullable value type `T?`.
+		internal static NullableOf(Type inner) : Type
+		{
+			if (inner.nullableType is Type known)
+				return known;
+			sync.Enter();
+			Type result = inner.nullableType ?? new Type(inner.name + "?", inner.space, ValueFlag() | NullableFlag() | GenericFlag() | PublicFlag(), new PartsDescriber(null, [inner], 0, null));
+			inner.nullableType = result;
+			sync.Exit();
+			return result;
+		}
+
+		/// A function type: `func<…> : R` (or `func*<…> : R` when `native`).
+		internal static FuncOf(Type[] parameters, Type result, bool native) : Type
+		{
+			str key = (native ? "func*<" : "func<") + Join(parameters) + "> : " + result.FullName;
+			List<Type> all = new List<Type>();
+			loop (Type p in parameters)
+				all.Add(p);
+			all.Add(result);
+			Type[] parts = all.ToArray();
+			i32 kind = native ? PointerFlag() | FunctionFlag() | PublicFlag() : ClassFlag() | FunctionFlag() | GenericFlag() | PublicFlag() | FinalFlag();
+			return Made(key, native ? "func*" : "func", "", kind, new PartsDescriber(null, parts, 0, null));
+		}
+
+		/// `void` (the result of a function that gives nothing).
+		internal static VoidType() : Type => Made("void", "Void", "System", ValueFlag() | PublicFlag(), new PartsDescriber(null, [], 0, null));
+
+		/// A type the program does not describe.
+		internal static Unknown() : Type => Made("?", "?", "", 0, new PartsDescriber(null, [], 0, null));
+
+		public:
+			/// The type's name (without its namespace or type arguments): `List`, `Int32`, `Int32[]`.
+			str Name { get => name; }
+
+			str Namespace { get => space; }
+
+			/// The namespace, the name and the type arguments: `System.Collections.Generic.List<System.Int32>`.
+			str FullName
+			{
+				get
+				{
+					if (Has(ArrayFlag()) || Has(PointerFlag()) && !Has(FunctionFlag()))
+					{
+						Describe();
+						if (element is Type of)
+							return of.FullName + name.Substring(of.name.Length);
+					}
+					if (Has(NullableFlag()))
+					{
+						Describe();
+						return arguments[0].FullName + "?";
+					}
+					str text = space.Length > 0 ? space + "." + name : name;
+					if (Has(GenericFlag()))
+					{
+						Describe();
+						if (Has(FunctionFlag()))
+						{
+							List<Type> parameters = new List<Type>();
+							loop (i32 i = 0..arguments.Length - 1)
+								parameters.Add(arguments[i]);
+							return text + "<" + Join(parameters.ToArray()) + "> : " + arguments[arguments.Length - 1].FullName;
+						}
+						// `str`: the language's string (String<u8>) goes by the string's name.
+						if (space == "System" && name == "String" && arguments.Length == 1 && arguments[0].name == "UInt8")
+							return text;
+						return text + "<" + Join(arguments) + ">";
+					}
+					return text;
+				}
+			}
+
+			override ToString() : str => FullName;
+
+			/// The base class (null for `any`, interfaces, values and the types made from others).
+			Type? BaseType { get { Describe(); return baseType; } }
+
+			bool IsClass { get => Has(ClassFlag()); }
+			bool IsValueType { get => Has(ValueFlag()); }
+			bool IsInterface { get => Has(InterfaceFlag()); }
+			bool IsEnum { get => Has(EnumFlag()); }
+			bool IsPrimitive { get => Has(PrimitiveFlag()); }
+			bool IsArray { get => Has(ArrayFlag()); }
+			bool IsPointer { get => Has(PointerFlag()) && !Has(FunctionFlag()); }
+			bool IsGenericType { get => Has(GenericFlag()); }
+			bool IsAbstract { get => Has(AbstractFlag()); }
+			bool IsSealed { get => Has(FinalFlag()); }
+			bool IsPublic { get => Has(PublicFlag()); }
+			/// A function type (`func<…> : R` or `func*<…> : R`).
+			bool IsFunction { get => Has(FunctionFlag()); }
+			/// A nullable value type (`T?` of a value type).
+			bool IsNullable { get => Has(NullableFlag()); }
+
+			/// The type arguments (of a generic type, a nullable, a function type).
+			GetGenericArguments() : Type[] { Describe(); return arguments; }
+
+			Type[] GenericTypeArguments { get { Describe(); return arguments; } }
+
+			/// What an array or a pointer holds (null otherwise).
+			GetElementType() : Type? { Describe(); return element; }
+
+			/// An array's dimensions.
+			GetArrayRank() : i32 { Describe(); return rank; }
+
+			/// The interfaces the type implements (its own and its base classes').
+			GetInterfaces() : Type[]
+			{
+				Describe();
+				List<Type> all = new List<Type>();
+				Type? at = this;
+				loop (at is Type current)
+				{
+					current.Describe();
+					loop (Type i in current.interfaces)
+					{
+						if (!Holds(all, i))
+							all.Add(i);
+					}
+					at = current.baseType;
+				}
+				return all.ToArray();
+			}
+
+			/// Whether this type derives from `other` (a class below it, not the class itself).
+			/// Whether `[FriendOf]` on this type names `other`, or the other way round: each sees the other's `friendly` members.
+			IsFriendOf(Type other) : bool => Names(this, other) || Names(other, this);
+
+			static Names(Type on, Type friend) : bool
+			{
+				loop (any a in on.GetCustomAttributes())
+				{
+					if (a is FriendOfAttribute f && f.Friend == friend)
+						return true;
+				}
+				return false;
+			}
+
+			IsSubclassOf(Type other) : bool
+			{
+				Type? at = BaseType;
+				loop (at is Type current)
+				{
+					if (current == other)
+						return true;
+					at = current.BaseType;
+				}
+				return false;
+			}
+
+			/// Whether a value of `other` can be a value of this type: the same type, a class below it, a type that
+			/// implements it (this an interface), anything for `any`.
+			IsAssignableFrom(Type? other) : bool
+			{
+				if (other == null)
+					return false;
+				Type from = other ?? this;
+				if (from == this)
+					return true;
+				if (Has(ClassFlag()) && name == "Any" && space == "System")
+					return true;
+				if (from.IsSubclassOf(this))
+					return true;
+				if (Has(InterfaceFlag()))
+				{
+					loop (Type i in from.GetInterfaces())
+					{
+						if (i == this || i != from && IsAssignableFrom(i))
+							return true;
+					}
+				}
+				return false;
+			}
+
+			/// Whether `value` is one of this type.
+			IsInstanceOfType(any? value) : bool => value is any some && IsAssignableFrom(some.GetType());
+
+			/// The public fields (instance and static, inherited ones too).
+			GetFields() : FieldInfo[] => GetFields(BindingFlags.Default);
+
+			GetFields(BindingFlags wanted) : FieldInfo[]
+			{
+				List<FieldInfo> found = new List<FieldInfo>();
+				Type? at = this;
+				loop (at is Type current)
+				{
+					loop (FieldInfo f in current.OwnFields())
+					{
+						if (Matches(wanted, f.IsPublic, f.IsStatic) && (current == this || !f.IsStatic && f.IsPublic))
+							found.Add(f);
+					}
+					at = (wanted & BindingFlags.DeclaredOnly) != BindingFlags.Default ? null : current.BaseType;
+				}
+				return found.ToArray();
+			}
+
+			/// The public field named `name` (null: none).
+			GetField(str name) : FieldInfo? => GetField(name, BindingFlags.Default);
+
+			GetField(str name, BindingFlags wanted) : FieldInfo?
+			{
+				loop (FieldInfo f in GetFields(wanted))
+				{
+					if (f.Name == name)
+						return f;
+				}
+				return null;
+			}
+
+			GetProperties() : PropertyInfo[] => GetProperties(BindingFlags.Default);
+
+			GetProperties(BindingFlags wanted) : PropertyInfo[]
+			{
+				List<PropertyInfo> found = new List<PropertyInfo>();
+				Type? at = this;
+				loop (at is Type current)
+				{
+					loop (PropertyInfo p in current.OwnProperties())
+					{
+						if (Matches(wanted, p.IsPublic, p.IsStatic) && (current == this || !p.IsStatic) && !Shadowed(found, p.Name))
+							found.Add(p);
+					}
+					at = (wanted & BindingFlags.DeclaredOnly) != BindingFlags.Default ? null : current.BaseType;
+				}
+				return found.ToArray();
+			}
+
+			GetProperty(str name) : PropertyInfo? => GetProperty(name, BindingFlags.Default);
+
+			GetProperty(str name, BindingFlags wanted) : PropertyInfo?
+			{
+				loop (PropertyInfo p in GetProperties(wanted))
+				{
+					if (p.Name == name)
+						return p;
+				}
+				return null;
+			}
+
+			/// The public methods (instance and static, inherited ones too; overridden ones once).
+			GetMethods() : MethodInfo[] => GetMethods(BindingFlags.Default);
+
+			GetMethods(BindingFlags wanted) : MethodInfo[]
+			{
+				List<MethodInfo> found = new List<MethodInfo>();
+				Type? at = this;
+				loop (at is Type current)
+				{
+					loop (MethodInfo m in current.OwnMethods())
+					{
+						if (Matches(wanted, m.IsPublic, m.IsStatic) && (current == this || !m.IsStatic) && !Overridden(found, m))
+							found.Add(m);
+					}
+					at = (wanted & BindingFlags.DeclaredOnly) != BindingFlags.Default ? null : current.BaseType;
+				}
+				return found.ToArray();
+			}
+
+			/// The public method named `name` (the first, when it has overloads; null: none).
+			GetMethod(str name) : MethodInfo? => GetMethod(name, BindingFlags.Default);
+
+			GetMethod(str name, BindingFlags wanted) : MethodInfo?
+			{
+				loop (MethodInfo m in GetMethods(wanted))
+				{
+					if (m.Name == name)
+						return m;
+				}
+				return null;
+			}
+
+			/// The public method named `name` that takes `types`.
+			GetMethod(str name, Type[] types) : MethodInfo?
+			{
+				loop (MethodInfo m in GetMethods())
+				{
+					if (m.Name == name && m.Takes(types))
+						return m;
+				}
+				return null;
+			}
+
+			GetConstructors() : ConstructorInfo[] => GetConstructors(BindingFlags.Instance | BindingFlags.Public);
+
+			GetConstructors(BindingFlags wanted) : ConstructorInfo[]
+			{
+				List<ConstructorInfo> found = new List<ConstructorInfo>();
+				loop (ConstructorInfo c in OwnConstructors())
+				{
+					if (Matches(wanted, c.IsPublic, false))
+						found.Add(c);
+				}
+				return found.ToArray();
+			}
+
+			/// The public constructor that takes `types` (null: none).
+			GetConstructor(Type[] types) : ConstructorInfo?
+			{
+				loop (ConstructorInfo c in GetConstructors())
+				{
+					if (c.Takes(types))
+						return c;
+				}
+				return null;
+			}
+
+			/// An enum's member names, in declaration order.
+			GetEnumNames() : str[] => describer.EnumNames();
+
+			/// An enum's member values (as numbers), in declaration order.
+			GetEnumValues() : i64[] => describer.EnumValues();
+
+			/// The custom attributes written on the type.
+			GetCustomAttributes() : any[] => describer.Attributes(-1);
+
+			/// Those of the attribute class `attributeType` (or a class below it).
+			GetCustomAttributes(Type attributeType) : any[] => Attributes.Of(GetCustomAttributes(), attributeType);
+
+			/// Whether an attribute of `attributeType` is written on the type.
+			IsDefined(Type attributeType) : bool => GetCustomAttributes(attributeType).Length > 0;
+
+			/// `T[]`.
+			MakeArrayType() : Type
+			{
+				if (arrayType is Type known)
+					return known;
+				sync.Enter();
+				Type result = arrayType ?? new Type(name + "[]", space, ClassFlag() | ArrayFlag() | FinalFlag() | PublicFlag(), new PartsDescriber(this, [], 1, null));
+				arrayType = result;
+				sync.Exit();
+				return result;
+			}
+
+			/// `T[,]`… (`rank` dimensions).
+			MakeArrayType(i32 rank) : Type
+			{
+				if (rank == 1)
+					return MakeArrayType();
+				sync.Enter();
+				if (grids == null)
+					grids = new List<Type>();
+				List<Type> all = grids ?? new List<Type>();
+				Type? found = null;
+				loop (Type g in all)
+				{
+					if (g.GetArrayRank() == rank)
+						found = g;
+				}
+				Type result = found ?? new Type(name + "[" + ",".Repeat(rank - 1) + "]", space, ClassFlag() | ArrayFlag() | FinalFlag() | PublicFlag(), new PartsDescriber(this, [], rank, null));
+				if (found == null)
+					all.Add(result);
+				sync.Exit();
+				return result;
+			}
+
+			/// `T*`.
+			MakePointerType() : Type
+			{
+				if (pointerType is Type known)
+					return known;
+				sync.Enter();
+				Type result = pointerType ?? new Type(name + "*", space, PointerFlag() | ValueFlag() | PublicFlag(), new PartsDescriber(this, [], 0, null));
+				pointerType = result;
+				sync.Exit();
+				return result;
+			}
+	}
+
+	/// What custom attributes derive from: a class derived from it can be written in `[…]` on a type or a member (with
+	/// constant arguments), and reflection gives its objects (GetCustomAttributes).
+	public base class Attribute
+	{
+		public:
+			new() { }
+	}
+
+	/// `[FriendOf(T)]` on a type makes it and `T` friends, from any assembly: each sees the other's `friendly` members.
+	public final class FriendOfAttribute : Attribute
+	{
+		readonly Type friend;
+
+		public:
+			new(Type friend) { this.friend = friend; }
+
+			/// The type named.
+			Type Friend { get => friend; }
+	}
+
+	/// Objects of types known at run time.
+	public static class Activator
+	{
+		/// No arguments.
+		internal static any?[] None = [];
+
+		public:
+			/// A new object of `type` through its constructor without parameters (a value type's zero value when it has none).
+			CreateInstance(Type type) : any
+			{
+				if (type.PlainConstructor() is ConstructorInfo plain)
+					return plain.Describer.Construct(plain.Index, None);
+				return CreateInstance(type, None);
+			}
+
+			/// A new object of `type` through the public constructor that takes `arguments`.
+			CreateInstance(Type type, any?[] arguments) : any
+			{
+				loop (ConstructorInfo c in type.GetConstructors())
+				{
+					if (c.Accepts(arguments))
+						return c.Invoke(arguments);
+				}
+				if (arguments.Length == 0 && type.IsValueType)
+					return type.ZeroValue();
+				throw new MissingMemberError(type.FullName + " has no public constructor that takes these arguments");
+			}
+	}
+
+	/// A member asked for through reflection is not there (no such constructor or method).
+	public class MissingMemberError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// A value of the wrong type given to a member through reflection (or a target that is not the member's).
+	public class InvalidCastError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+
+	/// Something reflection cannot do (setting a field of a boxed value, a value that is not an object).
+	public class NotSupportedError : Exception
+	{
+		public:
+			new(str message) : base(message) { }
+	}
+}
+
+into namespace System.Reflection
+{
+	/// Which members to look at: instance or static ones, public or not, only the type's own.
+	public bitflag enum BindingFlags { Default = 0, DeclaredOnly = 2, Instance = 4, Static = 8, Public = 16, NonPublic = 32 }
+
+	/// What every member has: its name, the type that declares it, its access, and where its describer keeps it.
+	public base class MemberInfo
+	{
+		readonly str name;
+		readonly Type declaring;
+		readonly i32 flags;
+		readonly TypeDescriber describer;
+		readonly i32 index;
+
+		internal new(Type declaring, str name, i32 flags, TypeDescriber describer, i32 index)
+		{
+			this.declaring = declaring;
+			this.name = name;
+			this.flags = flags;
+			this.describer = describer;
+			this.index = index;
+		}
+
+		internal TypeDescriber Describer { get => describer; }
+		internal i32 Index { get => index; }
+		/// What the describer's Attributes takes for this member (fields, methods and properties are numbered apart).
+		internal virtual AttributeKey() : i32 => index;
+		internal Has(i32 flag) : bool => (flags & flag) != 0;
+
+		public:
+			str Name { get => name; }
+
+			Type DeclaringType { get => declaring; }
+
+			bool IsPublic { get => Has(1); }
+
+			bool IsStatic { get => Has(2); }
+
+			/// The custom attributes written on the member.
+			GetCustomAttributes() : any[] => describer.Attributes(AttributeKey());
+
+			GetCustomAttributes(Type attributeType) : any[] => Attributes.Of(GetCustomAttributes(), attributeType);
+
+			IsDefined(Type attributeType) : bool => GetCustomAttributes(attributeType).Length > 0;
+
+			override ToString() : str => name;
+	}
+
+	/// A field: its type, and its value in an object (`GetValue(obj)`; null for a static field).
+	public final class FieldInfo : MemberInfo
+	{
+		readonly Type fieldType;
+
+		internal new(Type declaring, str name, i32 flags, TypeDescriber describer, i32 index, Type fieldType) : base(declaring, name, flags, describer, index)
+		{
+			this.fieldType = fieldType;
+		}
+
+		internal override AttributeKey() : i32 => 1000000 + Index;
+
+		public:
+			Type FieldType { get => fieldType; }
+
+			/// Set only by constructors (`readonly`).
+			bool IsInitOnly { get => Has(16); }
+
+			/// The field's value in `target` (boxed when it is a value).
+			GetValue(any? target) : any? => Describer.GetField(Index, target);
+
+			/// Sets the field in `target` to `value` (which must be of the field's type).
+			SetValue(any? target, any? value) { Describer.SetField(Index, target, value); }
+
+			override ToString() : str => fieldType.FullName + " " + Name;
+	}
+
+	/// A property: its type, and its value through its accessors.
+	public final class PropertyInfo : MemberInfo
+	{
+		readonly Type propertyType;
+		readonly i32 getter;
+		readonly i32 setter;
+
+		internal new(Type declaring, str name, i32 flags, TypeDescriber describer, i32 index, Type propertyType, i32 getter, i32 setter) : base(declaring, name, flags, describer, index)
+		{
+			this.propertyType = propertyType;
+			this.getter = getter;
+			this.setter = setter;
+		}
+
+		internal override AttributeKey() : i32 => 3000000 + Index;
+
+		public:
+			Type PropertyType { get => propertyType; }
+
+			bool CanRead { get => getter >= 0; }
+
+			bool CanWrite { get => setter >= 0; }
+
+			GetValue(any? target) : any?
+			{
+				if (getter < 0)
+					throw new NotSupportedError(Name + " has no getter");
+				return Describer.Invoke(getter, target, []);
+			}
+
+			SetValue(any? target, any? value)
+			{
+				if (setter < 0)
+					throw new NotSupportedError(Name + " has no setter");
+				Describer.Invoke(setter, target, [value]);
+			}
+
+			override ToString() : str => propertyType.FullName + " " + Name;
+	}
+
+	/// A parameter of a method or constructor.
+	public final class ParameterInfo
+	{
+		readonly str name;
+		readonly Type type;
+		readonly i32 position;
+		/// The method or constructor it belongs to (set when that is made).
+		internal MethodBase? member;
+
+		internal new(str name, Type type, i32 position)
+		{
+			this.name = name;
+			this.type = type;
+			this.position = position;
+		}
+
+		public:
+			str Name { get => name; }
+			Type ParameterType { get => type; }
+			i32 Position { get => position; }
+
+			/// The custom attributes written on the parameter (`[Tag("n")] i32 n`).
+			GetCustomAttributes() : any[]
+			{
+				if (member is MethodBase owner)
+					return owner.Describer.Attributes(4000000 + owner.Index * 256 + position);
+				return [];
+			}
+
+			GetCustomAttributes(Type attributeType) : any[] => Attributes.Of(GetCustomAttributes(), attributeType);
+
+			IsDefined(Type attributeType) : bool => GetCustomAttributes(attributeType).Length > 0;
+
+			override ToString() : str => type.FullName + " " + name;
+	}
+
+	/// What methods and constructors have: parameters.
+	public base class MethodBase : MemberInfo
+	{
+		readonly ParameterInfo[] parameters;
+
+		internal new(Type declaring, str name, i32 flags, TypeDescriber describer, i32 index, ParameterInfo[] parameters) : base(declaring, name, flags, describer, index)
+		{
+			this.parameters = parameters;
+			loop (ParameterInfo parameter in parameters)
+				parameter.member = this;
+		}
+
+		internal override AttributeKey() : i32 => 2000000 + Index;
+
+		/// Whether the parameters are of `types`.
+		internal Takes(Type[] types) : bool
+		{
+			if (types.Length != parameters.Length)
+				return false;
+			loop (i32 i = 0..types.Length)
+			{
+				if (types[i] != parameters[i].ParameterType)
+					return false;
+			}
+			return true;
+		}
+
+		/// Whether the values can be the arguments.
+		internal Accepts(any?[] values) : bool
+		{
+			if (values.Length != parameters.Length)
+				return false;
+			loop (i32 i = 0..values.Length)
+			{
+				if (values[i] is any value && !parameters[i].ParameterType.IsInstanceOfType(value) && !parameters[i].ParameterType.IsNullable)
+					return false;
+			}
+			return true;
+		}
+
+		internal Check(any?[] values)
+		{
+			if (values.Length != parameters.Length)
+				throw new ArgumentError(Name + " takes " + parameters.Length + " argument(s), not " + values.Length);
+		}
+
+		public:
+			GetParameters() : ParameterInfo[] => parameters;
+	}
+
+	/// A method: its result type, and calls through `Invoke(target, arguments)`.
+	public final class MethodInfo : MethodBase
+	{
+		readonly Type returnType;
+
+		internal new(Type declaring, str name, i32 flags, TypeDescriber describer, i32 index, Type returnType, ParameterInfo[] parameters) : base(declaring, name, flags, describer, index, parameters)
+		{
+			this.returnType = returnType;
+		}
+
+		/// Whether `other` is the same method seen from a class below (an override).
+		internal SameAs(MethodInfo other) : bool
+		{
+			if (other.Name != Name || other.GetParameters().Length != GetParameters().Length)
+				return false;
+			loop (i32 i = 0..GetParameters().Length)
+			{
+				if (other.GetParameters()[i].ParameterType != GetParameters()[i].ParameterType)
+					return false;
+			}
+			return true;
+		}
+
+		public:
+			Type ReturnType { get => returnType; }
+
+			bool IsVirtual { get => Has(4); }
+
+			bool IsAbstract { get => Has(8); }
+
+			/// A method with its own type parameters (it cannot be called through Invoke).
+			bool IsGenericMethod { get => Has(32); }
+
+			/// Calls the method on `target` (null for a static method) with `arguments`: its result, boxed (null for none).
+			Invoke(any? target, any?[] arguments) : any?
+			{
+				Check(arguments);
+				if (IsGenericMethod)
+					throw new NotSupportedError(Name + " has type parameters: it cannot be called through reflection");
+				return Describer.Invoke(Index, target, arguments);
+			}
+
+			override ToString() : str => returnType.FullName + " " + Name + "(" + Parameters.Text(GetParameters()) + ")";
+	}
+
+	/// A constructor: makes objects through `Invoke(arguments)`.
+	public final class ConstructorInfo : MethodBase
+	{
+		internal new(Type declaring, i32 flags, TypeDescriber describer, i32 index, ParameterInfo[] parameters) : base(declaring, ".ctor", flags, describer, index, parameters) { }
+
+		public:
+			/// A new object (a value type's comes boxed).
+			Invoke(any?[] arguments) : any
+			{
+				Check(arguments);
+				return Describer.Construct(Index, arguments);
+			}
+
+			override ToString() : str => "Void .ctor(" + Parameters.Text(GetParameters()) + ")";
+	}
+
+	internal static class Parameters
+	{
+		public:
+			Text(ParameterInfo[] parameters) : str
+			{
+				str text = "";
+				loop (i32 i = 0..parameters.Length)
+					text = i == 0 ? parameters[i].ParameterType.FullName : text + ", " + parameters[i].ParameterType.FullName;
+				return text;
+			}
+	}
+
+	internal static class Attributes
+	{
+		public:
+			/// Those of `all` that are of `attributeType` (or a class below it).
+			Of(any[] all, Type attributeType) : any[]
+			{
+				List<any> found = new List<any>();
+				loop (any a in all)
+				{
+					if (attributeType.IsInstanceOfType(a))
+						found.Add(a);
+				}
+				return found.ToArray();
+			}
+	}
+
+	/// What the compiler writes for each type (a class derived from this one per type): the parts of its Type made on
+	/// first use, and access to its members by number. Members' flags: 1 public, 2 static, 4 virtual, 8 abstract,
+	/// 16 readonly, 32 generic.
+	public base class TypeDescriber
+	{
+		public:
+			virtual Base() : Type? => null;
+			virtual Arguments() : Type[] => [];
+			virtual Interfaces() : Type[] => [];
+			virtual Element() : Type? => null;
+			virtual Rank() : i32 => 0;
+			virtual Fields(Type owner) : FieldInfo[] => [];
+			virtual Properties(Type owner) : PropertyInfo[] => [];
+			virtual Methods(Type owner) : MethodInfo[] => [];
+			virtual Constructors(Type owner) : ConstructorInfo[] => [];
+			virtual EnumNames() : str[] => [];
+			virtual EnumValues() : i64[] => [];
+			/// The custom attributes of member `member` (-1: of the type).
+			virtual Attributes(i32 member) : any[] => [];
+			virtual GetField(i32 index, any? target) : any? { throw new NotSupportedError("no field " + index); }
+			virtual SetField(i32 index, any? target, any? value) { throw new NotSupportedError("no field " + index); }
+			virtual Invoke(i32 index, any? target, any?[] arguments) : any? { throw new NotSupportedError("no method " + index); }
+			/// A new object through constructor `index` (-1: a value type's zero value).
+			virtual Construct(i32 index, any?[] arguments) : any { throw new NotSupportedError("no constructor " + index); }
+	}
+
+	/// Types made from others (arrays, pointers, nullables, functions): their parts.
+	internal final class PartsDescriber : TypeDescriber
+	{
+		readonly Type? element;
+		readonly Type[] parts;
+		readonly i32 rank;
+		readonly Type? baseType;
+
+		new(Type? element, Type[] parts, i32 rank, Type? baseType)
+		{
+			this.element = element;
+			this.parts = parts;
+			this.rank = rank;
+			this.baseType = baseType;
+		}
+
+		public:
+			override Base() : Type? => baseType;
+			override Arguments() : Type[] => parts;
+			override Element() : Type? => element;
+			override Rank() : i32 => rank;
+	}
+
+	/// What the compiler's code calls when reflection meets what it cannot do.
+	internal static class Fail
+	{
+		/// A field or result that is not an object (an array, a pointer, a function) cannot be an `any`.
+		[NoInline] NotAnObject(str what) : any? { throw new NotSupportedError(what + " is not an object: reflection cannot give it as an any"); }
+
+		[NoInline] Target(str type) : any { throw new InvalidCastError("the target is not a " + type); }
+
+		[NoInline] Value(str type) : any { throw new InvalidCastError("the value is not a " + type); }
+
+		[NoInline] ValueField(str field) { throw new NotSupportedError(field + " belongs to a value: set it on the value itself, not through a boxed copy"); }
+
+		[NoInline] Missing(str what) : any? { throw new MissingMemberError(what); }
+	}
+
+	/// A lock that the thread holding it may take again (the slow path of `typeof` may describe other types meanwhile).
+	internal final class Reentrant
+	{
+		readonly Mutex mutex;
+		i32 owner;
+		i32 depth;
+
+		new() { mutex = new Mutex(); }
+
+		public:
+			Enter()
+			{
+				i32 me = Thread.CurrentId;
+				if (owner == me && depth > 0)
+				{
+					depth++;
+					return;
+				}
+				mutex.Lock();
+				owner = me;
+				depth = 1;
+			}
+
+			Exit()
+			{
+				depth--;
+				if (depth == 0)
+				{
+					owner = 0;
+					mutex.Unlock();
+				}
+			}
+	}
+}

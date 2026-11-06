@@ -1,0 +1,892 @@
+// Numbers as text with a format: `x.ToString("F2")`, `n.ToString("X8")`. The letters are .NET's, in its invariant
+// culture: D decimal, X hexadecimal, B binary, N with thousands separators, F fixed point, E exponent, P percent,
+// G general, R round trip; a number after the letter is the precision.
+
+into namespace System
+{
+	/// A number's exact decimal digits: value = 0.d1 d2 … × 10^Point (digits 0..9, no leading zero; Count 0: zero).
+	final class DecimalDigits
+	{
+		public:
+			u8[] Digits;
+			i32 Count;
+			i32 Point;
+			bool Negative;
+
+			new(u8[] digits, i32 count, i32 point, bool negative)
+			{
+				Digits = digits;
+				Count = count;
+				Point = point;
+				Negative = negative;
+			}
+
+			/// Digit `i` (0 past the ones it has).
+			At(i32 i) : u8 => i >= 0 && i < Count ? Digits[i] : (u8)0;
+
+			/// Rounded to its first `keep` digits; an exact half goes to the even digit (as .NET does).
+			Round(i32 keep)
+			{
+				if (keep >= Count)
+					return;
+				if (keep < 0)
+				{
+					Count = 0;
+					return;
+				}
+				u8 next = Digits[keep];
+				bool up = next > 5 || next == 5 && (keep + 1 < Count || keep > 0 && Digits[keep - 1] % 2 == 1);
+				Count = keep;
+				if (!up)
+				{
+					Trim();
+					return;
+				}
+				i32 i = keep - 1;
+				loop (i >= 0 && Digits[i] == 9)
+				{
+					Digits[i] = 0;
+					i--;
+				}
+				if (i >= 0)
+				{
+					Digits[i] = (u8)(Digits[i] + 1);
+					Trim();
+					return;
+				}
+				// All nines (or nothing kept): one digit 1, a place higher.
+				if (Digits.Length == 0)
+					Digits = new u8[1];
+				Digits[0] = 1;
+				Count = 1;
+				Point++;
+			}
+
+			Trim()
+			{
+				loop (Count > 0 && Digits[Count - 1] == 0)
+					Count--;
+			}
+	}
+
+	/// The text a format makes: bytes (ASCII), grown as needed, then one string of exactly them.
+	final class NumberText
+	{
+		u8[] bytes = new u8[32];
+		i32 count;
+
+		[NoInline]
+		Grow()
+		{
+			u8[] bigger = new u8[bytes.Length * 2];
+			loop (i32 i = 0..count)
+				bigger[i] = bytes[i];
+			bytes = bigger;
+		}
+
+		public:
+			Add(u8 unit)
+			{
+				if (count == bytes.Length)
+					Grow();
+				bytes[count] = unit;
+				count++;
+			}
+
+			/// A non-negative number's digits.
+			Number(i32 value)
+			{
+				i32 width = 1;
+				loop (i32 m = value; m >= 10; m = m / 10)
+					width++;
+				loop (count + width > bytes.Length)
+					Grow();
+				loop (i32 i = width - 1; i >= 0; i--)
+				{
+					bytes[count + i] = (u8)('0' + value % 10);
+					value = value / 10;
+				}
+				count += width;
+			}
+
+			Made() : str
+			{
+				u8[] exact = new u8[count];
+				loop (i32 i = 0..count)
+					exact[i] = bytes[i];
+				return new String<u8>(exact);
+			}
+	}
+
+	/// Numbers formatted as text (what the primitives' `ToString(format)` call).
+	public static class NumberFormat
+	{
+		/// The exact digits of a finite f64 (every f64 is a finite decimal).
+		static ExactDigits(f64 x) : DecimalDigits
+		{
+			i64 bits = Float64.Bits(x);
+			bool negative = bits < 0;
+			i32 biased = (i32)((bits >> 52) & 2047);
+			u64 mantissa = (u64)bits & 4503599627370495;
+			i32 e2 = -1074;
+			if (biased != 0)
+			{
+				mantissa |= 4503599627370496;
+				e2 = biased - 1075;
+			}
+			return ExactOf(mantissa, e2, negative);
+		}
+
+		/// The exact digits of mantissa × 2^e2.
+		static ExactOf(u64 mantissa, i32 e2, bool negative) : DecimalDigits
+		{
+			if (mantissa == 0)
+				return new DecimalDigits(new u8[1], 0, 0, negative);
+			loop ((mantissa & 1) == 0)
+			{
+				mantissa = mantissa >> 1;
+				e2++;
+			}
+			i32 k = e2 < 0 ? -e2 : 0;
+			u32[] limbs = new u32[4 + (e2 >= 0 ? e2 / 29 : k * 7 / 29)];
+			i32 used = Set(limbs, mantissa);
+			used = e2 > 0 ? TimesPowerOfTwo(limbs, used, e2) : TimesPowerOfFive(limbs, used, k);
+			return DigitsOf(limbs, used, k, negative, 2147483646);
+		}
+
+		/// limbs = value (base 10^9); the count.
+		static Set(u32[] limbs, u64 value) : i32
+		{
+			i32 used = 0;
+			loop (value > 0)
+			{
+				limbs[used] = (u32)(value % 1000000000);
+				value = value / 1000000000;
+				used++;
+			}
+			return used;
+		}
+
+		static TimesPowerOfTwo(u32[] limbs, i32 used, i32 power) : i32
+		{
+			loop (power > 0)
+			{
+				i32 step = power < 29 ? power : 29;
+				used = Multiply(limbs, used, (u64)1 << step);
+				power -= step;
+			}
+			return used;
+		}
+
+		static TimesPowerOfFive(u32[] limbs, i32 used, i32 power) : i32
+		{
+			loop (power > 0)
+			{
+				i32 step = power < 13 ? power : 13;
+				u64 factor = 1;
+				loop (i32 s = 0..step)
+					factor *= 5;
+				used = Multiply(limbs, used, factor);
+				power -= step;
+			}
+			return used;
+		}
+
+		/// The decimal digits of a base-10^9 integer, over 10^shift: the first `limit` of them, then (when the rest is not
+		/// all zeros) a 1 standing for the rest, which keeps comparisons and rounding to fewer digits exact.
+		static DigitsOf(u32[] limbs, i32 used, i32 shift, bool negative, i32 limit) : DecimalDigits
+		{
+			if (used == 0)
+				return new DecimalDigits(new u8[1], 0, 0, negative);
+			u32 top = limbs[used - 1];
+			i32 topDigits = 1;
+			loop (u32 t = top; t >= 10; t = t / 10)
+				topDigits++;
+			i32 total = topDigits + (used - 1) * 9;
+			i32 keep = total < limit ? total : limit;
+			u8[] digits = new u8[keep + 1];
+			bool rest = false;
+			// Each limb's digits go to their places (by division by the constant 10); those past the limit only say
+			// whether the rest is zero.
+			i32 end = topDigits;
+			loop (i32 l = used - 1; l >= 0; l--)
+			{
+				u32 limb = limbs[l];
+				i32 width = l == used - 1 ? topDigits : 9;
+				i32 start = end - width;
+				if (start >= keep)
+				{
+					if (limb != 0)
+						rest = true;
+					if (rest)
+						break;
+				}
+				else
+				{
+					loop (i32 at = end - 1; at >= start; at--)
+					{
+						u32 digit = limb % 10;
+						limb = limb / 10;
+						if (at < keep)
+							digits[at] = (u8)digit;
+						else if (digit != 0)
+							rest = true;
+					}
+				}
+				end += 9;
+			}
+			i32 count = keep;
+			if (rest)
+			{
+				digits[count] = 1;
+				count++;
+			}
+			DecimalDigits result = new DecimalDigits(digits, count, total - shift, negative);
+			result.Trim();
+			return result;
+		}
+
+
+		/// The exact digits of a wide mantissa × 2^e2 (an f128 or f256).
+		static ExactWide(u256 mantissa, i32 e2, bool negative) : DecimalDigits
+		{
+			if (mantissa == 0)
+				return new DecimalDigits(new u8[1], 0, 0, negative);
+			loop ((mantissa & 1) == 0)
+			{
+				mantissa = mantissa >> 1;
+				e2++;
+			}
+			i32 k = e2 < 0 ? -e2 : 0;
+			u32[] limbs = new u32[13 + (e2 >= 0 ? e2 / 29 : k * 7 / 29)];
+			i32 used = SetWide(limbs, mantissa);
+			used = e2 > 0 ? TimesPowerOfTwo(limbs, used, e2) : TimesPowerOfFive(limbs, used, k);
+			return DigitsOf(limbs, used, k, negative, 2147483646);
+		}
+
+		/// limbs = value (base 10^9); the count.
+		static SetWide(u32[] limbs, u256 value) : i32
+		{
+			i32 used = 0;
+			loop (value > 0)
+			{
+				limbs[used] = (u32)(value % 1000000000);
+				value = value / 1000000000;
+				used++;
+			}
+			return used;
+		}
+
+		/// a × factor (a wide integer: up to nine limbs), base 10^9, into `result`; the count.
+		static TimesWide(u32[] a, i32 used, u256 factor, u32[] result) : i32
+		{
+			u32[] f = new u32[9];
+			i32 count = SetWide(f, factor);
+			i32 end = used + count + 1;
+			loop (i32 i = 0..end)
+				result[i] = 0;
+			loop (i32 i = 0..used)
+			{
+				u64 carry = 0;
+				loop (i32 j = 0..count)
+				{
+					u64 product = (u64)a[i] * f[j] + result[i + j] + carry;
+					result[i + j] = (u32)(product % 1000000000);
+					carry = product / 1000000000;
+				}
+				i32 at = i + count;
+				loop (carry > 0)
+				{
+					u64 sum = result[at] + carry;
+					result[at] = (u32)(sum % 1000000000);
+					carry = sum / 1000000000;
+					at++;
+				}
+			}
+			loop (end > 0 && result[end - 1] == 0)
+				end--;
+			return end;
+		}
+
+		/// The shortest digits that read back as the same wide float (see ShortestOf).
+		static ShortestWide(u256 mantissa, i32 e2, bool boundary, i32 most) : DecimalDigits
+		{
+			if (mantissa == 0)
+				return new DecimalDigits(new u8[1], 0, 0, false);
+			i32 scale = boundary ? 2 : 1;
+			i32 unitExponent = e2 - scale;
+			i32 k = unitExponent < 0 ? -unitExponent : 0;
+			i32 room = 16 + (unitExponent >= 0 ? unitExponent / 29 : k * 7 / 29);
+			u32[] unit = new u32[room];
+			i32 unitUsed = Set(unit, 1);
+			unitUsed = unitExponent > 0 ? TimesPowerOfTwo(unit, unitUsed, unitExponent) : TimesPowerOfFive(unit, unitUsed, k);
+			u32[] center = new u32[room];
+			i32 centerUsed = TimesWide(unit, unitUsed, mantissa << scale, center);
+			u32[] step = new u32[room];
+			loop (i32 i = 0..unitUsed)
+				step[i] = unit[i];
+			i32 stepUsed = boundary ? Multiply(step, unitUsed, 2) : unitUsed;
+			u32[] side = new u32[room];
+			i32 sideUsed = AddOrSubtract(center, centerUsed, step, stepUsed, true, side);
+			DecimalDigits exact = DigitsOf(center, centerUsed, k, false, most + 2);
+			DecimalDigits high = DigitsOf(side, sideUsed, k, false, most + 2);
+			sideUsed = AddOrSubtract(center, centerUsed, unit, unitUsed, false, side);
+			DecimalDigits low = DigitsOf(side, sideUsed, k, false, most + 2);
+			bool even = (mantissa & 1) == 0;
+			DecimalDigits scratch = new DecimalDigits(new u8[most + 2], 0, 0, false);
+			i32 shared = 0;
+			if (low.Point == high.Point)
+			{
+				loop (shared < most && low.At(shared) == high.At(shared))
+					shared++;
+			}
+			i32 lowest = shared > 1 ? shared : 1;
+			i32 last = most < exact.Count ? most : exact.Count;
+			loop (lowest < last)
+			{
+				RoundInto(exact, lowest, scratch);
+				i32 below = Compare(low, scratch), above = Compare(scratch, high);
+				if ((below < 0 || even && below == 0) && (above < 0 || even && above == 0))
+					break;
+				lowest++;
+			}
+			RoundInto(exact, lowest, scratch);
+			u8[] digits = new u8[scratch.Count > 0 ? scratch.Count : 1];
+			loop (i32 i = 0..scratch.Count)
+				digits[i] = scratch.Digits[i];
+			return new DecimalDigits(digits, scratch.Count, scratch.Point, false);
+		}
+
+		/// a × factor (factor < 10^18: two limbs), base 10^9, into `result`; the count.
+		static TimesLarge(u32[] a, i32 used, u64 factor, u32[] result) : i32
+		{
+			u64 f0 = factor % 1000000000, f1 = factor / 1000000000;
+			loop (i32 i = 0..used + 3)
+				result[i] = 0;
+			u64 carry = 0;
+			loop (i32 i = 0..used)
+			{
+				u64 product = (u64)a[i] * f0 + result[i] + carry;
+				result[i] = (u32)(product % 1000000000);
+				carry = product / 1000000000;
+			}
+			i32 end = used;
+			loop (carry > 0)
+			{
+				result[end] = (u32)(carry % 1000000000);
+				carry = carry / 1000000000;
+				end++;
+			}
+			if (f1 > 0)
+			{
+				carry = 0;
+				loop (i32 i = 0..used)
+				{
+					u64 product = (u64)a[i] * f1 + result[i + 1] + carry;
+					result[i + 1] = (u32)(product % 1000000000);
+					carry = product / 1000000000;
+				}
+				i32 at = used + 1;
+				loop (carry > 0)
+				{
+					u64 sum = result[at] + carry;
+					result[at] = (u32)(sum % 1000000000);
+					carry = sum / 1000000000;
+					at++;
+				}
+				if (at > end)
+					end = at;
+			}
+			loop (end > 0 && result[end - 1] == 0)
+				end--;
+			return end;
+		}
+
+		/// a + b or a - b (a ≥ b), base 10^9, into `result`; the count.
+		static AddOrSubtract(u32[] a, i32 aUsed, u32[] b, i32 bUsed, bool add, u32[] result) : i32
+		{
+			i64 carry = 0;
+			i32 used = aUsed > bUsed ? aUsed : bUsed;
+			loop (i32 i = 0..used)
+			{
+				i64 sum = (i64)(i < aUsed ? a[i] : 0) + carry + (add ? (i64)(i < bUsed ? b[i] : 0) : -(i64)(i < bUsed ? b[i] : 0));
+				carry = 0;
+				if (sum >= 1000000000)
+				{
+					sum -= 1000000000;
+					carry = 1;
+				}
+				else if (sum < 0)
+				{
+					sum += 1000000000;
+					carry = -1;
+				}
+				result[i] = (u32)sum;
+			}
+			if (carry > 0)
+			{
+				result[used] = (u32)carry;
+				used++;
+			}
+			loop (used > 0 && result[used - 1] == 0)
+				used--;
+			return used;
+		}
+
+		/// limbs × factor (factor < 2^34), in place; the new count.
+		static Multiply(u32[] limbs, i32 used, u64 factor) : i32
+		{
+			u64 carry = 0;
+			loop (i32 i = 0..used)
+			{
+				u64 product = (u64)limbs[i] * factor + carry;
+				limbs[i] = (u32)(product % 1000000000);
+				carry = product / 1000000000;
+			}
+			loop (carry > 0)
+			{
+				limbs[used] = (u32)(carry % 1000000000);
+				carry = carry / 1000000000;
+				used++;
+			}
+			return used;
+		}
+
+		/// The digits of an integer's magnitude.
+		static IntegerDigits(u64 magnitude, bool negative) : DecimalDigits
+		{
+			u8[] digits = new u8[20];
+			i32 count = 0;
+			loop (u64 m = magnitude; m > 0; m = m / 10)
+				count++;
+			u64 rest = magnitude;
+			loop (i32 d = count - 1; d >= 0; d--)
+			{
+				digits[d] = (u8)(rest % 10);
+				rest = rest / 10;
+			}
+			DecimalDigits result = new DecimalDigits(digits, count, count, negative);
+			result.Trim();
+			return result;
+		}
+
+		/// A format's letter (0 for none: general) and precision (-1 for none).
+		static Letter(str format) : u8
+		{
+			if (format.Length == 0)
+				return 'G';
+			u8 letter = format.Units()[0];
+			return letter;
+		}
+
+		static Precision(str format) : i32
+		{
+			u8[] bytes = format.Units();
+			if (bytes.Length <= 1)
+				return -1;
+			i32 value = 0;
+			loop (i32 i = 1..bytes.Length)
+			{
+				u8 c = bytes[i];
+				if (c < '0' || c > '9' || value > 99999)
+					throw new FormatError("bad number format: " + format);
+				value = value * 10 + (c - '0');
+			}
+			return value;
+		}
+
+		/// Fixed point: the integer digits (grouped by three with commas when `groups`), then `decimals` decimals.
+		static Fixed(NumberText text, DecimalDigits d, i32 decimals, bool groups)
+		{
+			if (d.Point <= 0)
+			{
+				text.Add('0');
+			}
+			else
+			{
+				loop (i32 i = 0..d.Point)
+				{
+					if (groups && i > 0 && (d.Point - i) % 3 == 0)
+						text.Add(',');
+					text.Add((u8)('0' + d.At(i)));
+				}
+			}
+			if (decimals > 0)
+			{
+				text.Add('.');
+				loop (i32 i = d.Point..d.Point + decimals)
+					text.Add((u8)('0' + d.At(i)));
+			}
+		}
+
+		/// Exponent form: one digit, `decimals` more after the point, then E (or e), the sign and `exponentDigits` or more.
+		static Scientific(NumberText text, DecimalDigits d, i32 decimals, u8 letter, i32 exponentDigits)
+		{
+			text.Add((u8)('0' + d.At(0)));
+			if (decimals > 0)
+			{
+				text.Add('.');
+				loop (i32 i = 1..decimals + 1)
+					text.Add((u8)('0' + d.At(i)));
+			}
+			i32 exponent = d.Count == 0 ? 0 : d.Point - 1;
+			text.Add(letter);
+			text.Add(exponent < 0 ? (u8)'-' : (u8)'+');
+			i32 magnitude = exponent < 0 ? -exponent : exponent;
+			i32 width = 1;
+			loop (i32 m = magnitude; m >= 10; m = m / 10)
+				width++;
+			loop (i32 pad = width..exponentDigits)
+				text.Add('0');
+			text.Number(magnitude);
+		}
+
+		/// General: `precision` significant digits (all of them when 0 or less), in exponent form when the exponent is
+		/// below -4 or at least `scientificFrom`; trailing zeros dropped.
+		static General(NumberText text, DecimalDigits d, i32 precision, i32 scientificFrom, u8 letter)
+		{
+			if (precision > 0)
+				d.Round(precision);
+			d.Trim();
+			if (d.Count == 0)
+			{
+				text.Add('0');
+				return;
+			}
+			i32 exponent = d.Point - 1;
+			if (exponent < -4 || exponent >= scientificFrom)
+			{
+				Scientific(text, d, d.Count - 1, letter == 'g' ? (u8)'e' : (u8)'E', 2);
+				return;
+			}
+			i32 decimals = d.Count - d.Point;
+			Fixed(text, d, decimals > 0 ? decimals : 0, false);
+		}
+
+		/// The digits by a format letter (not D, X, B: those are integers' own).
+		static Digits(NumberText text, DecimalDigits d, u8 letter, i32 precision, i32 generalPrecision, i32 scientificFrom) : bool
+		{
+			switch (letter)
+			{
+				'F' or 'f' =>
+				{
+					i32 decimals = precision < 0 ? 2 : precision;
+					d.Round(d.Point + decimals);
+					Fixed(text, d, decimals, false);
+				},
+				'N' or 'n' =>
+				{
+					i32 decimals = precision < 0 ? 2 : precision;
+					d.Round(d.Point + decimals);
+					Fixed(text, d, decimals, true);
+				},
+				'E' or 'e' =>
+				{
+					i32 decimals = precision < 0 ? 6 : precision;
+					d.Round(decimals + 1);
+					Scientific(text, d, decimals, letter, 3);
+				},
+				'P' or 'p' =>
+				{
+					i32 decimals = precision < 0 ? 2 : precision;
+					d.Point += 2;
+					d.Round(d.Point + decimals);
+					Fixed(text, d, decimals, true);
+					text.Add(' ');
+					text.Add('%');
+				},
+				'G' or 'g' => General(text, d, precision > 0 ? precision : generalPrecision, precision > 0 ? precision : scientificFrom, letter),
+				_ => return false,
+			}
+			return true;
+		}
+
+		public:
+			/// An integer (its bits, `width` of them, and whether its type is signed) by `format`.
+			FormatInteger(u64 bits, i32 width, bool signed, str format) : str
+			{
+				u8 letter = Letter(format);
+				i32 precision = Precision(format);
+				bool negative = signed && width < 64 ? ((bits >> (width - 1)) & 1) == 1 : signed && (i64)bits < 0;
+				u64 masked = width < 64 ? bits & (((u64)1 << width) - 1) : bits;
+				u64 magnitude = negative ? (0 - masked) & (width < 64 ? ((u64)1 << width) - 1 : 18446744073709551615) : masked;
+				if (letter == 'D' || letter == 'd')
+				{
+					// Straight into the text's bytes, from the last digit back.
+					i32 count = 1;
+					loop (u64 m = magnitude / 10; m > 0; m = m / 10)
+						count++;
+					i32 size = count > precision ? count : precision;
+					u8[] units = new u8[size + (negative ? 1 : 0)];
+					i32 at = units.Length;
+					u64 rest = magnitude;
+					loop (i32 i = 0..size)
+					{
+						at--;
+						units[at] = (u8)('0' + rest % 10);
+						rest = rest / 10;
+					}
+					if (negative)
+						units[0] = '-';
+					return new String<u8>(units);
+				}
+				if (letter == 'X' || letter == 'x' || letter == 'B' || letter == 'b')
+				{
+					i32 shift = letter == 'B' || letter == 'b' ? 1 : 4;
+					u64 digitMask = ((u64)1 << shift) - 1;
+					i32 count = 1;
+					loop (u64 m = masked >> shift; m > 0; m = m >> shift)
+						count++;
+					i32 size = count > precision ? count : precision;
+					u8[] units = new u8[size];
+					u8 letters = letter == 'x' ? (u8)87 : (u8)55; // 'a' - 10, 'A' - 10
+					u64 rest = masked;
+					loop (i32 at = size - 1; at >= 0; at--)
+					{
+						u8 digit = (u8)(rest & digitMask);
+						units[at] = digit < 10 ? (u8)('0' + digit) : (u8)(letters + digit);
+						rest = rest >> shift;
+					}
+					return new String<u8>(units);
+				}
+				NumberText text = new NumberText();
+				switch (letter)
+				{
+					_ =>
+					{
+						DecimalDigits d = IntegerDigits(magnitude, negative);
+						if (negative)
+							text.Add('-');
+						if (!Digits(text, d, letter, precision, 0, 1000))
+							throw new FormatError("bad number format: " + format);
+					},
+				}
+				return text.Made();
+			}
+
+			FormatInteger(i64 value, str format) : str => FormatInteger((u64)value, 64, true, format);
+
+			/// An f64 by `format` (no format, G or R: the shortest text that reads back as the same number).
+			FormatDouble(f64 value, str format) : str
+			{
+				if (value != value)
+					return "NaN";
+				if (value - value != 0)
+					return value > 0 ? "Infinity" : "-Infinity";
+				u8 letter = Letter(format);
+				i32 precision = Precision(format);
+				NumberText text = new NumberText();
+				if (Float64.Bits(value) < 0)
+					text.Add('-');
+				if ((letter == 'G' || letter == 'g') && precision <= 0 || letter == 'R' || letter == 'r')
+				{
+					General(text, Shortest(value), 0, 17, letter == 'g' ? (u8)'g' : (u8)'G');
+					return text.Made();
+				}
+				if (!Digits(text, ExactDigits(value), letter, precision, 15, 15))
+					throw new FormatError("bad number format: " + format);
+				return text.Made();
+			}
+
+			/// An f32 by `format` (no format, G or R: the shortest text that reads back as the same f32).
+			FormatSingle(f32 value, str format) : str
+			{
+				if (value != value)
+					return "NaN";
+				if (value - value != 0)
+					return value > 0 ? "Infinity" : "-Infinity";
+				u8 letter = Letter(format);
+				i32 precision = Precision(format);
+				NumberText text = new NumberText();
+				if (Float32.Bits(value) >= 2147483648)
+					text.Add('-');
+				if ((letter == 'G' || letter == 'g') && precision <= 0 || letter == 'R' || letter == 'r')
+				{
+					General(text, ShortestSingle(value), 0, 9, letter == 'g' ? (u8)'g' : (u8)'G');
+					return text.Made();
+				}
+				if (!Digits(text, ExactDigits(value), letter, precision, 7, 7))
+					throw new FormatError("bad number format: " + format);
+				return text.Made();
+			}
+
+			/// An f16 by `format` (no format, G or R: the shortest text that reads back as the same f16).
+			FormatHalf(f16 value, str format) : str
+			{
+				u16 bits = Float16.Bits(value);
+				bool negative = bits >= 32768;
+				i32 biased = (i32)((bits >> 10) & 31);
+				u64 mantissa = (u64)(bits & 1023);
+				if (biased == 31)
+					return mantissa != 0 ? "NaN" : negative ? "-Infinity" : "Infinity";
+				i32 e2 = -24;
+				if (biased != 0)
+				{
+					mantissa |= 1024;
+					e2 = biased - 25;
+				}
+				u8 letter = Letter(format);
+				i32 precision = Precision(format);
+				NumberText text = new NumberText();
+				if (negative)
+					text.Add('-');
+				if ((letter == 'G' || letter == 'g') && precision <= 0 || letter == 'R' || letter == 'r')
+				{
+					General(text, ShortestOf(mantissa, e2, biased > 1 && mantissa == 1024, 5), 0, 5, letter == 'g' ? (u8)'g' : (u8)'G');
+					return text.Made();
+				}
+				if (!Digits(text, ExactOf(mantissa, e2, negative), letter, precision, 3, 3))
+					throw new FormatError("bad number format: " + format);
+				return text.Made();
+			}
+
+			/// An f128 or f256 (its IEEE bits; `width` 128 or 256) by `format`: no format, G or R give the shortest text
+			/// that reads back as the same number; the fixed formats show up to 33 (f128) or 71 (f256) digits.
+			FormatWide(u256 bits, i32 width, str format) : str
+			{
+				i32 exponentBits = width == 128 ? 15 : 19;
+				i32 fractionBits = width - 1 - exponentBits;
+				i32 bias = (1 << (exponentBits - 1)) - 1;
+				i32 exponentMask = (1 << exponentBits) - 1;
+				bool negative = (bits >> (width - 1)) != 0;
+				i32 biased = (i32)((bits >> fractionBits) & (u256)exponentMask);
+				u256 hidden = (u256)1 << fractionBits;
+				u256 mantissa = bits & (hidden - 1);
+				if (biased == exponentMask)
+					return mantissa != 0 ? "NaN" : negative ? "-Infinity" : "Infinity";
+				i32 e2 = 1 - bias - fractionBits;
+				if (biased != 0)
+				{
+					mantissa |= hidden;
+					e2 = biased - bias - fractionBits;
+				}
+				u8 letter = Letter(format);
+				i32 precision = Precision(format);
+				i32 most = width == 128 ? 36 : 72;
+				i32 exact = width == 128 ? 33 : 71;
+				NumberText text = new NumberText();
+				if (negative)
+					text.Add('-');
+				if ((letter == 'G' || letter == 'g') && precision <= 0 || letter == 'R' || letter == 'r')
+				{
+					General(text, ShortestWide(mantissa, e2, biased > 1 && mantissa == hidden, most), 0, most, letter == 'g' ? (u8)'g' : (u8)'G');
+					return text.Made();
+				}
+				if (!Digits(text, ExactWide(mantissa, e2, negative), letter, precision, exact, exact))
+					throw new FormatError("bad number format: " + format);
+				return text.Made();
+			}
+
+		private:
+			/// The shortest digits that read back as the same f64 (the nearest of that length): those strictly between
+			/// the midpoints to its neighbours (or on them, when its mantissa is even and reading rounds to it).
+			static Shortest(f64 value) : DecimalDigits
+			{
+				i64 bits = Float64.Bits(value) & 9223372036854775807;
+				i32 biased = (i32)(bits >> 52);
+				u64 mantissa = (u64)bits & 4503599627370495;
+				i32 e2 = -1074;
+				if (biased != 0)
+				{
+					mantissa |= 4503599627370496;
+					e2 = biased - 1075;
+				}
+				return ShortestOf(mantissa, e2, biased > 1 && mantissa == 4503599627370496, 17);
+			}
+
+			static ShortestSingle(f32 value) : DecimalDigits
+			{
+				u32 bits = Float32.Bits(value) & 2147483647;
+				i32 biased = (i32)(bits >> 23);
+				u64 mantissa = (u64)(bits & 8388607);
+				i32 e2 = -149;
+				if (biased != 0)
+				{
+					mantissa |= 8388608;
+					e2 = biased - 150;
+				}
+				return ShortestOf(mantissa, e2, biased > 1 && mantissa == 8388608, 9);
+			}
+
+			static ShortestOf(u64 mantissa, i32 e2, bool boundary, i32 most) : DecimalDigits
+			{
+				if (mantissa == 0)
+					return new DecimalDigits(new u8[1], 0, 0, false);
+				// In units of 2^(e2-2) (or 2^(e2-1)): x = 4m·u, its neighbours' midpoints x ± 2u (x - u below a power of
+				// two, where the gap below is half). With u = 5^j / 10^j for a negative exponent, one product serves all three.
+				i32 scale = boundary ? 2 : 1;
+				i32 unitExponent = e2 - scale;
+				i32 k = unitExponent < 0 ? -unitExponent : 0;
+				i32 room = 6 + (unitExponent >= 0 ? unitExponent / 29 : k * 7 / 29);
+				u32[] unit = new u32[room];
+				i32 unitUsed = Set(unit, 1);
+				unitUsed = unitExponent > 0 ? TimesPowerOfTwo(unit, unitUsed, unitExponent) : TimesPowerOfFive(unit, unitUsed, k);
+				u32[] center = new u32[room];
+				i32 centerUsed = TimesLarge(unit, unitUsed, mantissa << scale, center);
+				u32[] step = new u32[room];
+				loop (i32 i = 0..unitUsed)
+					step[i] = unit[i];
+				i32 stepUsed = boundary ? Multiply(step, unitUsed, 2) : unitUsed;
+				u32[] side = new u32[room];
+				i32 sideUsed = AddOrSubtract(center, centerUsed, step, stepUsed, true, side);
+				DecimalDigits exact = DigitsOf(center, centerUsed, k, false, most + 2);
+				DecimalDigits high = DigitsOf(side, sideUsed, k, false, most + 2);
+				sideUsed = AddOrSubtract(center, centerUsed, unit, unitUsed, false, side);
+				DecimalDigits low = DigitsOf(side, sideUsed, k, false, most + 2);
+				bool even = (mantissa & 1) == 0;
+				// Every number between the midpoints shares the digits low and high share: the shortest has about that
+				// many digits plus one; try lengths from there (reading back works from some length on).
+				DecimalDigits scratch = new DecimalDigits(new u8[most + 2], 0, 0, false);
+				i32 shared = 0;
+				if (low.Point == high.Point)
+				{
+					loop (shared < most && low.At(shared) == high.At(shared))
+						shared++;
+				}
+				i32 lowest = shared > 1 ? shared : 1;
+				i32 last = most < exact.Count ? most : exact.Count;
+				loop (lowest < last)
+				{
+					RoundInto(exact, lowest, scratch);
+					i32 below = Compare(low, scratch), above = Compare(scratch, high);
+					if ((below < 0 || even && below == 0) && (above < 0 || even && above == 0))
+						break;
+					lowest++;
+				}
+				RoundInto(exact, lowest, scratch);
+				u8[] digits = new u8[scratch.Count > 0 ? scratch.Count : 1];
+				loop (i32 i = 0..scratch.Count)
+					digits[i] = scratch.Digits[i];
+				return new DecimalDigits(digits, scratch.Count, scratch.Point, false);
+			}
+
+			/// `d` rounded to `keep` digits, into `target` (its array has room): only the digits that decide it are copied
+			/// (what follows the next one, never all zeros, stands as a 1).
+			static RoundInto(DecimalDigits d, i32 keep, DecimalDigits target)
+			{
+				bool more = d.Count > keep + 1;
+				i32 count = more ? keep + 2 : d.Count;
+				u8[] digits = target.Digits;
+				loop (i32 i = 0..count)
+					digits[i] = i == keep + 1 ? (u8)1 : d.Digits[i];
+				target.Count = count;
+				target.Point = d.Point;
+				target.Round(keep);
+			}
+
+			/// Which of two positive numbers is larger (-1, 0, 1).
+			static Compare(DecimalDigits a, DecimalDigits b) : i32
+			{
+				if (a.Point != b.Point)
+					return a.Point < b.Point ? -1 : 1;
+				i32 n = a.Count > b.Count ? a.Count : b.Count;
+				loop (i32 i = 0..n)
+				{
+					u8 x = a.At(i), y = b.At(i);
+					if (x != y)
+						return x < y ? -1 : 1;
+				}
+				return 0;
+			}
+	}
+}

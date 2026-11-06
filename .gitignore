@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+artifacts/
+*.vsix
+node_modules/
+*.user
+__pycache__/
+# Signing keys never leave this machine.
+*.key
+*.pem
+TestResults/

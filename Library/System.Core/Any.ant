@@ -1,0 +1,71 @@
+// The root of every class (`any`): a class with no base class derives from it.
+
+into namespace System
+{
+	public class Any
+	{
+		/// What GetType gives: each class's own (the compiler writes one per class when the program uses reflection).
+		internal virtual RuntimeType() : Type? => null;
+
+		public:
+			/// The object's type at run time (its class; a boxed value's: the value's type).
+			GetType() : Type
+			{
+				if (RuntimeType() is Type known)
+					return known;
+				return Undescribed();
+			}
+
+		[NoInline] static Undescribed() : Type { throw new InvalidOperationError("GetType: the program's types are not described"); }
+
+		public:
+
+			/// The object as text (the name of its class unless the class says otherwise).
+			virtual ToString() : str => "System.Any";
+
+			/// A number for the object (the same for objects its class considers equal).
+			virtual Hash() : u64 => 0;
+
+		/// Runs once when the object dies: a class's `destroy()` runs, then its base's. Nothing here.
+		inherited virtual destroy() { }
+	}
+
+	/// What an `any` holds a function value or a pointer in (neither is an object of its own): `any a = f;` makes one,
+	/// `(func<i32> : i32)a` takes the value back out. It shows the value's type.
+	public final class Boxed<T>
+	{
+		readonly str type;
+
+		public:
+			/// The function value or pointer.
+			readonly T Value;
+
+			new(T Value, str type)
+			{
+				this.Value = Value;
+				this.type = type;
+			}
+
+			override ToString() : str => type;
+	}
+
+	/// What has a text of its own: `ToString()`. The primitives, `str` and the values that declare it; a class gets
+	/// `ToString()` from Any (its name unless it says otherwise) and declares `IToString` when it means it.
+	public interface IToString
+	{
+		ToString() : str;
+	}
+
+	/// Values that can be keys of a Dictionary or members of a HashSet: equal values (Equals) have the same Hash().
+	public interface IHashable<TSelf>
+	{
+		Hash() : u64;
+		Equals(TSelf other) : bool;
+	}
+
+	/// Values with an order: -1, 0 or 1 as this value is smaller than, equal to or larger than `other`.
+	public interface IComparable<TSelf>
+	{
+		CompareTo(TSelf other) : i32;
+	}
+}

@@ -1,0 +1,237 @@
+// A map from keys to values by hash (open addressing, linear probing): Set, Get, `map[key]`, TryGet, ContainsKey, Remove,
+// and `loop (KeyValuePair<K, V> pair in map)`. Keys are IHashable: equal keys (Equals) have the same Hash().
+
+into namespace System
+{
+	public value KeyValuePair<K, V>
+	{
+		public:
+			K Key;
+			V Value;
+			new(K Key, V Value);
+	}
+
+	public class Dictionary<K : IHashable<K>, V>
+	{
+		K[] keys;
+		V[] values;
+		/// Per slot: 0 empty, 2 removed (probing goes on past it), else (odd) the top bits of the key's mixed hash: probing
+		/// compares them before it looks at a key, and resizing places pairs without hashing their keys again.
+		u32[] tags;
+		i32 count;
+		i32 used;
+		/// The table has 2^bits slots.
+		i32 bits;
+
+		/// A key's tag: the top 32 bits of its hash × 2^64/φ (Fibonacci hashing), made odd.
+		static Tag(u64 hash) : u32 => (u32)((hash * 11400714819323198485) >> 32) | 1;
+
+		/// The first slot to look at for a tag (its top bits).
+		Home(u32 tag) : i32 => (i32)(tag >> (u32)(32 - bits));
+
+		/// The slot holding `key`, or -1.
+		Find(K key) : i32
+		{
+			u32 tag = Tag(key.Hash());
+			i32 mask = tags.Length - 1;
+			i32 slot = Home(tag);
+			loop (true)
+			{
+				u32 at = tags[slot];
+				if (at == 0)
+					return -1;
+				if (at == tag && keys[slot].Equals(key))
+					return slot;
+				slot = (slot + 1) & mask;
+			}
+		}
+
+		/// A slot for a new pair with this tag (empty or removed).
+		Free(u32 tag) : i32
+		{
+			i32 mask = tags.Length - 1;
+			i32 slot = Home(tag);
+			loop ((tags[slot] & 1) == 1)
+				slot = (slot + 1) & mask;
+			return slot;
+		}
+
+		/// Rebuilds the table with 2^newBits slots.
+		[NoInline]
+		Resize(i32 newBits)
+		{
+			K[] oldKeys = keys;
+			V[] oldValues = values;
+			u32[] oldTags = tags;
+			bits = newBits;
+			i32 size = 1 << newBits;
+			keys = new K[size];
+			values = new V[size];
+			tags = new u32[size];
+			used = count;
+			loop (i32 i = 0..oldTags.Length)
+			{
+				u32 tag = oldTags[i];
+				if ((tag & 1) == 1)
+				{
+					i32 slot = Free(tag);
+					keys[slot] = oldKeys[i];
+					values[slot] = oldValues[i];
+					tags[slot] = tag;
+				}
+			}
+		}
+
+		/// Adds a pair whose key is not in the table.
+		Add(K key, V value, u32 tag)
+		{
+			// At most 3/4 of the slots in use (pairs and removed ones).
+			if ((used + 1) * 4 > tags.Length * 3)
+				Resize(count * 2 + 2 > tags.Length ? bits + 1 : bits);
+			i32 slot = Free(tag);
+			if (tags[slot] == 0)
+				used++;
+			keys[slot] = key;
+			values[slot] = value;
+			tags[slot] = tag;
+			count++;
+		}
+
+		public:
+			new()
+			{
+				bits = 3;
+				keys = new K[8];
+				values = new V[8];
+				tags = new u32[8];
+			}
+
+			i32 Count { get => count; }
+
+			bool IsEmpty { get => count == 0; }
+
+			/// Gives `key` the value `value` (adding it, or replacing its value).
+			Set(K key, V value)
+			{
+				i32 slot = Find(key);
+				if (slot >= 0)
+					values[slot] = value;
+				else
+					Add(key, value, Tag(key.Hash()));
+			}
+
+			/// The value of `key`; a KeyNotFoundError when there is none.
+			Get(K key) : V
+			{
+				i32 slot = Find(key);
+				if (slot < 0)
+					Fail.KeyNotFound();
+				return values[slot];
+			}
+
+			/// `map[key]`.
+			At(K key) : V => Get(key);
+
+			/// `map[key] = value`.
+			SetAt(K key, V value) { Set(key, value); }
+
+			/// The value of `key`, or `fallback` when there is none.
+			TryGet(K key, V fallback) : V
+			{
+				i32 slot = Find(key);
+				return slot < 0 ? fallback : values[slot];
+			}
+
+			ContainsKey(K key) : bool => Find(key) >= 0;
+
+			/// Takes `key` out; false when it was not there.
+			Remove(K key) : bool
+			{
+				i32 slot = Find(key);
+				if (slot < 0)
+					return false;
+				tags[slot] = 2;
+				count--;
+				return true;
+			}
+
+			Clear()
+			{
+				loop (i32 i = 0..tags.Length)
+					tags[i] = 0;
+				count = 0;
+				used = 0;
+			}
+
+			/// The keys, in the table's order.
+			Keys() : List<K>
+			{
+				List<K> list = new List<K>(count);
+				loop (i32 i = 0..tags.Length)
+				{
+					if ((tags[i] & 1) == 1)
+						list.Add(keys[i]);
+				}
+				return list;
+			}
+
+			/// `loop (KeyValuePair<K, V> pair in map)`, in the table's order.
+			Iterator() : DictionaryIterator<K, V> => new DictionaryIterator<K, V>(this);
+
+			/// The slots (for the iterator).
+			Holds(i32 slot) : bool => (tags[slot] & 1) == 1;
+			KeyAt(i32 slot) : K => keys[slot];
+			ValueAt(i32 slot) : V => values[slot];
+			i32 Slots { get => tags.Length; }
+	}
+
+	/// The pairs of a dictionary, in the table's order.
+	public value DictionaryIterator<K : IHashable<K>, V>
+	{
+		Dictionary<K, V> map;
+		i32 slot;
+
+		public:
+			new(Dictionary<K, V> map) { this.map = map; slot = -1; }
+
+			Next() : bool
+			{
+				i32 slots = map.Slots;
+				slot++;
+				loop (slot < slots && !map.Holds(slot))
+					slot++;
+				return slot < slots;
+			}
+
+			KeyValuePair<K, V> Current { get => new KeyValuePair<K, V>(map.KeyAt(slot), map.ValueAt(slot)); }
+	}
+
+	/// A set of values by hash: Add, Contains, Remove, and `loop (T item in set)`.
+	public class HashSet<T : IHashable<T>>
+	{
+		Dictionary<T, bool> items;
+
+		public:
+			new() { items = new Dictionary<T, bool>(); }
+
+			i32 Count { get => items.Count; }
+
+			/// Adds `item`; false when it was already there.
+			Add(T item) : bool
+			{
+				if (items.ContainsKey(item))
+					return false;
+				items.Set(item, true);
+				return true;
+			}
+
+			Contains(T item) : bool => items.ContainsKey(item);
+
+			Remove(T item) : bool => items.Remove(item);
+
+			Clear() { items.Clear(); }
+
+			/// `loop (T item in set)`.
+			Iterator() : ListIterator<T> => items.Keys().Iterator();
+	}
+}

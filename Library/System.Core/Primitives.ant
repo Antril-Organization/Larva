@@ -1,0 +1,1129 @@
+﻿// The members of the primitive types: `i32` and `System.Int32` are one type; these declarations give it its members and
+// interfaces (methods take `this` as the value itself).
+
+into namespace System
+{
+	[Primitive("i32")]
+	public value Int32 : ISignedNumber<i32>, IHashable<i32>, IComparable<i32>, IToString
+	{
+		public:
+			static i32 Zero { get => 0; }
+			static i32 One { get => 1; }
+			/// The smallest i32.
+			const i32 MinValue = -2147483647 - 1;
+			/// The largest i32.
+			const i32 MaxValue = 2147483647;
+			[Inline] static FromF64(f64 value) : i32 => (i32)value;
+			[Inline] static ToF64(i32 value) : f64 => (f64)value;
+			static i32 NegativeOne { get => -1; }
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)(u32)this, 32, true, format);
+
+			ToString() : str => Number.Format(this);
+			Hash() : u64 => (u64)(u32)this;
+			Equals(i32 other) : bool => this == other;
+			CompareTo(i32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			static Parse(str text) : i32 => (i32)Number.Parse(text);
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : i32?
+			{
+				i64? value = Number.TryParse(text);
+				if (value == null)
+					return null;
+				return (i32)value.Value;
+			}
+	}
+
+	[Primitive("i64")]
+	public value Int64 : ISignedNumber<i64>, IHashable<i64>, IComparable<i64>, IToString
+	{
+		public:
+			static i64 Zero { get => 0; }
+			static i64 One { get => 1; }
+			/// The smallest i64.
+			const i64 MinValue = -9223372036854775807 - 1;
+			/// The largest i64.
+			const i64 MaxValue = 9223372036854775807;
+			[Inline] static FromF64(f64 value) : i64 => (i64)value;
+			[Inline] static ToF64(i64 value) : f64 => (f64)value;
+			static i64 NegativeOne { get => -1; }
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)this, 64, true, format);
+
+			ToString() : str => Number.Format(this);
+			Hash() : u64 => (u64)this;
+			Equals(i64 other) : bool => this == other;
+			CompareTo(i64 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			static Parse(str text) : i64 => Number.Parse(text);
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : i64? => Number.TryParse(text);
+	}
+
+	[Primitive("u64")]
+	public value UInt64 : INumber<u64>, IHashable<u64>, IComparable<u64>, IToString
+	{
+		public:
+			static u64 Zero { get => 0; }
+			static u64 One { get => 1; }
+			/// The smallest u64.
+			const u64 MinValue = 0;
+			/// The largest u64.
+			const u64 MaxValue = 18446744073709551615;
+			[Inline] static FromF64(f64 value) : u64 => (u64)value;
+			[Inline] static ToF64(u64 value) : f64 => (f64)value;
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger(this, 64, false, format);
+
+			ToString() : str => Number.FormatUnsigned(this);
+			Hash() : u64 => this;
+			Equals(u64 other) : bool => this == other;
+			CompareTo(u64 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+	}
+
+	[Primitive("u16")]
+	public value UInt16 : INumber<u16>, IHashable<u16>, IComparable<u16>, IToString
+	{
+		public:
+			static u16 Zero { get => 0; }
+			static u16 One { get => 1; }
+			/// The smallest u16.
+			const u16 MinValue = 0;
+			/// The largest u16.
+			const u16 MaxValue = 65535;
+			[Inline] static FromF64(f64 value) : u16 => (u16)value;
+			[Inline] static ToF64(u16 value) : f64 => (f64)value;
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)this, 16, false, format);
+
+			ToString() : str => Number.Format(this);
+			Hash() : u64 => (u64)this;
+			Equals(u16 other) : bool => this == other;
+			CompareTo(u16 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+	}
+
+	[Primitive("u8")]
+	public value UInt8 : INumber<u8>, IHashable<u8>, IComparable<u8>, IToString
+	{
+		public:
+			static u8 Zero { get => 0; }
+			static u8 One { get => 1; }
+			/// The smallest u8.
+			const u8 MinValue = 0;
+			/// The largest u8.
+			const u8 MaxValue = 255;
+			[Inline] static FromF64(f64 value) : u8 => (u8)value;
+			[Inline] static ToF64(u8 value) : f64 => (f64)value;
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)this, 8, false, format);
+
+			ToString() : str => Number.Format(this);
+			Hash() : u64 => (u64)this;
+			Equals(u8 other) : bool => this == other;
+			CompareTo(u8 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+	}
+
+	[Primitive("f64")]
+	public value Float64 : ISignedNumber<f64>, IHashable<f64>, IComparable<f64>, IToString
+	{
+		public:
+			static f64 Zero { get => 0.0; }
+			static f64 One { get => 1.0; }
+			/// The largest finite f64, and the smallest (its negative).
+			const f64 MaxValue = 1.7976931348623157e308;
+			const f64 MinValue = -1.7976931348623157e308;
+			/// The smallest f64 above zero (a subnormal).
+			const f64 Epsilon = 4.9406564584124654e-324;
+			/// Not a number (quiet, positive), and the infinities.
+			const f64 NaN = 0.0 / 0.0;
+			const f64 PositiveInfinity = 1.0 / 0.0;
+			const f64 NegativeInfinity = -1.0 / 0.0;
+			[Inline] static FromF64(f64 value) : f64 => value;
+			[Inline] static ToF64(f64 value) : f64 => value;
+			static f64 NegativeOne { get => -1.0; }
+
+		extern("format.f64") FormatInto(f64 value) : i64;
+		extern("format.unit") FormattedUnit(i64 index) : i64;
+		extern("parse.f64") ParseBits(u16[] text) : i64;
+		extern("f64.bits") BitsOf(f64 value) : i64;
+		extern("f64.from_bits") FromBitsOf(i64 bits) : f64;
+
+		/// Digits, an optional point and more digits, an optional exponent: what ParseBits reads.
+		static IsNumber(u8[] text) : bool
+		{
+			i32 i = 0;
+			i32 n = text.Length;
+			if (i < n && (text[i] == '-' || text[i] == '+'))
+				i++;
+			i32 digits = 0;
+			loop (i < n && text[i] >= '0' && text[i] <= '9')
+			{
+				i++;
+				digits++;
+			}
+			if (i < n && text[i] == '.')
+			{
+				i++;
+				loop (i < n && text[i] >= '0' && text[i] <= '9')
+				{
+					i++;
+					digits++;
+				}
+			}
+			if (digits == 0)
+				return false;
+			if (i < n && (text[i] == 'e' || text[i] == 'E'))
+			{
+				i++;
+				if (i < n && (text[i] == '-' || text[i] == '+'))
+					i++;
+				i32 exponent = 0;
+				loop (i < n && text[i] >= '0' && text[i] <= '9')
+				{
+					i++;
+					exponent++;
+				}
+				if (exponent == 0)
+					return false;
+			}
+			return i == n;
+		}
+
+		public:
+			/// As text by a format: F, N, E, P, G, R and a precision (`(2.5).ToString("F2")` is "2.50").
+			ToString(str format) : str => NumberFormat.FormatDouble(this, format);
+
+			/// The number as `print` writes it (up to 15 significant digits).
+			ToString() : str
+			{
+				i64 count = FormatInto(this);
+				u8[] digits = new u8[(i32)count];
+				loop (i32 i = 0..digits.Length)
+					digits[i] = (u8)FormattedUnit(i);
+				return new String<u8>(digits);
+			}
+
+			CompareTo(f64 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			Equals(f64 other) : bool => this == other || IsNaN(this) && IsNaN(other);
+			Hash() : u64 => (u64)BitsOf(this == 0 ? 0 : this);
+
+			/// The IEEE 754 bits of the number, and back.
+			static Bits(f64 value) : i64 => BitsOf(value);
+
+			static FromBits(i64 bits) : f64 => FromBitsOf(bits);
+
+			static IsNaN(f64 x) : bool => x != x;
+			static IsInfinity(f64 x) : bool => x - x != 0 && x == x;
+			static IsFinite(f64 x) : bool => x - x == 0;
+
+			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			static Parse(str text) : f64
+			{
+				str trimmed = text.Trim();
+				if (trimmed == "NaN")
+					return NaN;
+				if (trimmed == "Infinity" || trimmed == "+Infinity")
+					return PositiveInfinity;
+				if (trimmed == "-Infinity")
+					return NegativeInfinity;
+				if (!IsNumber(trimmed.Units()))
+					throw new FormatError("not a number: " + text);
+				return FromBitsOf(ParseBits(Unicode.ToUtf16(trimmed)));
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : f64?
+			{
+				str trimmed = text.Trim();
+				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+					return Parse(trimmed);
+				if (!IsNumber(trimmed.Units()))
+					return null;
+				return FromBitsOf(ParseBits(Unicode.ToUtf16(trimmed)));
+			}
+	}
+
+	[Primitive("f32")]
+	public value Float32 : ISignedNumber<f32>, IComparable<f32>, IToString
+	{
+		public:
+			static f32 Zero { get => 0.0; }
+			static f32 One { get => 1.0; }
+			/// The largest finite f32, and the smallest (its negative).
+			const f32 MaxValue = 3.4028234663852886e38;
+			const f32 MinValue = -3.4028234663852886e38;
+			/// The smallest f32 above zero (a subnormal).
+			const f32 Epsilon = 1.4012984643248171e-45;
+			/// Not a number (quiet, positive), and the infinities.
+			const f32 NaN = 0.0 / 0.0;
+			const f32 PositiveInfinity = 1.0 / 0.0;
+			const f32 NegativeInfinity = -1.0 / 0.0;
+			[Inline] static FromF64(f64 value) : f32 => (f32)value;
+			[Inline] static ToF64(f32 value) : f64 => (f64)value;
+			static f32 NegativeOne { get => -1.0; }
+
+			/// As text by a format: F, N, E, P, G, R and a precision (`(2.5).ToString("F2")` is "2.50").
+			ToString(str format) : str => NumberFormat.FormatSingle(this, format);
+
+			ToString() : str => NumberFormat.FormatSingle(this, "R");
+			CompareTo(f32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+
+			/// The IEEE 754 bits of `value` (an f32 is exact as an f64: its bits are rebuilt from those).
+			static Bits(f32 value) : u32
+			{
+				i64 wide = Float64.Bits(value);
+				u32 sign = (u32)(wide >> 32) & 0x80000000;
+				i32 exponent = (i32)(wide >> 52) & 0x7FF;
+				i64 mantissa = wide & 0xFFFFFFFFFFFFF;
+				if (exponent == 0x7FF)
+					return sign | 0x7F800000 | (u32)(mantissa >> 29) | (mantissa != 0 ? 0x400000 : 0);
+				if (exponent == 0)
+					return sign;
+				i32 biased = exponent - 1023 + 127;
+				if (biased >= 1)
+					return sign | (u32)biased << 23 | (u32)(mantissa >> 29);
+				// Subnormal: the hidden bit shifted down.
+				return sign | (u32)((mantissa | 0x10000000000000) >> (30 - biased));
+			}
+
+			/// The f32 with these IEEE 754 bits.
+			static FromBits(u32 bits) : f32
+			{
+				i64 sign = (i64)(bits & 0x80000000) << 32;
+				i32 exponent = (i32)(bits >> 23) & 0xFF;
+				i64 mantissa = bits & 0x7FFFFF;
+				if (exponent == 0xFF)
+					return (f32)Float64.FromBits(sign | 0x7FF0000000000000 | mantissa << 29);
+				if (exponent == 0)
+				{
+					if (mantissa == 0)
+						return (f32)Float64.FromBits(sign);
+					// Subnormal: normalized as an f64.
+					i32 shift = 0;
+					loop ((mantissa & 0x800000) == 0)
+					{
+						mantissa = mantissa << 1;
+						shift++;
+					}
+					return (f32)Float64.FromBits(sign | (i64)(1 - 127 - shift + 1023) << 52 | (mantissa & 0x7FFFFF) << 29);
+				}
+				return (f32)Float64.FromBits(sign | (i64)(exponent - 127 + 1023) << 52 | mantissa << 29);
+			}
+	}
+
+	[Primitive("f16")]
+	public value Float16 : ISignedNumber<f16>, IComparable<f16>, IToString
+	{
+		public:
+			static f16 Zero { get => 0; }
+			static f16 One { get => 1; }
+			/// The largest finite f16, and the smallest (its negative).
+			const f16 MaxValue = 65504.0;
+			const f16 MinValue = -65504.0;
+			/// The smallest f16 above zero (a subnormal).
+			const f16 Epsilon = 5.9604644775390625e-8;
+			/// Not a number (quiet, positive), and the infinities.
+			const f16 NaN = 0.0 / 0.0;
+			const f16 PositiveInfinity = 1.0 / 0.0;
+			const f16 NegativeInfinity = -1.0 / 0.0;
+			[Inline] static FromF64(f64 value) : f16 => (f16)value;
+			[Inline] static ToF64(f16 value) : f64 => (f64)value;
+			static f16 NegativeOne { get => -1; }
+
+			/// As text by a format: F, N, E, P, G, R and a precision (`(2.5f16).ToString("F2")` is "2.50").
+			ToString(str format) : str => NumberFormat.FormatHalf(this, format);
+
+			/// The shortest text that reads back as the same number.
+			ToString() : str => NumberFormat.FormatHalf(this, "G");
+			CompareTo(f16 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			Equals(f16 other) : bool => this == other || IsNaN(this) && IsNaN(other);
+			Hash() : u64 => (u64)Bits(this == 0 ? 0 : this);
+
+			/// The IEEE 754 bits of the number, and back.
+			static unsafe Bits(f16 value) : u16
+			{
+				f16 local = value;
+				return *(u16*)&local;
+			}
+
+			static unsafe FromBits(u16 bits) : f16
+			{
+				u16 local = bits;
+				return *(f16*)&local;
+			}
+
+			static IsNaN(f16 x) : bool => x != x;
+			static IsInfinity(f16 x) : bool => x - x != 0 && x == x;
+			static IsFinite(f16 x) : bool => x - x == 0;
+
+			/// The number `text` writes (digits, a point, an exponent), read as an f64 and rounded; a FormatError otherwise.
+			static Parse(str text) : f16 => (f16)Float64.Parse(text);
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : f16?
+			{
+				f64? value = Float64.TryParse(text);
+				if (value == null)
+					return null;
+				return (f16)value.Value;
+			}
+	}
+
+	[Primitive("u32")]
+	public value UInt32 : INumber<u32>, IHashable<u32>, IComparable<u32>, IToString
+	{
+		public:
+			static u32 Zero { get => 0; }
+			static u32 One { get => 1; }
+			/// The smallest u32.
+			const u32 MinValue = 0;
+			/// The largest u32.
+			const u32 MaxValue = 4294967295;
+			[Inline] static FromF64(f64 value) : u32 => (u32)value;
+			[Inline] static ToF64(u32 value) : f64 => (f64)value;
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)this, 32, false, format);
+
+			ToString() : str => Number.FormatUnsigned(this);
+			Hash() : u64 => (u64)this;
+			Equals(u32 other) : bool => this == other;
+			CompareTo(u32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+	}
+
+	[Primitive("i16")]
+	public value Int16 : ISignedNumber<i16>, IHashable<i16>, IComparable<i16>, IToString
+	{
+		public:
+			static i16 Zero { get => 0; }
+			static i16 One { get => 1; }
+			/// The smallest i16.
+			const i16 MinValue = -32768;
+			/// The largest i16.
+			const i16 MaxValue = 32767;
+			[Inline] static FromF64(f64 value) : i16 => (i16)value;
+			[Inline] static ToF64(i16 value) : f64 => (f64)value;
+			static i16 NegativeOne { get => -1; }
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)(u16)this, 16, true, format);
+
+			ToString() : str => Number.Format(this);
+			Hash() : u64 => (u64)(u16)this;
+			Equals(i16 other) : bool => this == other;
+			CompareTo(i16 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+	}
+
+	[Primitive("i8")]
+	public value Int8 : ISignedNumber<i8>, IHashable<i8>, IComparable<i8>, IToString
+	{
+		public:
+			static i8 Zero { get => 0; }
+			static i8 One { get => 1; }
+			/// The smallest i8.
+			const i8 MinValue = -128;
+			/// The largest i8.
+			const i8 MaxValue = 127;
+			[Inline] static FromF64(f64 value) : i8 => (i8)value;
+			[Inline] static ToF64(i8 value) : f64 => (f64)value;
+			static i8 NegativeOne { get => -1; }
+
+			/// As text by a format: D, X, B, N, F, E, P, G and a precision (`255.ToString("X4")` is "00FF").
+			ToString(str format) : str => NumberFormat.FormatInteger((u64)(u8)this, 8, true, format);
+
+			ToString() : str => Number.Format(this);
+			Hash() : u64 => (u64)(u8)this;
+			Equals(i8 other) : bool => this == other;
+			CompareTo(i8 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+	}
+
+	[Primitive("i128")]
+	public value Int128 : ISignedNumber<i128>, IHashable<i128>, IComparable<i128>, IToString
+	{
+		public:
+			static i128 Zero { get => 0; }
+			static i128 One { get => 1; }
+			/// The smallest i128.
+			const i128 MinValue = -170141183460469231731687303715884105727 - 1;
+			/// The largest i128.
+			const i128 MaxValue = 170141183460469231731687303715884105727;
+			// Through two 64-bit halves: a conversion of all 128 bits needs a routine not every back end has.
+			static FromF64(f64 value) : i128
+			{
+				if (value < 0)
+					return -(i128)UInt128.FromF64(-value);
+				return (i128)UInt128.FromF64(value);
+			}
+			static ToF64(i128 value) : f64 => value < 0 ? -UInt128.ToF64((u128)(-value)) : UInt128.ToF64((u128)value);
+			static i128 NegativeOne { get => -1; }
+
+			ToString() : str
+			{
+				if (this >= 0)
+					return Number.FormatUnsigned((u128)this);
+				// -(value + 1) + 1 keeps the smallest value in range.
+				u128 magnitude = (u128)(-(this + 1)) + 1;
+				return "-" + Number.FormatUnsigned(magnitude);
+			}
+			Hash() : u64 => (u64)this ^ (u64)(this >> 64);
+			Equals(i128 other) : bool => this == other;
+			CompareTo(i128 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+
+			/// The integer `text` writes (an optional '-', then decimal digits); a FormatError otherwise.
+			static Parse(str text) : i128
+			{
+				i128? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not a number: " + text);
+				return value.Value;
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : i128?
+			{
+				i32 length = text.Length;
+				bool negative = length > 0 && text[0] == 45;
+				i32 start = negative ? 1 : 0;
+				if (start == length)
+					return null;
+				i128 value = 0;
+				loop (i32 i = start..length)
+				{
+					u8 unit = text[i];
+					if (unit < 48 || unit > 57)
+						return null;
+					value = value * 10 + (i128)(unit - 48);
+				}
+				return negative ? -value : value;
+			}
+	}
+
+	[Primitive("u128")]
+	public value UInt128 : INumber<u128>, IHashable<u128>, IComparable<u128>, IToString
+	{
+		public:
+			static u128 Zero { get => 0; }
+			static u128 One { get => 1; }
+			/// The smallest u128.
+			const u128 MinValue = 0;
+			/// The largest u128.
+			const u128 MaxValue = 340282366920938463463374607431768211455;
+			// Through two 64-bit halves: a conversion of all 128 bits needs a routine not every back end has.
+			static FromF64(f64 value) : u128
+			{
+				f64 half = 18446744073709551616.0; // 2^64
+				if (value < half)
+					return (u128)(u64)value;
+				f64 high = Math.Floor(value / half);
+				return ((u128)(u64)high << 64) + (u128)(u64)(value - high * half);
+			}
+			static ToF64(u128 value) : f64 => (f64)(u64)(value >> 64) * 18446744073709551616.0 + (f64)(u64)value;
+
+			ToString() : str => Number.FormatUnsigned(this);
+			Hash() : u64 => (u64)this ^ (u64)(this >> 64);
+			Equals(u128 other) : bool => this == other;
+			CompareTo(u128 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+
+			/// The integer `text` writes (decimal digits); a FormatError otherwise.
+			static Parse(str text) : u128
+			{
+				u128? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not a number: " + text);
+				return value.Value;
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : u128?
+			{
+				i32 length = text.Length;
+				i32 start = 0;
+				if (start == length)
+					return null;
+				u128 value = 0;
+				loop (i32 i = start..length)
+				{
+					u8 unit = text[i];
+					if (unit < 48 || unit > 57)
+						return null;
+					value = value * 10 + (u128)(unit - 48);
+				}
+				return value;
+			}
+	}
+
+	[Primitive("i256")]
+	public value Int256 : ISignedNumber<i256>, IHashable<i256>, IComparable<i256>, IToString
+	{
+		public:
+			static i256 Zero { get => 0; }
+			static i256 One { get => 1; }
+			/// The smallest i256.
+			const i256 MinValue = -57896044618658097711785492504343953926634992332820282019728792003956564819967 - 1;
+			/// The largest i256.
+			const i256 MaxValue = 57896044618658097711785492504343953926634992332820282019728792003956564819967;
+			// Through two 128-bit halves: a conversion of all 256 bits has no routine on every back end.
+			static FromF64(f64 value) : i256
+			{
+				if (value < 0)
+					return -(i256)UInt256.FromF64(-value);
+				return (i256)UInt256.FromF64(value);
+			}
+			static ToF64(i256 value) : f64 => value < 0 ? -UInt256.ToF64((u256)(-value)) : UInt256.ToF64((u256)value);
+			static i256 NegativeOne { get => -1; }
+
+			ToString() : str
+			{
+				if (this >= 0)
+					return Number.FormatUnsigned((u256)this);
+				// -(value + 1) + 1 keeps the smallest value in range.
+				u256 magnitude = (u256)(-(this + 1)) + 1;
+				return "-" + Number.FormatUnsigned(magnitude);
+			}
+			Hash() : u64 => (u64)this ^ (u64)(this >> 64) ^ (u64)(this >> 128) ^ (u64)(this >> 192);
+			Equals(i256 other) : bool => this == other;
+			CompareTo(i256 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+
+			/// The integer `text` writes (an optional '-', then decimal digits); a FormatError otherwise.
+			static Parse(str text) : i256
+			{
+				i256? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not a number: " + text);
+				return value.Value;
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : i256?
+			{
+				i32 length = text.Length;
+				bool negative = length > 0 && text[0] == 45;
+				i32 start = negative ? 1 : 0;
+				if (start == length)
+					return null;
+				i256 value = 0;
+				loop (i32 i = start..length)
+				{
+					u8 unit = text[i];
+					if (unit < 48 || unit > 57)
+						return null;
+					value = value * 10 + (i256)(unit - 48);
+				}
+				return negative ? -value : value;
+			}
+	}
+
+	[Primitive("u256")]
+	public value UInt256 : INumber<u256>, IHashable<u256>, IComparable<u256>, IToString
+	{
+		public:
+			static u256 Zero { get => 0; }
+			static u256 One { get => 1; }
+			/// The smallest u256.
+			const u256 MinValue = 0;
+			/// The largest u256.
+			const u256 MaxValue = 115792089237316195423570985008687907853269984665640564039457584007913129639935;
+			// Through two 128-bit halves: a conversion of all 256 bits has no routine on every back end.
+			static FromF64(f64 value) : u256
+			{
+				f64 half = 340282366920938463463374607431768211456.0; // 2^128
+				if (value < half)
+					return (u256)UInt128.FromF64(value);
+				f64 high = Math.Floor(value / half);
+				return ((u256)UInt128.FromF64(high) << 128) + (u256)UInt128.FromF64(value - high * half);
+			}
+			static ToF64(u256 value) : f64 => UInt128.ToF64((u128)(value >> 128)) * 340282366920938463463374607431768211456.0 + UInt128.ToF64((u128)value);
+
+			ToString() : str => Number.FormatUnsigned(this);
+			Hash() : u64 => (u64)this ^ (u64)(this >> 64) ^ (u64)(this >> 128) ^ (u64)(this >> 192);
+			Equals(u256 other) : bool => this == other;
+			CompareTo(u256 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+
+			/// The integer `text` writes (decimal digits); a FormatError otherwise.
+			static Parse(str text) : u256
+			{
+				u256? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not a number: " + text);
+				return value.Value;
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : u256?
+			{
+				i32 length = text.Length;
+				i32 start = 0;
+				if (start == length)
+					return null;
+				u256 value = 0;
+				loop (i32 i = start..length)
+				{
+					u8 unit = text[i];
+					if (unit < 48 || unit > 57)
+						return null;
+					value = value * 10 + (u256)(unit - 48);
+				}
+				return value;
+			}
+	}
+
+	[Primitive("f128")]
+	public value Float128 : ISignedNumber<f128>, IHashable<f128>, IComparable<f128>, IToString
+	{
+		public:
+			static f128 Zero { get => 0; }
+			static f128 One { get => 1; }
+			/// The largest finite f128, and the smallest (its negative).
+			const f128 MaxValue = 1.189731495357231765085759326628007016196e4932f128;
+			const f128 MinValue = -1.189731495357231765085759326628007016196e4932f128;
+			/// The smallest f128 above zero (a subnormal).
+			const f128 Epsilon = 6.475175119438025110924438958227646552500e-4966f128;
+			/// Not a number (quiet, positive), and the infinities.
+			const f128 NaN = 0.0f128 / 0.0f128;
+			const f128 PositiveInfinity = 1.0f128 / 0.0f128;
+			const f128 NegativeInfinity = -1.0f128 / 0.0f128;
+			[Inline] static FromF64(f64 value) : f128 => (f128)value;
+			[Inline] static ToF64(f128 value) : f64 => (f64)value;
+			static f128 NegativeOne { get => -1; }
+
+			/// As text by a format: F, N, E, P, G, R and a precision; the fixed formats show up to 33 digits.
+			ToString(str format) : str => NumberFormat.FormatWide(Bits(this), 128, format);
+
+			/// The shortest text that reads back as the same number.
+			ToString() : str => NumberFormat.FormatWide(Bits(this), 128, "G");
+			CompareTo(f128 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			Equals(f128 other) : bool => this == other || IsNaN(this) && IsNaN(other);
+
+			Hash() : u64
+			{
+				u128 bits = Bits(this == 0 ? 0 : this);
+				return (u64)bits ^ (u64)(bits >> 64);
+			}
+
+			/// The IEEE 754 bits of the number, and back.
+			static unsafe Bits(f128 value) : u128
+			{
+				f128 local = value;
+				return *(u128*)&local;
+			}
+
+			static unsafe FromBits(u128 bits) : f128
+			{
+				u128 local = bits;
+				return *(f128*)&local;
+			}
+
+			static IsNaN(f128 x) : bool => x != x;
+			static IsInfinity(f128 x) : bool => x - x != 0 && x == x;
+			static IsFinite(f128 x) : bool => x - x == 0;
+
+			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			static Parse(str text) : f128
+			{
+				str trimmed = text.Trim();
+				if (trimmed == "NaN")
+					return NaN;
+				if (trimmed == "Infinity" || trimmed == "+Infinity")
+					return PositiveInfinity;
+				if (trimmed == "-Infinity")
+					return NegativeInfinity;
+				if (!Float64.IsNumber(trimmed.Units()))
+					throw new FormatError("not a number: " + text);
+				return Read(trimmed.Units());
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : f128?
+			{
+				str trimmed = text.Trim();
+				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+					return Parse(trimmed);
+				if (!Float64.IsNumber(trimmed.Units()))
+					return null;
+				return Read(trimmed.Units());
+			}
+
+		/// Digits × 10^exponent: exact (one correctly rounded operation) up to 33 significant digits and a power
+		/// of ten up to 10^48, which the type holds exactly; beyond that, within a few units in the last place.
+		static Read(u8[] units) : f128
+		{
+			i32 i = 0;
+			bool negative = units[0] == '-';
+			if (negative || units[0] == '+')
+				i++;
+			u128 digits = 0;
+			i32 count = 0;
+			i32 exponent = 0;
+			bool afterPoint = false;
+			loop (i < units.Length)
+			{
+				u8 c = units[i];
+				i++;
+				if (c == '.')
+				{
+					afterPoint = true;
+					continue;
+				}
+				if (c == 'e' || c == 'E')
+				{
+					bool negativeExponent = units[i] == '-';
+					if (negativeExponent || units[i] == '+')
+						i++;
+					i32 e = 0;
+					loop (i < units.Length)
+					{
+						if (e < 1000000)
+							e = e * 10 + (i32)(units[i] - 48);
+						i++;
+					}
+					exponent += negativeExponent ? -e : e;
+					break;
+				}
+				i32 d = (i32)(c - 48);
+				if (digits == 0 && d == 0)
+				{
+					if (afterPoint)
+						exponent--;
+					continue;
+				}
+				if (count < 33)
+				{
+					digits = digits * 10 + (u128)d;
+					count++;
+					if (afterPoint)
+						exponent--;
+				}
+				else if (!afterPoint)
+				{
+					exponent++;
+				}
+			}
+			f128 value = (f128)digits;
+			loop (exponent > 0)
+			{
+				i32 step = exponent > 4000 ? 4000 : exponent;
+				value = value * PowerOfTen(step);
+				exponent -= step;
+			}
+			loop (exponent < 0)
+			{
+				i32 step = -exponent > 4000 ? 4000 : -exponent;
+				value = value / PowerOfTen(step);
+				exponent += step;
+			}
+			return negative ? -value : value;
+		}
+
+		/// 10^power by squaring (exact up to 10^48).
+		static PowerOfTen(i32 power) : f128
+		{
+			f128 result = 1;
+			f128 base = 10;
+			loop (power > 0)
+			{
+				if ((power & 1) != 0)
+					result = result * base;
+				base = base * base;
+				power = power >> 1;
+			}
+			return result;
+		}
+	}
+
+	[Primitive("f256")]
+	public value Float256 : ISignedNumber<f256>, IHashable<f256>, IComparable<f256>, IToString
+	{
+		public:
+			static f256 Zero { get => 0; }
+			static f256 One { get => 1; }
+			/// The largest finite f256, and the smallest (its negative).
+			const f256 MaxValue = 1.61132571748576047361957211845200501064402387454966951747637125049607182699e78913f256;
+			const f256 MinValue = -1.61132571748576047361957211845200501064402387454966951747637125049607182699e78913f256;
+			/// The smallest f256 above zero (a subnormal).
+			const f256 Epsilon = 2.24800708647703657297018614776265182597360918266100276294348974547709294462e-78984f256;
+			/// Not a number (quiet, positive), and the infinities.
+			const f256 NaN = 0.0f256 / 0.0f256;
+			const f256 PositiveInfinity = 1.0f256 / 0.0f256;
+			const f256 NegativeInfinity = -1.0f256 / 0.0f256;
+			[Inline] static FromF64(f64 value) : f256 => (f256)value;
+			[Inline] static ToF64(f256 value) : f64 => (f64)value;
+			static f256 NegativeOne { get => -1; }
+
+			/// As text by a format: F, N, E, P, G, R and a precision; the fixed formats show up to 71 digits.
+			ToString(str format) : str => NumberFormat.FormatWide(Bits(this), 256, format);
+
+			/// The shortest text that reads back as the same number.
+			ToString() : str => NumberFormat.FormatWide(Bits(this), 256, "G");
+			CompareTo(f256 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			Equals(f256 other) : bool => this == other || IsNaN(this) && IsNaN(other);
+
+			Hash() : u64
+			{
+				u256 bits = Bits(this == 0 ? 0 : this);
+				return (u64)bits ^ (u64)(bits >> 64) ^ (u64)(bits >> 128) ^ (u64)(bits >> 192);
+			}
+
+			/// The IEEE 754 bits of the number, and back.
+			static unsafe Bits(f256 value) : u256
+			{
+				f256 local = value;
+				return *(u256*)&local;
+			}
+
+			static unsafe FromBits(u256 bits) : f256
+			{
+				u256 local = bits;
+				return *(f256*)&local;
+			}
+
+			static IsNaN(f256 x) : bool => x != x;
+			static IsInfinity(f256 x) : bool => x - x != 0 && x == x;
+			static IsFinite(f256 x) : bool => x - x == 0;
+
+			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			static Parse(str text) : f256
+			{
+				str trimmed = text.Trim();
+				if (trimmed == "NaN")
+					return NaN;
+				if (trimmed == "Infinity" || trimmed == "+Infinity")
+					return PositiveInfinity;
+				if (trimmed == "-Infinity")
+					return NegativeInfinity;
+				if (!Float64.IsNumber(trimmed.Units()))
+					throw new FormatError("not a number: " + text);
+				return Read(trimmed.Units());
+			}
+
+			/// The number `text` writes, or null when it writes none.
+			static TryParse(str text) : f256?
+			{
+				str trimmed = text.Trim();
+				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+					return Parse(trimmed);
+				if (!Float64.IsNumber(trimmed.Units()))
+					return null;
+				return Read(trimmed.Units());
+			}
+
+		/// Digits × 10^exponent: exact (one correctly rounded operation) up to 71 significant digits and a power
+		/// of ten up to 10^102, which the type holds exactly; beyond that, within a few units in the last place.
+		static Read(u8[] units) : f256
+		{
+			i32 i = 0;
+			bool negative = units[0] == '-';
+			if (negative || units[0] == '+')
+				i++;
+			u256 digits = 0;
+			i32 count = 0;
+			i32 exponent = 0;
+			bool afterPoint = false;
+			loop (i < units.Length)
+			{
+				u8 c = units[i];
+				i++;
+				if (c == '.')
+				{
+					afterPoint = true;
+					continue;
+				}
+				if (c == 'e' || c == 'E')
+				{
+					bool negativeExponent = units[i] == '-';
+					if (negativeExponent || units[i] == '+')
+						i++;
+					i32 e = 0;
+					loop (i < units.Length)
+					{
+						if (e < 1000000)
+							e = e * 10 + (i32)(units[i] - 48);
+						i++;
+					}
+					exponent += negativeExponent ? -e : e;
+					break;
+				}
+				i32 d = (i32)(c - 48);
+				if (digits == 0 && d == 0)
+				{
+					if (afterPoint)
+						exponent--;
+					continue;
+				}
+				if (count < 71)
+				{
+					digits = digits * 10 + (u256)d;
+					count++;
+					if (afterPoint)
+						exponent--;
+				}
+				else if (!afterPoint)
+				{
+					exponent++;
+				}
+			}
+			f256 value = (f256)digits;
+			loop (exponent > 0)
+			{
+				i32 step = exponent > 70000 ? 70000 : exponent;
+				value = value * PowerOfTen(step);
+				exponent -= step;
+			}
+			loop (exponent < 0)
+			{
+				i32 step = -exponent > 70000 ? 70000 : -exponent;
+				value = value / PowerOfTen(step);
+				exponent += step;
+			}
+			return negative ? -value : value;
+		}
+
+		/// 10^power by squaring (exact up to 10^102).
+		static PowerOfTen(i32 power) : f256
+		{
+			f256 result = 1;
+			f256 base = 10;
+			loop (power > 0)
+			{
+				if ((power & 1) != 0)
+					result = result * base;
+				base = base * base;
+				power = power >> 1;
+			}
+			return result;
+		}
+	}
+
+	[Primitive("bool")]
+	public value Boolean : IHashable<bool>, IToString
+	{
+		public:
+			ToString() : str => this ? "true" : "false";
+			Hash() : u64 => this ? 1 : 0;
+			Equals(bool other) : bool => this == other;
+	}
+
+	/// Numbers as text and back.
+	public static class Number
+	{
+		public:
+			/// The decimal digits of `value` (with a '-' when negative).
+			Format(i64 value) : str
+			{
+				if (value >= 0)
+					return FormatUnsigned((u64)value);
+				// -(value + 1) + 1 keeps the smallest i64 in range.
+				u64 magnitude = (u64)(-(value + 1)) + 1;
+				return String<u8>.Decimal(magnitude, true);
+			}
+
+			/// The decimal digits of `value`.
+			FormatUnsigned(u64 value) : str
+			{
+				return String<u8>.Decimal(value, false);
+			}
+
+			/// The decimal digits of a 128-bit `value`.
+			FormatUnsigned(u128 value) : str
+			{
+				i32 count = 1;
+				u128 rest = value;
+				loop (rest >= 10)
+				{
+					rest = rest / 10;
+					count++;
+				}
+				u8[] digits = new u8[count];
+				i32 at = count;
+				do
+				{
+					at--;
+					digits[at] = (u8)(48 + (u64)(value % 10));
+					value = value / 10;
+				}
+				loop (value > 0);
+				return new String<u8>(digits);
+			}
+
+			/// The decimal digits of a 256-bit `value`.
+			FormatUnsigned(u256 value) : str
+			{
+				i32 count = 1;
+				u256 rest = value;
+				loop (rest >= 10)
+				{
+					rest = rest / 10;
+					count++;
+				}
+				u8[] digits = new u8[count];
+				i32 at = count;
+				do
+				{
+					at--;
+					digits[at] = (u8)(48 + (u64)(value % 10));
+					value = value / 10;
+				}
+				loop (value > 0);
+				return new String<u8>(digits);
+			}
+
+			/// How many decimal digits `value` has (1 for 0).
+			DigitCount(u64 value) : i32
+			{
+				i32 count = 1;
+				loop (value >= 10)
+				{
+					value = value / 10;
+					count++;
+				}
+				return count;
+			}
+
+			/// Writes the digits of `value` so they end just before `end`.
+			WriteDigits(u64 value, u8[] units, i32 end)
+			{
+				i32 at = end;
+				do
+				{
+					at--;
+					units[at] = (u8)(48 + value % 10);
+					value = value / 10;
+				}
+				loop (value > 0);
+			}
+
+			/// The integer `text` writes (an optional '-', then decimal digits); a FormatError otherwise.
+			Parse(str text) : i64
+			{
+				i64? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not a number: " + text);
+				return value.Value;
+			}
+
+			/// The integer `text` writes (an optional '-', then decimal digits), or null.
+			TryParse(str text) : i64?
+			{
+				i32 length = text.Length;
+				bool negative = length > 0 && text[0] == 45;
+				i32 start = negative ? 1 : 0;
+				if (start == length)
+					return null;
+				i64 value = 0;
+				loop (i32 i = start..length)
+				{
+					u8 unit = text[i];
+					if (unit < 48 || unit > 57)
+						return null;
+					value = value * 10 + (i64)(unit - 48);
+				}
+				return negative ? -value : value;
+			}
+
+	}
+}

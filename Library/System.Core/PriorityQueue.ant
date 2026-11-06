@@ -1,0 +1,135 @@
+// A priority queue: a 4-ary min-heap (as .NET's), elements and priorities in parallel arrays.
+
+into namespace System
+{
+	/// Elements with priorities; Dequeue gives one with the smallest priority (among equals, in no set order).
+	public class PriorityQueue<E, P : IComparable<P>>
+	{
+		E[] elements;
+		P[] priorities;
+		i32 count;
+
+		[NoInline]
+		Grow()
+		{
+			i32 size = elements.Length * 2;
+			E[] e = new E[size];
+			P[] p = new P[size];
+			loop (i32 i = 0..count)
+			{
+				e[i] = elements[i];
+				p[i] = priorities[i];
+			}
+			elements = e;
+			priorities = p;
+		}
+
+		[NoInline]
+		static Empty() { throw new InvalidOperationError("the queue is empty"); }
+
+		/// Moves the entry at `at` (element, priority) up past larger parents.
+		Up(i32 at, E element, P priority)
+		{
+			loop (at > 0)
+			{
+				i32 parent = (at - 1) >> 2;
+				if (priority.CompareTo(priorities[parent]) >= 0)
+					break;
+				elements[at] = elements[parent];
+				priorities[at] = priorities[parent];
+				at = parent;
+			}
+			elements[at] = element;
+			priorities[at] = priority;
+		}
+
+		/// Puts (element, priority) at `at` and moves it down past smaller children.
+		Down(i32 at, E element, P priority)
+		{
+			loop (true)
+			{
+				i32 first = (at << 2) + 1;
+				if (first >= count)
+					break;
+				// The smallest of up to four children.
+				i32 best = first;
+				i32 end = first + 4 < count ? first + 4 : count;
+				loop (i32 c = first + 1..end)
+				{
+					if (priorities[c].CompareTo(priorities[best]) < 0)
+						best = c;
+				}
+				if (priority.CompareTo(priorities[best]) <= 0)
+					break;
+				elements[at] = elements[best];
+				priorities[at] = priorities[best];
+				at = best;
+			}
+			elements[at] = element;
+			priorities[at] = priority;
+		}
+
+		public:
+			new() : (8) { }
+
+			new(i32 capacity)
+			{
+				i32 size = capacity > 4 ? capacity : 4;
+				elements = new E[size];
+				priorities = new P[size];
+			}
+
+			i32 Count { get => count; }
+			bool IsEmpty { get => count == 0; }
+
+			Enqueue(E element, P priority)
+			{
+				if (count == elements.Length)
+					Grow();
+				count++;
+				Up(count - 1, element, priority);
+			}
+
+			/// The element with the smallest priority, taken out.
+			Dequeue() : E
+			{
+				if (count == 0)
+					Empty();
+				E top = elements[0];
+				count--;
+				if (count > 0)
+					Down(0, elements[count], priorities[count]);
+				return top;
+			}
+
+			/// The element with the smallest priority, and that priority (left in).
+			Peek() : E
+			{
+				if (count == 0)
+					Empty();
+				return elements[0];
+			}
+
+			P PeekPriority
+			{
+				get
+				{
+					if (count == 0)
+						Empty();
+					return priorities[0];
+				}
+			}
+
+			/// Enqueue then Dequeue, in one step (the new element comes straight back when it is the smallest).
+			EnqueueDequeue(E element, P priority) : E
+			{
+				if (count == 0 || priority.CompareTo(priorities[0]) <= 0)
+					return element;
+				E top = elements[0];
+				Down(0, element, priority);
+				return top;
+			}
+
+			Clear() { count = 0; }
+	}
+}

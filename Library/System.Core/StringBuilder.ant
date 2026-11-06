@@ -1,0 +1,125 @@
+// Builds text (UTF-8) piece by piece in a growing buffer; ToString() makes the string once.
+
+into namespace System
+{
+	public final class StringBuilder
+	{
+		u8[] buffer;
+		i32 length;
+
+		Reserve(i32 more)
+		{
+			if (length + more > buffer.Length)
+				Grow(more);
+		}
+
+		[NoInline]
+		Grow(i32 more)
+		{
+			i32 capacity = buffer.Length * 2;
+			if (capacity < length + more)
+				capacity = length + more;
+			u8[] bigger = new u8[capacity];
+			loop (i32 i = 0..length)
+				bigger[i] = buffer[i];
+			buffer = bigger;
+		}
+
+		public:
+			new() { buffer = new u8[16]; }
+
+			new(i32 capacity) { buffer = new u8[capacity < 1 ? 1 : capacity]; }
+
+			/// How many bytes it holds.
+			i32 Length { get => length; }
+
+			/// Adds the text.
+			Append(str text) : StringBuilder
+			{
+				i32 count = text.Length;
+				Reserve(count);
+				text.CopyTo(0, buffer, length, count);
+				length += count;
+				return this;
+			}
+
+			/// Adds one character (a UTF-16 code unit, as character literals are), in UTF-8.
+			Append(u16 unit) : StringBuilder
+			{
+				if (unit < 0x80)
+				{
+					if (length == buffer.Length)
+						Reserve(1);
+					buffer[length] = (u8)unit;
+					length++;
+					return this;
+				}
+				return AppendCodePoint(unit);
+			}
+
+			/// Adds one code point in UTF-8.
+			AppendCodePoint(u32 point) : StringBuilder
+			{
+				Reserve(4);
+				if (point < 0x80)
+				{
+					buffer[length] = (u8)point;
+					length++;
+				}
+				else if (point < 0x800)
+				{
+					buffer[length] = (u8)(0xC0 | point >> 6);
+					buffer[length + 1] = (u8)(0x80 | point & 0x3F);
+					length += 2;
+				}
+				else if (point < 0x10000)
+				{
+					u32 c = point >= 0xD800 && point <= 0xDFFF ? 0xFFFD : point;
+					buffer[length] = (u8)(0xE0 | c >> 12);
+					buffer[length + 1] = (u8)(0x80 | c >> 6 & 0x3F);
+					buffer[length + 2] = (u8)(0x80 | c & 0x3F);
+					length += 3;
+				}
+				else
+				{
+					buffer[length] = (u8)(0xF0 | point >> 18);
+					buffer[length + 1] = (u8)(0x80 | point >> 12 & 0x3F);
+					buffer[length + 2] = (u8)(0x80 | point >> 6 & 0x3F);
+					buffer[length + 3] = (u8)(0x80 | point & 0x3F);
+					length += 4;
+				}
+				return this;
+			}
+
+			/// Adds the number as text (written straight into the buffer).
+			Append(i64 value) : StringBuilder
+			{
+				u64 magnitude = value < 0 ? (u64)(-(value + 1)) + 1 : (u64)value;
+				i32 digits = Number.DigitCount(magnitude);
+				i32 sign = value < 0 ? 1 : 0;
+				Reserve(digits + sign);
+				if (sign == 1)
+					buffer[length] = 45;
+				length += digits + sign;
+				Number.WriteDigits(magnitude, buffer, length);
+				return this;
+			}
+
+			/// Adds the text and a line break.
+			AppendLine(str text) : StringBuilder
+			{
+				Append(text);
+				return Append((u16)10);
+			}
+
+			Clear() { length = 0; }
+
+			/// The buffer itself (its first Length bytes are the text; shared, not copied).
+			Bytes() : u8[] => buffer;
+
+			override ToString() : str
+			{
+				return new String<u8>(buffer, 0, length);
+			}
+	}
+}

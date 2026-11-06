@@ -1,0 +1,4 @@
+<Project>
+  <!-- The repository's settings only: FakeOpt is a plain console tool, not a test project (no TestProject.props). -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../..'))" />
+</Project>

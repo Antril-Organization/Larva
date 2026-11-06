@@ -1,0 +1,465 @@
+// Tasks: what async functions give, `await`, and the scheduler that runs them (one thread, taking turns); Task.Run runs
+// work on the thread pool, and its tasks finish there (what waits for them runs on the scheduler's thread).
+
+import System.Threading;
+
+into namespace System.Threading.Tasks
+{
+	/// Work that finishes later: an async function, a delay, several tasks together. In an async function, `await`
+	/// waits for one; elsewhere, `Wait()` runs the scheduler until it is done. A task finishes once: done, or failed
+	/// (`await` and `Wait()` then throw its error).
+	public class Task
+	{
+		/// 0 running, 1 done, 2 failed.
+		i32 state;
+		any? error;
+
+		/// The tasks waiting for this one: the first in a field (most tasks have one), the others in a list.
+		Task? waiter;
+		List<Task>? waiters;
+
+		public:
+			/// Done: what waits for it runs (in its turn).
+			Complete()
+			{
+				if (Scheduler.Threaded)
+				{
+					Finish(1, null);
+					return;
+				}
+				if (state != 0)
+					return;
+				state = 1;
+				Wake();
+			}
+
+			/// Failed with `failure`: what waits for it runs and finds the error.
+			Fail(any failure)
+			{
+				if (Scheduler.Threaded)
+				{
+					Finish(2, failure);
+					return;
+				}
+				if (state != 0)
+					return;
+				error = failure;
+				state = 2;
+				Wake();
+			}
+
+			/// Something this task waits for is done (an async function goes on from its `await`). The scheduler calls it.
+			virtual Run() { }
+
+		inherited:
+			/// An async function at an `await`: false when `awaited` is done (it goes on); otherwise this task runs again
+			/// once it is, and true (the function pauses).
+			Pause(Task awaited) : bool
+			{
+				if (awaited.state != 0)
+					return false;
+				awaited.AddWaiter(this);
+				return true;
+			}
+
+			AddWaiter(Task task)
+			{
+				if (Scheduler.Threaded)
+				{
+					Scheduler.Sync.Lock();
+					AddWaiterLocked(task);
+					Scheduler.Sync.Unlock();
+					return;
+				}
+				AddWaiterLocked(task);
+			}
+
+			AddWaiterLocked(Task task)
+			{
+				if (state != 0)
+				{
+					Scheduler.Ready(task);
+					return;
+				}
+				if (waiter is null)
+				{
+					waiter = task;
+					return;
+				}
+				List<Task> more = waiters ?? new List<Task>();
+				waiters = more;
+				more.Add(task);
+			}
+
+		/// Finishes it once threads complete tasks: under the scheduler's lock, and every waiting thread is told.
+		[NoInline]
+		Finish(i32 how, any? failure)
+		{
+			Scheduler.Sync.Lock();
+			if (state != 0)
+			{
+				Scheduler.Sync.Unlock();
+				return;
+			}
+			error = failure;
+			state = how;
+			Wake();
+			bool sleeping = Scheduler.Sleeping;
+			Scheduler.Sync.Unlock();
+			if (sleeping)
+				Scheduler.Changed.Broadcast();
+		}
+
+		[NoInline]
+		Wake()
+		{
+			if (waiter is Task first)
+			{
+				waiter = null;
+				Scheduler.Ready(first);
+			}
+			if (waiters is List<Task> more)
+			{
+				waiters = null;
+				loop (Task task in more)
+					Scheduler.Ready(task);
+			}
+		}
+
+		public:
+			/// Whether it has finished (done or failed).
+			bool IsCompleted { get => state != 0; }
+
+			/// Whether it failed.
+			bool IsFaulted { get => state == 2; }
+
+			/// Runs the scheduler until this task has finished (on another thread than the scheduler's: waits for it);
+			/// throws its error if it failed.
+			Wait()
+			{
+				if (state == 0)
+				{
+					if (Scheduler.Threaded && !Scheduler.OnItsThread())
+						Scheduler.BlockUntil(this);
+					else
+						Scheduler.RunUntil(this);
+				}
+				Check();
+			}
+
+			/// What `await` does once the task has finished: throws its error if it failed.
+			Check()
+			{
+				if (state == 2 && error is any failure)
+					throw failure;
+			}
+
+			/// A task done after `milliseconds` (measured by the scheduler, which sleeps when nothing else is ready).
+			static Delay(i32 milliseconds) : Task
+			{
+				Task task = new Task();
+				Scheduler.After(task, milliseconds);
+				return task;
+			}
+
+			/// A task done once the tasks ready now have had their turn: `await Task.Yield();` lets them run.
+			static Yield() : Task
+			{
+				Task task = new Task();
+				Scheduler.Soon(task);
+				return task;
+			}
+
+			/// A task done.
+			static Task CompletedTask { get => Done(); }
+
+			static Done() : Task
+			{
+				Task task = new Task();
+				task.state = 1;
+				return task;
+			}
+
+			/// A task done when every one of `tasks` has finished (failed if one of them failed: the first error).
+			static WhenAll(Task[] tasks) : Task
+			{
+				WhenAllTask all = new WhenAllTask(tasks);
+				all.Run();
+				return all;
+			}
+
+			/// Runs `body` on the thread pool: a task done when it returns (failed if it throws).
+			static Run(func body) : Task
+			{
+				Task task = new Task();
+				Scheduler.Started();
+				ThreadPool.QueueUserWorkItem(() =>
+				{
+					try
+					{
+						body();
+						task.Complete();
+					}
+					catch (any failure)
+					{
+						task.Fail(failure);
+					}
+					Scheduler.Finished();
+				});
+				return task;
+			}
+
+			/// Runs `body` on the thread pool: a task with what it returns.
+			static Run<T>(func : T body) : Task<T>
+			{
+				Task<T> task = new Task<T>();
+				Scheduler.Started();
+				ThreadPool.QueueUserWorkItem(() =>
+				{
+					try
+					{
+						task.SetResult(body());
+					}
+					catch (any failure)
+					{
+						task.Fail(failure);
+					}
+					Scheduler.Finished();
+				});
+				return task;
+			}
+	}
+
+	/// A task with a value: what an async function that returns one gives.
+	public class Task<T> : Task
+	{
+		inherited:
+			T result;
+
+		public:
+			/// Done with `value`.
+			SetResult(T value)
+			{
+				result = value;
+				Complete();
+			}
+
+			/// The value, once done (runs the scheduler until then; throws the error if it failed).
+			T Result { get { Wait(); return result; } }
+
+			/// What `await` gives once the task has finished: its value (or its error, thrown).
+			GetResult() : T
+			{
+				Check();
+				return result;
+			}
+
+			/// A task done with `value`.
+			static FromResult(T value) : Task<T>
+			{
+				Task<T> task = new Task<T>();
+				task.SetResult(value);
+				return task;
+			}
+	}
+
+	/// Waits for every task of a list: each one that finishes runs it, and it counts what is left.
+	final class WhenAllTask : Task
+	{
+		Task[] tasks;
+		i32 next;
+
+		public:
+			new(Task[] tasks) { this.tasks = tasks; }
+
+			override Run()
+			{
+				loop (next < tasks.Length)
+				{
+					Task task = tasks[next];
+					if (!task.IsCompleted)
+					{
+						AddWaiterTo(task);
+						return;
+					}
+					if (task.IsFaulted)
+					{
+						try { task.Check(); }
+						catch (any failure) { Fail(failure); return; }
+					}
+					next++;
+				}
+				Complete();
+			}
+
+			AddWaiterTo(Task task) { Pause(task); }
+	}
+
+	/// Runs tasks on this thread, one at a time: those ready (in order), then the timers that are due; when nothing is
+	/// ready it sleeps until the next timer.
+	public static class Scheduler
+	{
+		static List<Task> ready = new List<Task>();
+		static i32 first;
+		static List<Task> timers = new List<Task>();
+		static List<i64> due = new List<i64>();
+		/// Once Task.Run was used: tasks made ready on other threads (under Sync), and how many Task.Run bodies are running.
+		static bool threaded;
+		static Mutex sync = new Mutex();
+		static Condition changed = new Condition();
+		static List<Task> inbox = new List<Task>();
+		static i32 running;
+		/// Threads asleep on Changed (under Sync): a change wakes them only if there are some.
+		static i32 sleepers;
+
+		/// Sleeps on Changed (holding Sync).
+		Sleep()
+		{
+			sleepers++;
+			changed.Wait(sync);
+			sleepers--;
+		}
+
+		/// Moves what other threads made ready to the ready list.
+		[NoInline]
+		Drain()
+		{
+			sync.Lock();
+			loop (Task task in inbox)
+				ready.Add(task);
+			inbox.Clear();
+			sync.Unlock();
+		}
+
+		public:
+			static bool Threaded { get => threaded; }
+			static Mutex Sync { get => sync; }
+			static Condition Changed { get => changed; }
+
+			/// Whether a thread sleeps on Changed (read holding Sync).
+			static bool Sleeping { get => sleepers > 0; }
+
+			/// Whether the caller is the scheduler's thread (the program's first).
+			OnItsThread() : bool => Thread.CurrentId == 1;
+
+			/// Runs `task` in its turn (`Run()`). On another thread (holding Sync): it goes to the scheduler's inbox.
+			Ready(Task task)
+			{
+				if (threaded && !OnItsThread())
+					inbox.Add(task);
+				else
+					ready.Add(task);
+			}
+
+			/// A Task.Run body starts, and has finished.
+			Started()
+			{
+				sync.Lock();
+				threaded = true;
+				running++;
+				sync.Unlock();
+			}
+
+			Finished()
+			{
+				sync.Lock();
+				running--;
+				bool sleeping = sleepers > 0;
+				sync.Unlock();
+				if (sleeping)
+					changed.Broadcast();
+			}
+
+			/// Waits (another thread than the scheduler's) until `task` has finished.
+			BlockUntil(Task task)
+			{
+				loop (i32 spin = 0; spin < 1000 && !task.IsCompleted; spin++)
+					Thread.SpinWait(20);
+				loop (i32 spin = 0; spin < 32 && !task.IsCompleted; spin++)
+					Thread.Yield();
+				sync.Lock();
+				loop (!task.IsCompleted)
+					Sleep();
+				sync.Unlock();
+			}
+
+			/// Done in its turn (after what is ready now).
+			Soon(Task task) { ready.Add(new CompleteTask(task)); }
+
+			/// Done after `milliseconds`.
+			After(Task task, i32 milliseconds)
+			{
+				timers.Add(task);
+				due.Add(Environment.TickCount64 + milliseconds);
+			}
+
+			/// Runs ready tasks and timers until `task` has finished (or nothing is left that could finish it).
+			RunUntil(Task task)
+			{
+				loop (!task.IsCompleted)
+				{
+					if (threaded && inbox.Count > 0)
+						Drain();
+					if (first < ready.Count)
+					{
+						Task next = ready[first];
+						first++;
+						if (first == ready.Count)
+						{
+							ready.Clear();
+							first = 0;
+						}
+						next.Run();
+						continue;
+					}
+					if (threaded && timers.Count == 0)
+					{
+						// Nothing to run here: wait for another thread to finish something (a little actively first).
+						loop (i32 spin = 0; spin < 1000 && inbox.Count == 0 && !task.IsCompleted; spin++)
+							Thread.SpinWait(20);
+						loop (i32 spin = 0; spin < 32 && inbox.Count == 0 && !task.IsCompleted; spin++)
+							Thread.Yield();
+						sync.Lock();
+						loop (inbox.Count == 0 && !task.IsCompleted && running > 0)
+							Sleep();
+						bool stuck = inbox.Count == 0 && !task.IsCompleted;
+						sync.Unlock();
+						if (stuck)
+							throw new InvalidOperationError("Task.Wait: the task waits for something that never finishes");
+						continue;
+					}
+					if (timers.Count == 0)
+						throw new InvalidOperationError("Task.Wait: the task waits for something that never finishes");
+					Timers();
+				}
+			}
+
+		/// Completes the timers that are due; when none is, sleeps until the first one.
+		Timers()
+		{
+			i64 now = Environment.TickCount64;
+			i32 soonest = 0;
+			loop (i32 t = 1..timers.Count)
+			{
+				if (due[t] < due[soonest])
+					soonest = t;
+			}
+			if (due[soonest] > now)
+				Thread.Sleep((i32)(due[soonest] - now));
+			Task timer = timers[soonest];
+			timers.RemoveAt(soonest);
+			due.RemoveAt(soonest);
+			timer.Complete();
+		}
+	}
+
+	/// Completes a task in its turn (`Task.Yield()`).
+	final class CompleteTask : Task
+	{
+		Task target;
+
+		public:
+			new(Task target) { this.target = target; }
+			override Run() { target.Complete(); }
+	}
+}
