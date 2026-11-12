@@ -230,6 +230,63 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
         Check("an exe or a project without a version is not packed", Throws(() => HivePacker.Pack(project, library, packed, null, null), "packages are libraries"));
     }
 
+    // ── the cache ──
+
+    /// <summary>The cache never mixes two packages up because the file system would (case, trailing dots), and a lock pins bytes, not just a version number.</summary>
+    [Fact]
+    public void Cache_folders_tell_names_apart_and_locks_pin_bytes()
+    {
+        string root = hive.Root;
+        var (_, _, _, cache, locked) = hive.Registry.Value;
+        Check("names that Windows would fold are refused (trailing dot, device names)",
+            PackageReference.Parse("Acme./Json") is null && PackageReference.Parse("Acme/Json.") is null && PackageReference.Parse("CON/Json") is null && PackageReference.Parse("Acme/com1.x") is null
+            && PackageReference.Parse("Acme/Json.Net") is not null);
+        var upper = PackageReference.Parse("Acme/Json")!;
+        var lower = PackageReference.Parse("acme/json")!;
+        Check("names that differ in case get different folders (lower case plus a hash of the exact name)",
+            !string.Equals(cache.Folder(upper, "1.0.0"), cache.Folder(lower, "1.0.0"), StringComparison.OrdinalIgnoreCase)
+            && Path.GetFileName(Path.GetDirectoryName(cache.Folder(upper, "1.0.0")))!.StartsWith("json-", StringComparison.Ordinal)
+            && cache.Folder(upper, "1.0.0") == cache.Folder(PackageReference.Parse("Acme/Json")!, "1.0.0"),
+            cache.Folder(upper, "1.0.0"));
+        Check("installed packages are listed by their exact names", cache.Installed().Any(i => i.Package.Id == "T/B" && i.Version == "1.3.0") && cache.Installed().All(i => i.Package.Author == "T"),
+            string.Join(", ", cache.Installed().Select(i => $"{i.Package.Id} {i.Version}")));
+        Check("an installed version carries the hash of the file it came from", cache.Has(PackageReference.Parse("T/B")!, "1.3.0", locked.Find("T/B")!.Sha256)
+            && !cache.Has(PackageReference.Parse("T/B")!, "1.3.0", new string('0', 64)) && cache.Stamp(PackageReference.Parse("T/B")!, "9.9.9") is null);
+
+        string folder = Path.Combine(root, "pinned");
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "Main.ant"), "Main() : i32 => 0;");
+        File.WriteAllText(Path.Combine(folder, "Pinned.queen"), $"""
+            queen 1.0;
+
+            chunk PROJ:
+               name: Pinned
+
+            chunk BUILD:
+               stdlib: none
+
+            chunk DEPS:
+               package: T/B@^1.0
+
+            chunk HIVE:
+               provider: ../registry,
+               cache: "{cache.Root.Replace("\\", "/")}",
+               verify: hashes
+            """);
+        locked.Save(folder);
+        var diagnostics = new List<QueenDiagnostic>();
+        var project = QueenProject.Load(Path.Combine(folder, "Pinned.queen"), null, diagnostics, HiveResolver.Create());
+        Check("the pinned version is used when the cache holds the pinned file", project is not null && !diagnostics.Any(d => d.IsError) && project.Dependencies.Any(d => d.Name == "B"), string.Join("; ", diagnostics));
+
+        var tampered = locked with { Packages = [.. locked.Packages.Select(p => p.Package == "T/B" ? p with { Sha256 = new string('a', 64) } : p)] };
+        tampered.Save(folder);
+        diagnostics.Clear();
+        QueenProject.Load(Path.Combine(folder, "Pinned.queen"), null, diagnostics, HiveResolver.Create());
+        Check("a cached version that is not the file the lock pins is refused, pointing at `hive restore`",
+            diagnostics.Any(d => d.Code == "QN108" && d.IsError && d.Message.Contains("not the file hive.lock pins", StringComparison.Ordinal) && d.Message.Contains("hive restore", StringComparison.Ordinal)),
+            string.Join("; ", diagnostics));
+    }
+
     // ── helpers ──
 
     private static void Publish(HiveProvider provider, string root, string package, string version, HiveDependency[] dependencies, string? privatePem, string? publicKey)

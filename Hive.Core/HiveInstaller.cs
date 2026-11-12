@@ -117,8 +117,8 @@ namespace Hive
         {
             var entry = new HiveLockEntry(package.Id, version.Version, version.Sha256, version.Key, provider.Address, version.Dependencies);
             string folder = cache.Folder(package, version.Version);
-            string stamp = Path.Combine(folder, ".sha256");
-            if (cache.Project(package, version.Version) is not null && File.Exists(stamp) && File.ReadAllText(stamp).Trim() == version.Sha256)
+            string stamp = Path.Combine(folder, HiveCache.StampFile);
+            if (cache.Has(package, version.Version, version.Sha256))
                 return entry;
 
             log?.Invoke($"  fetching {package.Id} {version.Version} from {provider.Address}");
@@ -173,11 +173,19 @@ namespace Hive
             foreach (var package in packages)
             {
                 var versions = cache.Versions(package).Where(v => package.Version is null || package.Version.Accepts(VersionRange.Parse(v)!.Version)).ToList();
-                string? pinned = locked?.Find(package.Id)?.Version;
+                var pin = locked?.Find(package.Id);
+                string? pinned = pin?.Version;
                 string? version = pinned is not null && versions.Contains(pinned) ? pinned : versions.FirstOrDefault();
                 if (version is null || cache.Project(package, version) is not { } path)
                 {
                     diagnostics.Add(new QueenDiagnostic("QN108", $"package {package} is not installed: run `larva hive install`{(pinned is not null ? " (or `larva hive restore`)" : "")}",
+                        project.File, package.Line, package.Column));
+                    continue;
+                }
+                // The lock pins the bytes, not only the version: what the cache holds under that version must be that file.
+                if (pin is not null && version == pin.Version && !cache.Has(package, version, pin.Sha256))
+                {
+                    diagnostics.Add(new QueenDiagnostic("QN108", $"package {package.Id} {version} in the cache is not the file {HiveLock.FileName} pins: run `larva hive restore`",
                         project.File, package.Line, package.Column));
                     continue;
                 }
