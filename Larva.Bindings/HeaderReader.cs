@@ -144,7 +144,7 @@ namespace Larva.Bindings
             {
                 if (ResolveStruct(definition) is { } fields)
                     text.Append(definition.IsUnion ? "union " : "struct ").Append(definition.Name)
-                        .Append(!definition.IsUnion && definition.Pack is > 0 and < 8 ? $" pack {definition.Pack}" : "").Append(" { ").Append(string.Join("; ", fields.Select(f => $"{f.Type} {f.Name}"))).Append(" }\n");
+                        .Append(definition.Pack is > 0 and < 8 ? $" pack {definition.Pack}" : "").Append(" { ").Append(string.Join("; ", fields.Select(f => $"{f.Type} {f.Name}"))).Append(" }\n");
             }
             foreach (string function in functions)
                 text.Append(function).Append('\n');

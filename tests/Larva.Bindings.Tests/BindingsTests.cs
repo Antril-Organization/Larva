@@ -317,6 +317,32 @@ public sealed class BindingsTests : CheckedTest
             && BindingDescription.Layout("Tagged", parsed.Structs) == (16, 8) && BindingDescription.Layout("Small", parsed.Structs) == (2, 2) && BindingDescription.Layout("Pair", parsed.Structs) == (4, 2));
     }
 
+    /// <summary>A union under `#pragma pack` is packed like a struct: its alignment drops, and so does that of a struct holding it.</summary>
+    [Fact]
+    public void Unions_under_pragma_pack_keep_the_packing()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #pragma pack(push, 1)
+            typedef union { unsigned char c; unsigned int v; } PU;
+            typedef struct { unsigned char c; PU u; } PS;
+            #pragma pack(pop)
+            typedef struct { unsigned char c; PU u; } Natural;   /* the packed union keeps its alignment of 1 here */
+            typedef union { unsigned char c; unsigned int v; } NU;
+            void Use(PS* s, Natural* n, NU* u);
+            """, "lib.dll");
+        Log(description);
+        Check("`union PU pack 1`, the struct under the same pack, the union after the pop without one",
+            description.Contains("union PU pack 1 { u8 c; u32 v }\n") && description.Contains("struct PS pack 1 { u8 c; PU u }\n")
+            && description.Contains("union NU { u8 c; u32 v }\n") && description.Contains("Use(PS* s, Natural* n, NU* u)\n"));
+        var parsed = BindingDescription.Parse(description);
+        Check("layouts as C: PU 4/1, PS 5/1, Natural 5/1 (the packed union inside), NU 4/4",
+            BindingDescription.Layout("PU", parsed.Structs) == (4, 1) && BindingDescription.Layout("PS", parsed.Structs) == (5, 1)
+            && BindingDescription.Layout("Natural", parsed.Structs) == (5, 1) && BindingDescription.Layout("NU", parsed.Structs) == (4, 4),
+            $"{BindingDescription.Layout("PU", parsed.Structs)} {BindingDescription.Layout("Natural", parsed.Structs)}");
+        Check("the description's own text keeps the union's pack", parsed.ToText().Contains("union PU pack 1 {"), parsed.ToText());
+    }
+
     // ── SDL3 ──
 
     /// <summary>

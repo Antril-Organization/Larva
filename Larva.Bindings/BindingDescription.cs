@@ -320,7 +320,7 @@ namespace Larva.Bindings
             foreach (var s in Structs)
             {
                 Place(s.Namespace, null, s.File);
-                text.Append(s.IsUnion ? "union " : "struct ").Append(s.Name).Append(!s.IsUnion && s.Pack > 0 ? $" pack {s.Pack}" : "").Append(" { ")
+                text.Append(s.IsUnion ? "union " : "struct ").Append(s.Name).Append(s.Pack > 0 ? $" pack {s.Pack}" : "").Append(" { ")
                     .Append(string.Join("; ", s.Fields.Select(f => $"{f.Type} {f.Name}"))).Append(" }\n");
             }
             foreach (var c in Constants)
