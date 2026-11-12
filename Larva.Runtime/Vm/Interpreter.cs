@@ -47,9 +47,12 @@ namespace Larva.Runtime.Vm
         public int Barriers { get; internal set; }
         public int Pins { get; internal set; }
 
+        /// <summary>Turn handoffs between threads at safepoints (not the ones made to wait in the runtime).</summary>
+        public int Turns { get; internal set; }
+
         public override string ToString() =>
             $"steps {Steps}, calls {Calls}, safepoints {Safepoints}, collections {Collections} (reclaimed {Reclaimed}), " +
-            $"retain/release {Retains}/{Releases}, barriers {Barriers}, pins {Pins}";
+            $"retain/release {Retains}/{Releases}, barriers {Barriers}, pins {Pins}, turns {Turns}";
     }
 
     /// <summary>

@@ -193,6 +193,81 @@ public sealed class InterpreterTests : CheckedTest
     }
 
     [Fact]
+    public void Threads_keep_the_turn_for_a_slice_while_others_spin()
+    {
+        // Four workers spin on a flag (each poll is a safepoint) while the main thread counts to 20000; then it sets the
+        // flag, waits on a condition until every worker has reported under the lock, and joins them. Handing the turn over
+        // at every safepoint would make every one of main's polls a host context switch (the shape of a thread pool whose
+        // workers spin for work): the slice keeps the handoffs to a small fraction of the safepoints.
+        var i32Ptr = IrType.PtrMut(IrType.I32);
+        var envStruct = new StructDef("Env", i32Ptr, i32Ptr, IrType.I64, IrType.I64); // flag, done, mutex, cond
+        var env = IrType.Struct(0);
+        var envPtr = IrType.PtrMut(env);
+        var opaque = IrType.Ptr(IrType.Unit);
+        var unit = IrType.Unit;
+
+        var worker = new FunctionBuilder("spinner", unit) { Unsafe = true };
+        int arg = worker.Argument(opaque, "env");
+        int we = worker.Local(envPtr, "e");
+        int seen = worker.Local(IrType.I32, "seen", mutable: true);
+        int wc = worker.Temp(IrType.Bool);
+        int u1 = worker.Temp(unit), u2 = worker.Temp(unit), u3 = worker.Temp(unit);
+        int old = worker.Temp(IrType.I32);
+        int spin = worker.NewBlock(), report = worker.NewBlock();
+        worker.Assign(we, Rvalue.Cast(Copy(arg), envPtr)).Goto(spin);
+        worker.At(spin).Assign(seen, new IntrinsicRvalue("atomic.load.i32", [Copy(new Place(we).Deref().Field(0))]))
+              .Assign(wc, Rvalue.Binary(BinaryOp.Eq, Copy(seen), Int(0))).If(Move(wc), spin, report);
+        worker.At(report).Assign(u1, new IntrinsicRvalue("mutex.lock", [Copy(new Place(we).Deref().Field(2))]))
+              .Assign(old, new IntrinsicRvalue("atomic.add.i32", [Copy(new Place(we).Deref().Field(1)), Int(1)]))
+              .Assign(u2, new IntrinsicRvalue("cond.signal", [Copy(new Place(we).Deref().Field(3))]))
+              .Assign(u3, new IntrinsicRvalue("mutex.unlock", [Copy(new Place(we).Deref().Field(2))]))
+              .Return();
+
+        var main = new FunctionBuilder("spin_main", IrType.I32) { Unsafe = true };
+        int e = main.Local(env, "e", mutable: true);
+        int p = main.Local(envPtr, "p");
+        int flag = main.Local(i32Ptr, "flag"), done = main.Local(i32Ptr, "done");
+        int code = main.Local(new FunctionType([opaque], unit), "code");
+        int handle = main.Local(opaque, "handle");
+        int[] threads = [main.Local(IrType.I64, "t0"), main.Local(IrType.I64, "t1"), main.Local(IrType.I64, "t2"), main.Local(IrType.I64, "t3")];
+        int i = main.Local(IrType.I32, "i", mutable: true);
+        int d = main.Local(IrType.I32, "d", mutable: true);
+        int mc = main.Temp(IrType.Bool), wc2 = main.Temp(IrType.Bool);
+        int mu1 = main.Temp(unit), mu2 = main.Temp(unit), mu3 = main.Temp(unit);
+        int joined = main.Local(IrType.I64, "joined", mutable: true), woken = main.Local(IrType.I64, "woken", mutable: true);
+        int count = main.NewBlock(), countBody = main.NewBlock(), release = main.NewBlock(), check = main.NewBlock(), wait = main.NewBlock(), finish = main.NewBlock();
+        main.Assign(flag, Rvalue.Alloc(Int(0))).Assign(done, Rvalue.Alloc(Int(0)))
+            .Assign(new Place(e).Field(0), Copy(flag)).Assign(new Place(e).Field(1), Copy(done))
+            .Assign(new Place(e).Field(2), new IntrinsicRvalue("mutex.new", []))
+            .Assign(new Place(e).Field(3), new IntrinsicRvalue("cond.new", []))
+            .Assign(p, Rvalue.Alloc(Move(e)))
+            .Assign(code, Rvalue.FunctionRef(0))
+            .Assign(handle, Rvalue.Cast(Copy(p), opaque));
+        foreach (int t in threads)
+            main.Assign(t, new IntrinsicRvalue("thread.start", [Copy(code), Copy(handle)]));
+        main.Assign(i, Int(0)).Goto(count);
+        main.At(count).Assign(mc, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(20_000))).If(Move(mc), countBody, release);
+        main.At(countBody).Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1))).Goto(count);
+        main.At(release).Assign(mu1, new IntrinsicRvalue("atomic.store.i32", [Copy(flag), Int(1)]))
+            .Assign(mu2, new IntrinsicRvalue("mutex.lock", [Copy(new Place(p).Deref().Field(2))]))
+            .Goto(check);
+        main.At(check).Assign(d, new IntrinsicRvalue("atomic.load.i32", [Copy(done)]))
+            .Assign(wc2, Rvalue.Binary(BinaryOp.Lt, Copy(d), Int(threads.Length))).If(Move(wc2), wait, finish);
+        main.At(wait).Assign(woken, new IntrinsicRvalue("cond.wait", [Copy(new Place(p).Deref().Field(3)), Copy(new Place(p).Deref().Field(2)), Int(-1, IrType.I64)]))
+            .Goto(check);
+        main.At(finish).Assign(mu3, new IntrinsicRvalue("mutex.unlock", [Copy(new Place(p).Deref().Field(2))]));
+        foreach (int t in threads)
+            main.Assign(joined, new IntrinsicRvalue("thread.join", [Copy(t), Int(-1, IrType.I64)]));
+        main.Free(p).Free(flag).Free(done).Assign(FunctionBuilder.ReturnPlace, Copy(d)).Return();
+
+        var vm = Vm(new IrModule([envStruct], [worker.Build(), main.Build()]));
+        Check("spin_main() = 4: every worker reported", Equal(vm.Run("spin_main"), 4L), vm.Stats.ToString());
+        Check("turn handoffs are a small fraction of the safepoints (a slice per turn, not a handoff per safepoint)",
+            vm.Stats.Turns > 0 && vm.Stats.Turns * 50 < vm.Stats.Safepoints, vm.Stats.ToString());
+        Check("the environment was freed", Leaks(vm) == 0);
+    }
+
+    [Fact]
     public void Deep_recursion_runs_without_the_host_stack_and_the_depth_limit_is_a_vm_error()
     {
         // fn deep(n: i32) -> i32 { if n == 0 { 0 } else { deep(n - 1) + 1 } }
