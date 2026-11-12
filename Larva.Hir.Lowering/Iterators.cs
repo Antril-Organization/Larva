@@ -84,12 +84,8 @@ namespace Larva.Hir.Lowering
                 HirLowerer.DeclareGenerics(pause, plan.Generics);
                 pause.Argument(handle, "task", mutable: false);
                 pause.Return();
-                lock (lowerer.Functions)
-                {
-                    lowerer.Functions.Add(suspend.Build());
-                    iteratorPause = lowerer.Functions.Count;
-                    lowerer.Functions.Add(Awaiting(pause.Build()));
-                }
+                lowerer.AddFunction(suspend.Build());
+                iteratorPause = lowerer.AddFunction(Awaiting(pause.Build()));
                 return;
             }
             // Async: pause unless the awaited task is done (Task.Pause registers the frame to run again).
@@ -103,8 +99,7 @@ namespace Larva.Hir.Lowering
             suspend.Assign(asTask, Rvalue.HandleCast(Operand.Copy(frame), pauseThis))
                    .Call(pauseFunction, [Operand.Copy(asTask), Operand.Copy(awaited)], FunctionBuilder.ReturnPlace, done);
             suspend.At(done).Return();
-            lock (lowerer.Functions)
-                lowerer.Functions.Add(suspend.Build());
+            lowerer.AddFunction(suspend.Build());
         }
 
         private static IrFunction Awaiting(IrFunction function) =>
@@ -174,12 +169,7 @@ namespace Larva.Hir.Lowering
             f.Assign(receiver, Rvalue.HandleCast(Operand.Copy(argument), thisType))
              .Call(function, a.Type == H.HirType.Void ? [] : [resultType], [Operand.Copy(receiver)], FunctionBuilder.ReturnPlace, done);
             f.At(done).Return();
-            int index;
-            lock (lowerer.Functions)
-            {
-                index = lowerer.Functions.Count;
-                lowerer.Functions.Add(Awaiting(f.Build()));
-            }
+            int index = lowerer.AddFunction(Awaiting(f.Build()));
             Emit(index, OwnTypeArguments, [Operand.Copy(awaitedTask)], target);
         }
 

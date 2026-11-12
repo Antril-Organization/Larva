@@ -37,7 +37,7 @@ namespace Larva.Hir.Lowering
             try
             {
                 var function = new BodyLowerer(this, plan, info, method).Lower();
-                lock (Functions)
+                lock (Sync)
                     Functions[plan.Function] = function;
             }
             catch (LoweringException e)
@@ -47,7 +47,7 @@ namespace Larva.Hir.Lowering
                 DeclareGenerics(empty, plan.Generics);
                 empty.Unreachable();
                 var built = empty.Build();
-                lock (Functions)
+                lock (Sync)
                     Functions[plan.Function] = built;
             }
         }
@@ -1321,7 +1321,7 @@ namespace Larva.Hir.Lowering
 
         // ── Expressions ────────────────────────────────────
 
-        private IrModule Module => moduleView ??= new IrModule([.. lowerer.Structs], []);
+        private IrModule Module => moduleView ??= lowerer.StructsView();
         private IrModule? moduleView;
 
         /// <summary>Evaluates for its effects only.</summary>
@@ -1504,7 +1504,7 @@ namespace Larva.Hir.Lowering
         private void CopyFields(Place target, Place source, StructType type)
         {
             b.Assign(target, Rvalue.ZeroFiller(type));
-            var fields = lowerer.Structs[type.Id].Fields;
+            var fields = lowerer.Struct(type.Id).Fields;
             for (int f = 0; f < fields.Length; f++)
             {
                 var fieldType = fields[f].Substitute(type.Arguments);
@@ -1518,7 +1518,7 @@ namespace Larva.Hir.Lowering
         /// <summary>Whether values of <paramref name="type"/> are copied field by field (value types holding objects).</summary>
         private bool FieldCopied(IrType type)
         {
-            if (type is not StructType st || lowerer.Structs[st.Id].Mutable)
+            if (type is not StructType st || lowerer.Struct(st.Id).Mutable)
                 return false;
             if (copied.TryGetValue(type, out bool known))
                 return known;
@@ -2363,7 +2363,7 @@ namespace Larva.Hir.Lowering
             var target = Of(to);
             if (source is null || target is null)
                 return false;
-            for (StructType? s = source; s is not null; s = lowerer.Structs[s.Id].Base)
+            for (StructType? s = source; s is not null; s = lowerer.Struct(s.Id).Base)
             {
                 if (s.Id == target.Id)
                     return false;
@@ -2868,7 +2868,7 @@ namespace Larva.Hir.Lowering
             Emit(lowerer.MethodFunctions[H.MemberToken.Def(info.Index, lengthMethod)], typeArguments, [.. held.Select(h => Operand.Copy(h))], new Place(length));
             if (lowerer.ExternalOrigin(info) is { } externalOrigin)
                 throw new LoweringException(HirLowerer.CrossingError($"`{info.Name}`", externalOrigin, "its objects live in that domain's collector and cannot be made here"));
-            var element = ((IR.ArrayType)lowerer.Structs[structType.Id].Fields[^1]).Element.Substitute(typeArguments);
+            var element = ((IR.ArrayType)lowerer.Struct(structType.Id).Fields[^1]).Element.Substitute(typeArguments);
             int handle = Temp(type);
             int vt = Temp(HirLowerer.VtablePointer(IrType.Struct(info.Vtable, typeArguments)));
             b.Assign(handle, new ArrayRvalue(lowerer.ObjectAlloc, element, Operand.Copy(length)) { Owner = structType });

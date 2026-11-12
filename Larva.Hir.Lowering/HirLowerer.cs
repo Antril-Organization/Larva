@@ -80,11 +80,70 @@ namespace Larva.Hir.Lowering
         internal readonly LoweringOptions Options;
         private readonly List<LoweringError> errors = [];
 
+        /// <summary>
+        /// The module's tables. Body lowering runs on several threads (<see cref="LoweringOptions.Parallel"/>), and the
+        /// helpers that bodies share (lambdas, display structs, iterator steps, imports, boxes, literals…) add to these
+        /// tables and to the memo dictionaries that index them while it runs: every such addition, and every read of a
+        /// table during it, holds <see cref="Sync"/>. One lock for all of them (never one per table) means there is no
+        /// lock order to get wrong: a helper that adds a function while another holds the lock for a literal just
+        /// re-enters it. <see cref="errors"/> has its own lock and takes nothing else while holding it.
+        /// </summary>
+        internal readonly object Sync = new();
         internal readonly List<StructDef> Structs = [];
         internal readonly List<IrFunction?> Functions = [];
         internal readonly List<GlobalDef> Globals = [];
         internal readonly List<StaticData> Data = [];
         internal readonly List<Implementation> Implementations = [];
+
+        /// <summary>A struct's definition, read under <see cref="Sync"/> (bodies on other threads may be adding structs).</summary>
+        internal StructDef Struct(int id)
+        {
+            lock (Sync)
+                return Structs[id];
+        }
+
+        /// <summary>A module over the structs declared so far (for type queries), taken under <see cref="Sync"/>.</summary>
+        internal IrModule StructsView()
+        {
+            lock (Sync)
+                return new IrModule([.. Structs], []);
+        }
+
+        internal int AddStruct(StructDef def)
+        {
+            lock (Sync)
+            {
+                Structs.Add(def);
+                return Structs.Count - 1;
+            }
+        }
+
+        internal int AddFunction(IrFunction function)
+        {
+            lock (Sync)
+            {
+                Functions.Add(function);
+                return Functions.Count - 1;
+            }
+        }
+
+        internal int AddGlobal(GlobalDef def)
+        {
+            lock (Sync)
+            {
+                Globals.Add(def);
+                return Globals.Count - 1;
+            }
+        }
+
+        internal int AddData(StaticData data)
+        {
+            lock (Sync)
+            {
+                Data.Add(data);
+                return Data.Count - 1;
+            }
+        }
 
         /// <summary>The root header struct and its vtable struct.</summary>
         internal int ObjectStruct, ObjectVtable;
@@ -1383,18 +1442,17 @@ namespace Larva.Hir.Lowering
         /// <summary>The static data of a literal's code units in <paramref name="unit"/> (UTF-8, UTF-16 or UTF-32), each once.</summary>
         internal int StringData(string text, H.Primitive unit = H.Primitive.U16)
         {
-            lock (Data)
+            lock (Sync)
             {
                 if (!literalData.TryGetValue((text, unit), out int index))
                 {
-                    index = Data.Count;
                     IEnumerable<System.Numerics.BigInteger> units = unit switch
                     {
                         H.Primitive.U8 => System.Text.Encoding.UTF8.GetBytes(text).Select(b => new System.Numerics.BigInteger(b)),
                         H.Primitive.U32 => text.EnumerateRunes().Select(r => new System.Numerics.BigInteger(r.Value)),
                         _ => text.Select(c => new System.Numerics.BigInteger(c)),
                     };
-                    Data.Add(new StaticData(Primitive(unit), [.. units]));
+                    index = AddData(new StaticData(Primitive(unit), [.. units]));
                     literalData[(text, unit)] = index;
                 }
                 return index;
@@ -1409,21 +1467,16 @@ namespace Larva.Hir.Lowering
         /// <summary>Static data for a constant array literal (a resource's bytes): its index.</summary>
         internal int ConstantData(H.Primitive unit, IEnumerable<System.Numerics.BigInteger> values)
         {
-            lock (Data)
-            {
-                Data.Add(new StaticData(Primitive(unit), [.. values]));
-                return Data.Count - 1;
-            }
+            return AddData(new StaticData(Primitive(unit), [.. values]));
         }
 
         internal int LiteralGlobal(string text, H.Primitive unit, IrType type)
         {
-            lock (Globals)
+            lock (Sync)
             {
                 if (!literalGlobals.TryGetValue((text, unit), out int index))
                 {
-                    index = Globals.Count;
-                    Globals.Add(new GlobalDef($"$literal{index}", type));
+                    index = AddGlobal(new GlobalDef($"$literal{Globals.Count}", type));
                     literalGlobals[(text, unit)] = index;
                 }
                 return index;
@@ -1433,7 +1486,7 @@ namespace Larva.Hir.Lowering
         /// <summary><c>$units(&amp;[T]) -&gt; gc [T]</c>: a new array with a literal's units (the string takes it).</summary>
         internal int StringUnits(H.Primitive unit = H.Primitive.U16)
         {
-            lock (Data)
+            lock (Sync)
             {
                 if (stringUnits.TryGetValue(unit, out int existing))
                     return existing;
@@ -1467,13 +1520,7 @@ namespace Larva.Hir.Lowering
                  .Assign(moved, new IntrinsicRvalue("mem.copy", [Operand.Copy(target), Operand.Copy(from), Operand.Copy(count)]))
                  .Goto(done);
                 b.At(done).Assign(FunctionBuilder.ReturnPlace, Operand.Copy(made)).Return();
-                var built = b.Build();
-                int function;
-                lock (Functions)
-                {
-                    function = Functions.Count;
-                    Functions.Add(built);
-                }
+                int function = AddFunction(b.Build());
                 stringUnits[unit] = function;
                 return function;
             }

@@ -72,7 +72,7 @@ namespace Larva.Hir.Lowering
             int table = Temp(tableType);
             b.Unsafe = true;
             b.Assign(table, Rvalue.Unwrap(Operand.Copy(found)));
-            var fieldType = lowerer.Structs[itable.Struct].Fields[slot].Substitute(arguments);
+            var fieldType = lowerer.Struct(itable.Struct).Fields[slot].Substitute(arguments);
             int function = Temp(fieldType);
             b.Assign(function, Operand.Copy(new Place(table).Deref().Field(slot)));
             var operands = new List<Operand> { Operand.Copy(receiver) };
