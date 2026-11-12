@@ -178,6 +178,34 @@ public sealed unsafe class LlvmTests : CheckedTest
         }
     }
 
+    /// <summary>
+    /// A caught exception reaches its handler through the handling frame's own slots (<c>llvm.localescape</c> in the frame,
+    /// <c>llvm.localrecover</c> in the filter), never a process-wide global: with one, two threads throwing at the same time
+    /// each got the other's exception about half the time. Flag exceptions (POSIX) keep the exception in flight per thread;
+    /// WebAssembly, without threads, keeps the plain globals its host reads.
+    /// </summary>
+    [Fact]
+    public void Exceptions_travel_through_the_handling_frame_not_globals()
+    {
+        var module = RuntimeFeaturePrograms.ExceptionModule();
+        using (var program = Compile(module, optimize: 0))
+        {
+            string ir = program.IrText;
+            Check("no process-wide exception slots", !ir.Contains("larva.eh.payload") && !ir.Contains("larva.eh.type"));
+            Check("filters store into the frame they handle for", ir.Contains("@llvm.eh.recoverfp(") && ir.Contains("@llvm.localrecover("));
+            Check("a filter is the handling function's own", ir.Contains("@larva.filter.caller."));
+            Check("the handling frame escapes its slots", Extract(ir, "define", "@caller(", 200).Contains("@llvm.localescape("));
+            using var jit = program.Jit();
+            Check("caller(-3) = 3 through the frame's slots", ((delegate* unmanaged<int, int>)jit.Address("caller"))(-3) == 3);
+            Check("caller2(-4) = 96: resume re-raises what the frame took", ((delegate* unmanaged<int, int>)jit.Address("caller2"))(-4) == 96);
+        }
+
+        string linux = Ir(module, LlvmBackend.LinuxX64);
+        Check("Linux: one exception in flight per thread", linux.Contains("thread_local") && linux.Contains("@larva_exception"));
+        string wasm = Ir(module, LlvmBackend.Wasm64);
+        Check("WebAssembly: the host reads plain globals", !wasm.Contains("thread_local") && wasm.Contains("@larva_exception"));
+    }
+
     /// <summary>Tracing collection with stack maps, under GC stress (a collection at every safepoint).</summary>
     [Fact]
     public void Tracing_gc_finds_roots_through_stack_maps()
@@ -436,6 +464,16 @@ public sealed unsafe class LlvmTests : CheckedTest
     }
 
     private static Interpreter Vm(IrModule module) => new(Compiler.Compile(module).Il!);
+
+    /// <summary>The LLVM IR of <paramref name="module"/> for another target (not run).</summary>
+    private static string Ir(IrModule module, string triple)
+    {
+        var result = LlvmBackend.Compile(module, new LlvmOptions { Compilation = CompilationOptions.Default, OptimizationLevel = 0, Triple = triple });
+        if (!result.Success)
+            throw new InvalidOperationException(result.ToString());
+        using var program = result.Program!;
+        return program.IrText;
+    }
 
     /// <summary>The lines of <paramref name="text"/> from the first line containing both markers.</summary>
     private static string Extract(string text, string marker, string? also, int maxLines = 30)

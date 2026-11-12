@@ -5878,7 +5878,7 @@ static int run_thread_code(LarvaThread *me) {
     }
 }
 #else
-extern void *larva_exception;
+extern THREAD_LOCAL void *larva_exception;
 
 static int run_thread_code(LarvaThread *me) {
     me->code(me->env);
@@ -7054,9 +7054,9 @@ static int run(EntryFn entry, EntryF64Fn entry_f64, int64_t *arguments, int kind
     }
 }
 #else
-/* The exception in flight, set by compiled code (which also defines these, weakly). */
-LARVA_API void *larva_exception;
-LARVA_API int64_t larva_exception_type;
+/* The exception in flight, set by compiled code (which also defines these, weakly): one per thread. */
+LARVA_API THREAD_LOCAL void *larva_exception;
+LARVA_API THREAD_LOCAL int64_t larva_exception_type;
 
 static int run(EntryFn entry, EntryF64Fn entry_f64, int64_t *arguments, int kind, int64_t *result, double *real) {
     if (kind == 4)
