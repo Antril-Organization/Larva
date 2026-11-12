@@ -4693,27 +4693,35 @@ LARVA_API int64_t larva_read_line(void) {
     if (GetConsoleMode(in, &mode)) {
         /* A console gives UTF-16 itself. */
         int any = 0;
+        int64_t result = -1;
+        BLOCKING_ENTER();
         for (;;) {
             wchar_t unit;
             DWORD read = 0;
-            if (!ReadConsoleW(in, &unit, 1, &read, NULL) || read == 0)
-                return any ? input_line.length : -1;
+            if (!ReadConsoleW(in, &unit, 1, &read, NULL) || read == 0) {
+                result = any ? input_line.length : -1;
+                goto console_done;
+            }
             any = 1;
             if (unit == L'\n')
                 break;
             if (unit == 0x1A && input_line.length == 0)
-                return -1; /* Ctrl+Z */
+                goto console_done; /* Ctrl+Z */
             units_add(&input_line, (uint16_t)unit);
         }
         if (input_line.length > 0 && input_line.units[input_line.length - 1] == '\r')
             input_line.length--;
-        return input_line.length;
+        result = input_line.length;
+    console_done:
+        blocking_leave();
+        return result;
     }
 #endif
     static unsigned char *bytes;
     static size_t capacity;
     size_t count = 0;
     int c, any = 0;
+    BLOCKING_ENTER();
     while ((c = getchar()) != EOF) {
         any = 1;
         if (c == '\n')
@@ -4728,6 +4736,7 @@ LARVA_API int64_t larva_read_line(void) {
         }
         bytes[count++] = (unsigned char)c;
     }
+    blocking_leave();
     if (!any)
         return -1;
     if (count > 0 && bytes[count - 1] == '\r')
@@ -4833,16 +4842,13 @@ static char *io_text(const int64_t *text) {
 #endif
 
 /* Reads the whole file into the runtime's buffer: its size, or -1. */
-LARVA_API int64_t larva_file_read(const int64_t *path) {
-    file_size = 0;
 #ifdef _WIN32
-    wchar_t *name = io_text(path);
-    FILE *file = name ? _wfopen(name, L"rb") : NULL;
+static int64_t file_read_blocking(const wchar_t *name) {
+    FILE *file = _wfopen(name, L"rb");
 #else
-    char *name = io_text(path);
-    FILE *file = name ? fopen(name, "rb") : NULL;
+static int64_t file_read_blocking(const char *name) {
+    FILE *file = fopen(name, "rb");
 #endif
-    free(name);
     if (!file)
         return -1;
     /* The size first, then one read into a buffer that large (it doubles if the file grows meanwhile). */
@@ -4888,6 +4894,23 @@ LARVA_API int64_t larva_file_read(const int64_t *path) {
     return file_size;
 }
 
+LARVA_API int64_t larva_file_read(const int64_t *path) {
+    file_size = 0;
+#ifdef _WIN32
+    wchar_t *name = io_text(path);
+#else
+    char *name = io_text(path);
+#endif
+    if (!name)
+        return -1;
+    /* Opening and reading may wait (a slow disk, a network path): a collection goes on meanwhile. */
+    BLOCKING_ENTER();
+    int64_t result = file_read_blocking(name);
+    blocking_leave();
+    free(name);
+    return result;
+}
+
 /* Copies the file read last into a u8[] (its length, then the bytes). */
 LARVA_API void larva_file_take(int64_t *bytes) {
     int64_t count = bytes[0] < file_size ? bytes[0] : file_size;
@@ -4907,8 +4930,10 @@ LARVA_API int64_t larva_file_write(const int64_t *path, const int64_t *bytes, in
     free(name);
     if (!file)
         return -1;
+    BLOCKING_ENTER();
     size_t written = bytes[0] > 0 ? fwrite(bytes + 1, 1, (size_t)bytes[0], file) : 0;
     int closed = fclose(file);
+    blocking_leave();
     return written == (size_t)bytes[0] && closed == 0 ? 0 : -1;
 }
 
@@ -5226,7 +5251,10 @@ LARVA_API int64_t larva_net_connect(const int64_t *host, int64_t port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    if (GetAddrInfoW(name, wservice, &hints, &found) != 0) { free(name); return -1; }
+    BLOCKING_ENTER();  /* resolving the name waits on the network too */
+    int unresolved = GetAddrInfoW(name, wservice, &hints, &found) != 0;
+    blocking_leave();
+    if (unresolved) { free(name); return -1; }
     BLOCKING_ENTER();
     for (ADDRINFOW *a = found; a; a = a->ai_next) {
         s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -5247,7 +5275,10 @@ LARVA_API int64_t larva_net_connect(const int64_t *host, int64_t port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    if (getaddrinfo(name, service, &hints, &found) != 0) { free(name); return -1; }
+    BLOCKING_ENTER();  /* resolving the name waits on the network too */
+    int unresolved = getaddrinfo(name, service, &hints, &found) != 0;
+    blocking_leave();
+    if (unresolved) { free(name); return -1; }
     BLOCKING_ENTER();
     for (struct addrinfo *a = found; a; a = a->ai_next) {
         s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -5576,7 +5607,9 @@ LARVA_API int64_t larva_stream_read(int64_t handle, int64_t *bytes, int64_t offs
         fflush(stdout);
     else
         fseek(file, 0, SEEK_CUR); /* a read may follow a write */
+    BLOCKING_ENTER();  /* the standard input waits for the user; a file for the disk */
     size_t read = fread((uint8_t *)(bytes + 1) + offset, 1, (size_t)count, file);
+    blocking_leave();
     return read == 0 && ferror(file) ? -1 : (int64_t)read;
 }
 
@@ -5606,7 +5639,9 @@ LARVA_API int64_t larva_stream_write(int64_t handle, const int64_t *bytes, int64
         return -1;
     if (handle >= 3)
         fseek(file, 0, SEEK_CUR); /* a write may follow a read */
+    BLOCKING_ENTER();
     size_t written = fwrite((const uint8_t *)(bytes + 1) + offset, 1, (size_t)count, file);
+    blocking_leave();
     return written == (size_t)count ? (int64_t)written : -1;
 }
 
@@ -6281,12 +6316,20 @@ LARVA_API int64_t larva_process_run(const int64_t *command) {
     fflush(stderr);
 #ifdef _WIN32
     wchar_t *line = io_text(command);
-    int code = line ? _wsystem(line) : -1;
+    if (!line)
+        return -1;
+    BLOCKING_ENTER();  /* the command runs as long as it takes */
+    int code = _wsystem(line);
+    blocking_leave();
     free(line);
     return code;
 #else
     char *line = io_text(command);
-    int status = line ? system(line) : -1;
+    if (!line)
+        return -1;
+    BLOCKING_ENTER();
+    int status = system(line);
+    blocking_leave();
     free(line);
     return status == -1 ? -1 : WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif

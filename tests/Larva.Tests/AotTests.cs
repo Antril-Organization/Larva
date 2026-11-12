@@ -270,6 +270,29 @@ public sealed unsafe class AotTests : CheckedTest
             $"exit {exit}: {output.Trim()} {errors.Trim()}");
     }
 
+    /// <summary>
+    /// A thread blocked in a read of the standard input must not hold up the collections of the other threads: the
+    /// runtime's blocking calls (console and file reads and writes, name resolution, a command) leave managed code around
+    /// the wait, as sleeping, joining and the socket calls already did. The reader never gets its line: before the fix the
+    /// first collection waited for it forever (the test's input stays open and the process is killed after the timeout).
+    /// </summary>
+    [Fact]
+    public void Llvm_a_thread_blocked_reading_input_does_not_stop_collections()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.BlockedReaderProgram() with { Name = "reader" }, "reader.lvo");
+        string exe = Path.Combine(Directory, "reader-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "read_blocked", "-o", exe, program);
+        Check("llvm: larva native --exe --entry read_blocked", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, ["2000000"], stats: true, holdInput: true, timeout: 30_000);
+        Check("llvm: reader.exe 2000000 = 2000000 with a thread blocked in read.line: the main thread's collections went on and it finished",
+            exit == 0 && output.Trim() == "2000000" && Regex.IsMatch(errors, @"collections [1-9]\d* \(") && errors.Contains("errors 0"),
+            $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)
@@ -283,9 +306,10 @@ public sealed unsafe class AotTests : CheckedTest
     }
 
     private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false, int nursery = 0,
-        bool generations = true, bool verify = false)
+        bool generations = true, bool verify = false, bool holdInput = false, int timeout = 60_000)
     {
-        var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        // holdInput: the standard input is a pipe that stays open (a read of it blocks) until the process ends or the timeout kills it.
+        var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = holdInput, UseShellExecute = false };
         foreach (var argument in arguments ?? [])
             start.ArgumentList.Add(argument);
         if (stress)
@@ -300,9 +324,18 @@ public sealed unsafe class AotTests : CheckedTest
             start.Environment["LARVA_GC_VERIFY"] = "1";
         using var process = Process.Start(start)!;
         var errors = process.StandardError.ReadToEndAsync();
-        string output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit(60_000);
-        return (process.ExitCode, output, errors.Result);
+        var output = process.StandardOutput.ReadToEndAsync();
+        if (!process.WaitForExit(timeout))
+        {
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit();
+            if (holdInput)
+                process.StandardInput.Close();
+            return (-1, output.Result, errors.Result + $" [killed after {timeout} ms]");
+        }
+        if (holdInput)
+            process.StandardInput.Close();
+        return (process.ExitCode, output.Result, errors.Result);
     }
 
     /// <summary>larva with LARVA_DIAGNOSTICS (the programs run under LARVA_GC_STRESS and print LARVA_STATS).</summary>
