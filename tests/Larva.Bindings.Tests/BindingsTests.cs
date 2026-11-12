@@ -308,6 +308,43 @@ public sealed class BindingsTests : CheckedTest
             withoutTypedefs.Contains("A(u8* s) : i32\n") && withoutTypedefs.Contains("B(str? s) : i32\n") && withoutTypedefs.Contains("C(u16* s) : i32\n") && withoutTypedefs.Contains("D(String<u16>? s) : i32\n"), withoutTypedefs);
     }
 
+    /// <summary>`__attribute__((packed))` packs; `aligned(n)` and `__declspec(align(n))`, which the description cannot carry, make the struct opaque with the reason.</summary>
+    [Fact]
+    public void Packed_and_aligned_attributes_are_honoured_or_refused_with_a_reason()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            struct __attribute__((packed)) P1 { unsigned char tag; unsigned int value; };
+            typedef struct { unsigned char tag; unsigned int value; } __attribute__((packed)) P2;
+            typedef struct { unsigned char tag; unsigned int value; } __attribute__((__packed__, deprecated)) P3;
+            typedef struct { unsigned char tag; unsigned int value; } __attribute__((aligned(16))) A1;
+            struct __declspec(align(16)) A2 { unsigned char tag; unsigned int value; };
+            typedef struct { unsigned char tag; unsigned int value __attribute__((aligned(8))); } F1;
+            typedef struct { unsigned char tag; struct { unsigned char a; unsigned int b; } __attribute__((packed)) inner; } Outer;
+            #pragma pack(push, 4)
+            struct __attribute__((packed)) P4 { unsigned char tag; unsigned int value; };
+            #pragma pack(pop)
+            typedef struct { unsigned char tag; unsigned int value; } N1;
+            __attribute__((noreturn)) void Stop(void);
+            int Use(struct P1* a, P2* b, P3* c, A1* d, struct A2* e, F1* f, Outer* g, struct P4* h, N1* i);
+            """, "mylib.dll", "My");
+        Log(description);
+        Check("packed on the tag, after the body, among other attributes, inside a #pragma pack, on a nested struct: pack 1",
+            description.Contains("struct P1 pack 1 { u8 tag; u32 value }\n") && description.Contains("struct P2 pack 1 { u8 tag; u32 value }\n") && description.Contains("struct P3 pack 1 { u8 tag; u32 value }\n")
+            && description.Contains("struct P4 pack 1 { u8 tag; u32 value }\n") && description.Contains("struct Outer_inner pack 1 { u8 a; u32 b }\n") && description.Contains("struct Outer { u8 tag; Outer_inner inner }\n")
+            && description.Contains("struct N1 { u8 tag; u32 value }\n"));
+        Check("aligned(16), __declspec(align(16)) and an attribute on a field: opaque with the reason, not a wrong layout",
+            !description.Contains("struct A1") && !description.Contains("struct A2") && !description.Contains("struct F1")
+            && reader.Opaque.Any(o => o.Name == "A1" && o.Why.Contains("aligned(16)")) && reader.Opaque.Any(o => o.Name == "A2" && o.Why.Contains("aligned(16)"))
+            && reader.Opaque.Any(o => o.Name == "F1" && o.Why.Contains("field") && o.Why.Contains("aligned(8)")),
+            string.Join("; ", reader.Opaque.Select(o => $"{o.Name}: {o.Why}")));
+        Check("the functions: pointers to the packed structs, void* to the opaque ones, an attribute on a prototype dropped",
+            description.Contains("Use(P1* a, P2* b, P3* c, void* d, void* e, void* f, Outer* g, P4* h, N1* i) : i32\n") && description.Contains("Stop()\n"));
+        var parsed = BindingDescription.Parse(description);
+        Check("layouts: the packed structs 5/1, the natural one 8/4",
+            BindingDescription.Layout("P1", parsed.Structs) == (5, 1) && BindingDescription.Layout("P4", parsed.Structs) == (5, 1) && BindingDescription.Layout("N1", parsed.Structs) == (8, 4));
+    }
+
     // ── SDL3 ──
 
     /// <summary>

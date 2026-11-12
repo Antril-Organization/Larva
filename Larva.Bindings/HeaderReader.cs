@@ -116,7 +116,7 @@ namespace Larva.Bindings
                 }
             }
             currentFile = null;
-            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(Decorations.Replace(d, " "), "(*").Trim())
+            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(Decorations.Replace(LayoutAttributes(d), " "), "(*").Trim())
                 .Where(d => d.Length > 0).ToList();
             // Types first, prototypes after: a prototype may use a typedef written below it in another header.
             foreach (string declaration in declarations)
@@ -408,6 +408,94 @@ namespace Larva.Bindings
             @"\(\s*(?:(?:__cdecl|__stdcall|__fastcall|__vectorcall|WINAPI|CALLBACK|APIENTRY|SDLCALL)\s*)*\*\s*",
             System.Text.RegularExpressions.RegexOptions.Compiled);
 
+        /// <summary>
+        /// A layout attribute kept as a word where it was written, for the struct it belongs to: `__attribute__((packed))`
+        /// and `__attribute__((aligned(n)))` / `__declspec(align(n))` (n: 0 when it is not a literal). The other
+        /// attributes are dropped here, with balanced parentheses (`aligned(16)` has its own).
+        /// </summary>
+        private const string PackedMarker = "__larva_packed__";
+        private const string AlignedMarker = "__larva_aligned_";
+
+        private static string LayoutAttributes(string declaration)
+        {
+            if (!declaration.Contains("__attribute__") && !declaration.Contains("__declspec"))
+                return declaration;
+            var text = new StringBuilder();
+            for (int i = 0; i < declaration.Length;)
+            {
+                int keyword = declaration.IndexOf("__", i, StringComparison.Ordinal);
+                if (keyword < 0 || !(Starts(keyword, "__attribute__") || Starts(keyword, "__declspec")))
+                {
+                    text.Append(declaration, i, (keyword < 0 ? declaration.Length : keyword + 2) - i);
+                    i = keyword < 0 ? declaration.Length : keyword + 2;
+                    continue;
+                }
+                bool attribute = Starts(keyword, "__attribute__");
+                int open = declaration.IndexOf('(', keyword), close = open < 0 ? -1 : MatchingParenthesis(declaration, open);
+                if (close < 0)
+                {
+                    text.Append(declaration, i, declaration.Length - i);
+                    break;
+                }
+                text.Append(declaration, i, keyword - i);
+                string inside = declaration[(open + 1)..close].Trim();
+                if (attribute && inside.StartsWith('(') && inside.EndsWith(')'))
+                    inside = inside[1..^1];
+                foreach (string item in BindingDescription.SplitTopLevel(inside))
+                {
+                    string a = item.Trim();
+                    if (a is "packed" or "__packed__")
+                        text.Append(' ').Append(PackedMarker).Append(' ');
+                    else if (a is "aligned" or "__aligned__" || a.StartsWith("aligned") || a.StartsWith("__aligned__") || !attribute && a.StartsWith("align"))
+                    {
+                        int argument = a.IndexOf('(');
+                        long n = argument >= 0 && a.EndsWith(')') ? Integer(a[(argument + 1)..^1]) ?? 0 : 0;
+                        text.Append(' ').Append(AlignedMarker).Append(n).Append("__ ");
+                    }
+                }
+                text.Append(' ');
+                i = close + 1;
+            }
+            return text.ToString();
+
+            bool Starts(int at, string word) => string.CompareOrdinal(declaration, at, word, 0, word.Length) == 0;
+        }
+
+        /// <summary>
+        /// The layout attributes of a struct: taken out of the text around its body (not out of the body: those belong to
+        /// its fields or nested structs).
+        /// </summary>
+        private static string TakeLayout(string text, out bool packed, out int? aligned)
+        {
+            packed = false;
+            aligned = null;
+            if (!text.Contains("__larva_"))
+                return text;
+            int open = text.IndexOf('{'), close = text.LastIndexOf('}');
+            string head = open < 0 ? text : text[..open], body = open < 0 ? "" : text[open..(close + 1)], tail = open < 0 ? "" : text[(close + 1)..];
+            bool isPacked = false;
+            int? alignment = null;
+            string result = Take(head) + body + Take(tail);
+            packed = isPacked;
+            aligned = alignment;
+            return result;
+
+            string Take(string part)
+            {
+                var kept = new StringBuilder();
+                foreach (string word in part.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (word == PackedMarker)
+                        isPacked = true;
+                    else if (word.StartsWith(AlignedMarker, StringComparison.Ordinal) && int.TryParse(word[AlignedMarker.Length..].TrimEnd('_'), out int n))
+                        alignment = Math.Max(alignment ?? 0, n);
+                    else
+                        kept.Append(word).Append(' ');
+                }
+                return kept.ToString();
+            }
+        }
+
         /// <summary>`push[, n]`, `pop`, `n` or nothing: the pack in force from here on (0: natural alignment).</summary>
         private void Pragma(string arguments)
         {
@@ -454,12 +542,13 @@ namespace Larva.Bindings
             }
             if (IsTypeDeclaration(t))
             {
+                t = TakeLayout(t, out bool packed, out int? aligned);
                 int brace = t.IndexOf('{');
                 string tag = (brace < 0 ? t : t[..brace]).Split(' ', StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(1) ?? "";
                 if (tag.Length == 0)
                     return;
                 if (brace >= 0)
-                    DefineStruct(tag, tag, t[(brace + 1)..t.LastIndexOf('}')], t.StartsWith("union "));
+                    DefineStruct(tag, tag, t[(brace + 1)..t.LastIndexOf('}')], t.StartsWith("union "), packed, aligned);
                 else if (!structNames.ContainsKey(tag))
                     opaque.Add(tag); // a forward declaration: opaque unless a body follows
                 return;
@@ -493,6 +582,8 @@ namespace Larva.Bindings
             if (brace >= 0)
             {
                 // typedef struct [Tag] { … } Name, *PName;  /  typedef enum { … } Name;
+                t = TakeLayout(t, out bool packed, out int? aligned);
+                brace = t.IndexOf('{');
                 int close = t.LastIndexOf('}');
                 var declarators = Declarators(t[(close + 1)..]);
                 string head = t[..brace].Trim();
@@ -508,7 +599,7 @@ namespace Larva.Bindings
                 string structName = declarators.FirstOrDefault(d => d.Stars == 0).Name ?? tag;
                 if (structName.Length == 0)
                     return;
-                DefineStruct(structName, tag, t[(brace + 1)..close], head.StartsWith("union"));
+                DefineStruct(structName, tag, t[(brace + 1)..close], head.StartsWith("union"), packed, aligned);
                 foreach (var (name, stars) in declarators)
                 {
                     if (name != structName)
@@ -572,9 +663,16 @@ namespace Larva.Bindings
             return list;
         }
 
-        private void DefineStruct(string name, string tag, string body, bool isUnion = false)
+        /// <summary>
+        /// A struct with a body. <paramref name="packed"/> (<c>__attribute__((packed))</c>) packs it to 1 whatever
+        /// <c>#pragma pack</c> says; <paramref name="aligned"/> (<c>aligned(n)</c>, <c>__declspec(align(n))</c>) is an
+        /// alignment the description cannot carry: the struct is opaque, with the reason (never a wrong layout).
+        /// </summary>
+        private void DefineStruct(string name, string tag, string body, bool isUnion = false, bool packed = false, int? aligned = null)
         {
-            var raw = new RawStruct { Name = name, Fields = [], IsUnion = isUnion, Pack = pack };
+            var raw = new RawStruct { Name = name, Fields = [], IsUnion = isUnion, Pack = packed ? 1 : pack };
+            if (aligned is { } alignment)
+                raw.Why = $"aligned({(alignment > 0 ? alignment.ToString() : "…")}): an alignment the bindings cannot carry";
             if (currentFile is not null)
                 Origins.TryAdd(name, currentFile);
             int anonymous = 0;
@@ -587,16 +685,24 @@ namespace Larva.Bindings
                     if (declaration.Contains('{'))
                     {
                         // a nested `struct { … } a, *b;` or `union { … };`: its own definition, named after the outer one
+                        declaration = TakeLayout(declaration, out bool nestedPacked, out int? nestedAligned);
                         int open = declaration.IndexOf('{'), close = declaration.LastIndexOf('}');
                         bool nestedUnion = declaration.StartsWith("union");
                         var declarators = Declarators(declaration[(close + 1)..]);
                         if (declarators.Count == 0)
                             declarators.Add(($"anon{anonymous++}", 0));
                         string nested = $"{name}_{declarators[0].Name}";
-                        DefineStruct(nested, "", declaration[(open + 1)..close], nestedUnion);
+                        DefineStruct(nested, "", declaration[(open + 1)..close], nestedUnion, nestedPacked, nestedAligned);
                         foreach (var (fieldName, stars) in declarators)
                             raw.Fields.Add(Field(nested, stars, declaration[(close + 1)..], fieldName));
                         continue;
+                    }
+                    if (declaration.Contains("__larva_"))
+                    {
+                        // `int x __attribute__((aligned(8)));`, a packed field: a layout of its own the description cannot carry
+                        string written = System.Text.RegularExpressions.Regex.Replace(declaration.Replace(PackedMarker, "packed"), AlignedMarker + @"(\d+)__", "aligned($1)");
+                        raw.Why = $"field `{written}`: an attribute on a field (packed, aligned) the bindings cannot carry";
+                        break;
                     }
                     if (declaration.Contains(':'))
                     {
