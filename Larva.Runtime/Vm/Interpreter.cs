@@ -58,7 +58,7 @@ namespace Larva.Runtime.Vm
         private readonly IrModule shapes;
         private readonly InterpreterOptions options;
         private readonly List<Frame> callStack = [];
-        private readonly Stack<int> regions = new();
+        private readonly Stack<OpenRegion> regions = new();
         private int allocatedSinceCollect;
 
         public RuntimeModule Runtime { get; }
@@ -130,7 +130,7 @@ namespace Larva.Runtime.Vm
             {
                 // Unwinding out of this frame: close the arena regions it left open.
                 while (regions.Count > frame.RegionDepth)
-                    ExitRegion(regions.Peek());
+                    ExitRegion();
                 throw;
             }
             finally

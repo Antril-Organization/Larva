@@ -193,6 +193,43 @@ public sealed class InterpreterTests : CheckedTest
     }
 
     [Fact]
+    public void A_callee_closing_its_region_keeps_the_callers_region_objects()
+    {
+        // Both functions number their region 0: the ids are per function, the regions are per activation.
+        // fn inner() -> i32 { region { let g = gc Point{1, 2}; g.x } }
+        var inner = new FunctionBuilder("inner", IrType.I32);
+        int ip = inner.Local(GcPrograms.PointType, "p", mutable: true);
+        int ig = inner.Local(IrType.Gc(GcPrograms.PointType), "g");
+        int iv = inner.Local(IrType.I32, "v");
+        inner.RegionEnter(0)
+             .Assign(new Place(ip).Field(0), Int(1)).Assign(new Place(ip).Field(1), Int(2))
+             .Assign(ig, Rvalue.Gc(Move(ip)))
+             .Assign(iv, Copy(new Place(ig).Deref().Field(0)))
+             .RegionExit(0)
+             .Assign(FunctionBuilder.ReturnPlace, Copy(iv))
+             .Return();
+
+        // fn outer() -> i32 { region { let g = gc Point{40, 0}; let t = inner(); g.x + t } }
+        var outer = new FunctionBuilder("outer", IrType.I32);
+        int op = outer.Local(GcPrograms.PointType, "p", mutable: true);
+        int og = outer.Local(IrType.Gc(GcPrograms.PointType), "g");
+        int t = outer.Local(IrType.I32, "t");
+        int after = outer.NewBlock();
+        outer.RegionEnter(0)
+             .Assign(new Place(op).Field(0), Int(40)).Assign(new Place(op).Field(1), Int(0))
+             .Assign(og, Rvalue.Gc(Move(op)))
+             .Call(0, [], t, after);
+        outer.At(after)
+             .Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Add, Copy(new Place(og).Deref().Field(0)), Copy(t)))
+             .RegionExit(0)
+             .Return();
+
+        var vm = Vm(new IrModule(GcPrograms.StructDefs, [inner.Build(), outer.Build()]), gc: GcConfig.Arena);
+        Check("outer() = 41: inner's region exit freed inner's object only", Equal(vm.Run("outer"), 41L));
+        Check("both regions freed their own object", vm.Heap.Live.Count(x => x.Kind == AllocationKind.Gc) == 0 && vm.Heap.TotalFrees == 2, $"frees {vm.Heap.TotalFrees}");
+    }
+
+    [Fact]
     public void Marking_a_long_linked_list_does_not_overflow_the_host_stack()
     {
         // fn chain(count: i32) -> i32 { let head: ?gc Node = null; for i in 0..count { head = gc Node{i, head} } head.value }
