@@ -233,7 +233,8 @@ into namespace System
 				return NumberFormat.ShortestDouble(this);
 			}
 
-			CompareTo(f64 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f64 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f64 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 			Hash() : u64 => (u64)BitsOf(this == 0 ? 0 : this);
 
@@ -294,7 +295,8 @@ into namespace System
 			ToString(str format) : str => NumberFormat.FormatSingle(this, format);
 
 			ToString() : str => NumberFormat.FormatSingle(this, "R");
-			CompareTo(f32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f32 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 
 			/// The IEEE 754 bits of `value` (an f32 is exact as an f64: its bits are rebuilt from those).
 			static Bits(f32 value) : u32
@@ -363,7 +365,8 @@ into namespace System
 
 			/// The shortest text that reads back as the same number.
 			ToString() : str => NumberFormat.FormatHalf(this, "G");
-			CompareTo(f16 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f16 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f16 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 			Hash() : u64 => (u64)Bits(this == 0 ? 0 : this);
 
@@ -719,7 +722,8 @@ into namespace System
 
 			/// The shortest text that reads back as the same number.
 			ToString() : str => NumberFormat.FormatWide(Bits(this), 128, "G");
-			CompareTo(f128 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f128 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f128 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 
 			Hash() : u64
@@ -879,7 +883,8 @@ into namespace System
 
 			/// The shortest text that reads back as the same number.
 			ToString() : str => NumberFormat.FormatWide(Bits(this), 256, "G");
-			CompareTo(f256 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f256 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f256 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 
 			Hash() : u64
