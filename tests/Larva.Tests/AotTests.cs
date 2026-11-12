@@ -158,6 +158,36 @@ public sealed unsafe class AotTests : CheckedTest
             && Regex.IsMatch(errors, @"collections [2-9]\d* \(") && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
     }
 
+    [Fact]
+    public void Llvm_major_collection_resets_remembered_objects_before_the_sweep() => RememberedSweep("llvm");
+
+    [Fact]
+    public void X64_major_collection_resets_remembered_objects_before_the_sweep() => RememberedSweep("x64");
+
+    /// <summary>
+    /// A major collection that no minor one precedes (every object old: x64, or generations off) still holds the objects
+    /// the write barrier remembered; those that die in the sweep must not be written afterwards (their age was reset after
+    /// the sweep, into freed memory: a crash in collect_major once the memory was given back).
+    /// </summary>
+    private void RememberedSweep(string backend)
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.RememberProgram() with { Name = "remember" }, "remember.lvo");
+        string exe = Path.Combine(Directory, $"remember-{backend}.exe");
+        var (code, log) = Cli("native", "--exe", "--backend", backend, "--entry", "remember_churn", "-o", exe, program);
+        Check($"{backend}: larva native --exe --entry remember_churn", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        foreach (bool generations in new[] { true, false })
+        {
+            var (exit, output, errors) = Execute(exe, ["300"], stats: true, generations: generations);
+            Check($"{backend}: remember.exe 300 = 299 (generations {(generations ? "on" : "off")}), the collections after remembered objects died",
+                exit == 0 && output.Trim() == "299" && Regex.IsMatch(errors, @"collections [1-9]\d* \(") && errors.Contains("errors 0"),
+                $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)
@@ -170,7 +200,8 @@ public sealed unsafe class AotTests : CheckedTest
         return path;
     }
 
-    private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false, int nursery = 0)
+    private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false, int nursery = 0,
+        bool generations = true)
     {
         var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         foreach (var argument in arguments ?? [])
@@ -181,6 +212,8 @@ public sealed unsafe class AotTests : CheckedTest
             start.Environment["LARVA_STATS"] = "1";
         if (nursery > 0)
             start.Environment["LARVA_GC_NURSERY"] = nursery.ToString();
+        if (!generations)
+            start.Environment["LARVA_GC_GENERATIONS"] = "0";
         using var process = Process.Start(start)!;
         var errors = process.StandardError.ReadToEndAsync();
         string output = process.StandardOutput.ReadToEnd();

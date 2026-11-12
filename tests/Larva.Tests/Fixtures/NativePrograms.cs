@@ -166,4 +166,36 @@ internal static class NativePrograms
         return new IrModule(GcPrograms.StructDefs, [fin.Build(), pinned.Build(), alive.Build(), churn.Build()])
             { Globals = [new GlobalDef("finalized", IrType.I32), new GlobalDef("latest", gcPoint)] };
     }
+
+    /// <summary>
+    /// unsafe remember_churn(n: i64) -> i32 { let mut last; for i in 0..n { let arr = gc [gc Point; 100000]; arr[0] = gc Point{i,i}; last = arr[0] } last.y }
+    /// — every iteration stores a handle into a large array (800 KB: old at once, its memory given back to the system when
+    /// it dies), so the write barrier lists it (cards), and it dies before the next collection (→ n - 1).
+    /// </summary>
+    public static IrModule RememberProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var f = new FunctionBuilder("remember_churn", IrType.I32) { Unsafe = true };
+        int n = f.Argument(IrType.I64, "n");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int zero = f.Local(IrType.I64, "zero");
+        int p = f.Local(Point, "p", mutable: true);
+        int arr = f.Local(IrType.Gc(new ArrayType(gcPoint)), "arr", mutable: true);
+        int last = f.Local(gcPoint, "last", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int head = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(new Place(p).Field(0), Int(0)).Assign(new Place(p).Field(1), Int(0))
+         .Assign(last, Rvalue.Gc(Move(p)))
+         .Assign(zero, Int(0, IrType.I64))
+         .Assign(i, Int(0, IrType.I64)).Goto(head);
+        f.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(c), body, exit);
+        f.At(body)
+         .Assign(arr, Rvalue.NewArray(AllocKind.Gc, gcPoint, Int(100000, IrType.I64)))
+         .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+         .Assign(new Place(arr).Deref().Index(zero), Rvalue.Gc(Move(p)))
+         .Assign(last, Copy(new Place(arr).Deref().Index(zero)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        f.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(last).Deref().Field(1))).Return();
+        return new IrModule(GcPrograms.StructDefs, [f.Build()]);
+    }
 }
