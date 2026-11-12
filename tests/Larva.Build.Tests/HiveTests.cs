@@ -110,6 +110,63 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
         Check("…and accepted with `verify: hashes`", new HiveInstaller(cache, [plain], false).Install([PackageReference.Parse("T/Plain")!], null).Packages.Count == 1);
     }
 
+    // ── strict verification and pinned keys ──
+
+    private sealed class KeylessIndex(HiveProvider inner) : HiveProvider
+    {
+        public override string Address => inner.Address;
+        public override HiveIndex? Index(PackageReference package) =>
+            inner.Index(package) is { } index ? index with { Keys = [], Versions = [.. index.Versions.Select(v => v with { Key = null })] } : null;
+        public override byte[] Download(PackageReference package, HiveIndexVersion version) => inner.Download(package, version);
+        public override void Publish(PackageReference package, HiveIndexVersion version, byte[] file, string? publicKey) => inner.Publish(package, version, file, publicKey);
+    }
+
+    [Fact]
+    public void Strict_verification_needs_a_signature_and_a_pinned_key_always_wins()
+    {
+        string root = hive.Root;
+        var pkg = PackageReference.Parse("T/S")!;
+        var good = HiveKeys.Generate();
+        var evil = HiveKeys.Generate();
+        var goodRegistry = new HiveFolderProvider(Path.Combine(root, "s-good"));
+        Publish(goodRegistry, root, "T/S", "1.0.0", [], good.PrivatePem, good.PublicKey);
+        var evilRegistry = new HiveFolderProvider(Path.Combine(root, "s-evil"));
+        Publish(evilRegistry, root, "T/S", "1.0.0", [], evil.PrivatePem, evil.PublicKey);
+        var unsigned = new HiveFolderProvider(Path.Combine(root, "s-unsigned"));
+        Publish(unsigned, root, "T/S", "1.0.0", [], null, null);
+
+        // Signed, key only in the index: accepted and pinned on first use.
+        var cache = new HiveCache(Path.Combine(root, "s-cache1"));
+        Check("strict, signed, key only in the index: accepted", new HiveInstaller(cache, [goodRegistry], true).Install([pkg], null).Packages.Count == 1);
+        Check("...and the key is pinned", cache.Pinned(pkg) is [var pinned] && pinned == good.Fingerprint);
+
+        // Pinned key matches: accepted again (fresh folder so it is fetched).
+        var again = new HiveCache(Path.Combine(root, "s-cache2"));
+        again.AddTrusted(pkg, good.Fingerprint);
+        Check("strict, pinned key matches the index: accepted", new HiveInstaller(again, [goodRegistry], true).Install([pkg], null).Packages.Count == 1);
+
+        // Pinned key, the index offers another key: refused.
+        var pinnedCache = new HiveCache(Path.Combine(root, "s-cache3"));
+        pinnedCache.AddTrusted(pkg, good.Fingerprint);
+        Check("strict, pinned key, index with a different key: refused",
+            Throws(() => new HiveInstaller(pinnedCache, [evilRegistry], true).Install([pkg], null), "not by the key it was installed with"));
+
+        // No key in the index and an unsigned package: refused, with or without a pinned key.
+        Check("strict, no key in the index, unsigned package: refused",
+            Throws(() => new HiveInstaller(new HiveCache(Path.Combine(root, "s-cache4")), [unsigned], true).Install([pkg], null), "not signed"));
+        Check("strict, pinned key, index without a key, unsigned package: refused",
+            Throws(() => new HiveInstaller(pinnedCache, [unsigned], true).Install([pkg], null), "not signed"));
+        // The index of a signed package stripped of its key: strict refuses, and so does a pinned key under any policy.
+        var stripped = new KeylessIndex(goodRegistry);
+        Check("strict, signed package but the index gives no key: refused",
+            Throws(() => new HiveInstaller(new HiveCache(Path.Combine(root, "s-cache5")), [stripped], true).Install([pkg], null), "not signed"));
+        Check("hashes policy, pinned key, index without a key: refused (a pinned key is never bypassed)",
+            Throws(() => new HiveInstaller(pinnedCache, [stripped], false).Install([pkg], null), "was installed with key"));
+        Check("hashes policy, no pinned key, unsigned: still accepted",
+            new HiveInstaller(new HiveCache(Path.Combine(root, "s-cache6")), [unsigned], false).Install([pkg], null).Packages.Count == 1);
+        Refused("strict without any key cannot verify", File.ReadAllBytes(Path.Combine(root, "s-good", "T", "S", "1.0.0", "S-1.0.0.hive")), null, true, "no key");
+    }
+
     // ── projects ──
 
     [Fact]

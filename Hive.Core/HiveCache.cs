@@ -81,6 +81,9 @@ namespace Hive
             SaveKeys(keys);
         }
 
+        /// <summary>The key fingerprints pinned for a package (empty: none yet).</summary>
+        public IReadOnlyList<string> Pinned(PackageReference package) => LoadKeys().TryGetValue(package.Id, out var known) ? known : [];
+
         /// <summary><c>hive trust</c>: accepts another key for a package.</summary>
         public void AddTrusted(PackageReference package, string fingerprint)
         {

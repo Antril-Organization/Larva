@@ -125,12 +125,21 @@ namespace Hive
             byte[] file = provider.Download(package, version);
             if (HiveManifest.Hash(file) != version.Sha256)
                 throw new HiveException($"{package.Id} {version.Version} from {provider.Address} does not match the hash its index gives: refusing it");
+            // A key pinned locally for the package always wins over what the index says; a missing key never skips it.
+            var pinned = cache.Pinned(package);
             string? publicKey = null;
             if (version.Key is { } fingerprint)
             {
                 if (!index.Keys.TryGetValue(fingerprint, out publicKey) || HiveKeys.Fingerprint(publicKey) != fingerprint)
                     throw new HiveException($"{package.Id} {version.Version} is signed by key {HiveArchive.Short(fingerprint)}, which its index does not give");
+                if (pinned.Count > 0 && !pinned.Contains(fingerprint))
+                    throw new HiveException($"{package.Id} {version.Version} is signed by key {HiveArchive.Short(fingerprint)}, not by the key it was installed with ({string.Join(", ", pinned.Select(HiveArchive.Short))}). " +
+                        $"If its author changed keys, accept the new one with `hive trust {package.Id} {fingerprint}`");
             }
+            else if (requireSignatures)
+                throw new HiveException($"{package.Id} {version.Version} is not signed: its index gives no key for it (`verify: hashes` in HIVE accepts unsigned packages)");
+            else if (pinned.Count > 0)
+                throw new HiveException($"{package.Id} {version.Version} is not signed, but {package.Id} was installed with key {string.Join(", ", pinned.Select(HiveArchive.Short))}: refusing it");
             var opened = HiveArchive.Open(file, publicKey, requireSignatures);
             if (opened.Manifest.Package != package.Id || opened.Manifest.Version != version.Version)
                 throw new HiveException($"{provider.Address} gave {opened.Manifest.Package} {opened.Manifest.Version} for {package.Id} {version.Version}");
