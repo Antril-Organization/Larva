@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 ﻿using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -146,6 +146,7 @@ namespace Larva.Native
             ["larva_region_depth"] = (nint)(delegate* unmanaged<int>)&RegionDepth,
             ["larva_region_unwind"] = (nint)(delegate* unmanaged<int, void>)&RegionUnwind,
             ["larva_gc_wb"] = (nint)(delegate* unmanaged<void*, void*, long, void>)&WriteBarrier,
+            ["larva_gc_wb_at"] = (nint)(delegate* unmanaged<void*, long, void>)&WriteBarrierAt,
             ["larva_pin"] = (nint)(delegate* unmanaged<void*, void>)&Pin,
             ["larva_unpin"] = (nint)(delegate* unmanaged<void*, void>)&Unpin,
             ["larva_poll"] = (nint)(delegate* unmanaged<void>)&Poll,
@@ -872,6 +873,9 @@ namespace Larva.Native
 
         [UnmanagedCallersOnly]
         private static void WriteBarrier(void* owner, void* slot, long size) => Barriers++;
+
+        [UnmanagedCallersOnly]
+        private static void WriteBarrierAt(void* slot, long size) => Barriers++;
 
         /// <summary>A borrow into a gc object: the object stays alive (and, for a moving collector, in place) until unpinned.</summary>
         [UnmanagedCallersOnly]

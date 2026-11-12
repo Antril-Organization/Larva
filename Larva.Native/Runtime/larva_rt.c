@@ -7359,3 +7359,75 @@ void __stdcall larva_crt_start(void) {
 }
 #endif
 #pragma optimize("", on)
+
+/*
+ * The write barrier for a store through a reference or pointer (`&mut`, `*mut`), whose owner compiled code does not know:
+ * `size` bytes of handles were stored at `slot`. Nothing to do when the slot is young (the nursery), on this thread's stack
+ * or in memory that is not a gc object (heap cells and globals are scanned as roots). The owner of a pinned nursery object
+ * comes from its retained block, of a small object from its chunk, of a borrowed one from this thread's pins, of a large one from the large-object index (rebuilt here when
+ * the live table grew since it was last made; a major collection rebuilds it anyway).
+ */
+static size_t wb_indexed_used = (size_t)-1;
+
+LARVA_API void larva_gc_wb_at(void *slot, int64_t size) {
+    uintptr_t address = (uintptr_t)slot;
+    if (!slot)
+        return;
+    if (in_nursery(slot)) {
+        /* Young, unless its block was retained by a pin: then the object is old in place, and the barrier applies. */
+        if (nursery_blocks[(size_t)((char *)slot - nursery_low) / NURSERY_BLOCK].state != BLOCK_RETAINED)
+            return;
+        void *object = nursery_object(address);
+        if (object)
+            larva_gc_wb(object, slot, size);
+        return;
+    }
+    LarvaThread *me = this_thread ? this_thread : &main_record;
+    if (address >= (uintptr_t)&address && address < me->stack_high)
+        return;
+    if (address >= small_low && address < small_high) {
+        uintptr_t base = address & ~(uintptr_t)(CHUNK - 1);
+        if (chunk_map[(base - small_low) / CHUNK]) {
+            Chunk *chunk = (Chunk *)base;
+            uintptr_t offset = address - base;
+            if (offset < CHUNK_DATA)
+                return;
+            size_t index = (offset - CHUNK_DATA) / chunk->block;
+            if (index >= chunk->bump)
+                return;
+            GcHeader *header = (GcHeader *)chunk_slot(chunk, index);
+            if (header->domain != SLOT_FREE)
+                larva_gc_wb((char *)header + GC_HEADER, slot, size);
+            return;
+        }
+    }
+    for (size_t i = me->pin_count; i > 0; i--) {
+        char *pinned = (char *)me->pins[i - 1];
+        if (pinned && address >= (uintptr_t)pinned && address < (uintptr_t)pinned + (uintptr_t)payload_bytes(header_of(pinned))) {
+            larva_gc_wb(pinned, slot, size);
+            return;
+        }
+    }
+    int locked = rt_enter();
+    if (live.used != wb_indexed_used) {
+        index_large();
+        wb_indexed_used = live.used;
+    }
+    if (large_count > 0 && address >= large_starts[0]) {
+        size_t low = 0, high = large_count;
+        while (high - low > 1) {
+            size_t middle = (low + high) / 2;
+            if (large_starts[middle] <= address)
+                low = middle;
+            else
+                high = middle;
+        }
+        Entry *e = table_find(&live, large_starts[low]);
+        if (e && e->kind == KIND_GC && address < large_ends[low]) {
+            rt_leave(locked);
+            larva_gc_wb((void *)large_starts[low], slot, size);
+            return;
+        }
+    }
+    rt_leave(locked);
+}

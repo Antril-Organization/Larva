@@ -1,4 +1,4 @@
-using Larva.IR;
+﻿using Larva.IR;
 using static Larva.IR.Operand;
 
 namespace Larva.Tests;
@@ -165,6 +165,44 @@ internal static class NativePrograms
 
         return new IrModule(GcPrograms.StructDefs, [fin.Build(), pinned.Build(), alive.Build(), churn.Build()])
             { Globals = [new GlobalDef("finalized", IrType.I32), new GlobalDef("latest", gcPoint)] };
+    }
+
+    /// <summary>
+    /// put(slot: &mut gc Point, v: gc Point) { *slot = v } — a store through a reference, whose owner put cannot name;
+    /// unsafe keep_through_ref(n: i64) -> i32 { let h = gc Holder{gc Point{1,2}, 0}; churn(n); put(&mut (*h).0, gc Point{42,43}); churn(n); (*(*h).0).1 }
+    /// — h is old by the time the young Point is stored into it through the reference (→ 43 only if the store was remembered).
+    /// </summary>
+    public static IrModule BarrierProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var churn = TracingProgram().Functions[0];
+
+        var put = new FunctionBuilder("put", IrType.Unit);
+        int slot = put.Argument(IrType.RefMut(gcPoint), "slot");
+        int v = put.Argument(gcPoint, "v");
+        put.Assign(new Place(slot).Deref(), Move(v)).Return();
+
+        var f = new FunctionBuilder("keep_through_ref", IrType.I32) { Unsafe = true };
+        int n = f.Argument(IrType.I64, "n");
+        int p = f.Local(Point, "p", mutable: true);
+        int holder = f.Local(GcPrograms.HolderType, "holder", mutable: true);
+        int h = f.Local(IrType.Gc(GcPrograms.HolderType), "h");
+        int young = f.Local(gcPoint, "young");
+        int r = f.Local(IrType.RefMut(gcPoint), "r");
+        int t = f.Local(IrType.I64, "t", mutable: true);
+        int unit = f.Temp(IrType.Unit);
+        int b1 = f.NewBlock(), b2 = f.NewBlock(), b3 = f.NewBlock();
+        f.Assign(new Place(p).Field(0), Int(1)).Assign(new Place(p).Field(1), Int(2))
+         .Assign(new Place(holder).Field(0), Rvalue.Gc(Move(p))).Assign(new Place(holder).Field(1), Int(0))
+         .Assign(h, Rvalue.Gc(Move(holder)))
+         .Call(0, [Copy(n)], t, b1);
+        f.At(b1).Assign(new Place(p).Field(0), Int(42)).Assign(new Place(p).Field(1), Int(43))
+         .Assign(young, Rvalue.Gc(Move(p)))
+         .Assign(r, Rvalue.RefMut(new Place(h).Deref().Field(0)))
+         .Call(1, [Move(r), Move(young)], unit, b2);
+        f.At(b2).Call(0, [Copy(n)], t, b3);
+        f.At(b3).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(h).Deref().Field(0).Deref().Field(1))).Return();
+        return new IrModule(GcPrograms.StructDefs, [churn, put.Build(), f.Build()]);
     }
 
     /// <summary>

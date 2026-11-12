@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text.RegularExpressions;
 using Larva.IR;
 using Larva.IR.Linking;
@@ -156,6 +156,27 @@ public sealed unsafe class AotTests : CheckedTest
         (exit, output, errors) = Execute(Exe("alive"), ["1000000"], stats: true);
         Check($"{backend}: alive.exe 1000000 = 8: keep (pinned by the first minor collection) not finalized while held", exit == 0 && output.Trim() == "8"
             && Regex.IsMatch(errors, @"collections [2-9]\d* \(") && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
+    /// <summary>
+    /// A handle stored through a `&mut` reference (or pointer) lands in memory whose owner the storing function cannot name:
+    /// when that memory is an old object, the store must still be remembered (larva_gc_wb_at finds the owner), or the next
+    /// minor collection leaves the old object pointing at the young object's former place.
+    /// </summary>
+    [Fact]
+    public void Llvm_stores_through_references_into_old_objects_are_remembered()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.BarrierProgram() with { Name = "barrier" }, "barrier.lvo");
+        string exe = Path.Combine(Directory, "barrier-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--backend", "llvm", "--entry", "keep_through_ref", "-o", exe, program);
+        Check("llvm: larva native --exe --entry keep_through_ref", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, ["300"], stress: true, stats: true, nursery: 1);
+        Check("llvm: barrier.exe 300 = 43 with a one-block nursery: the store through the reference into the old holder was remembered",
+            exit == 0 && output.Trim() == "43" && Regex.IsMatch(errors, @"barrier calls [1-9]") && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
     }
 
     [Fact]

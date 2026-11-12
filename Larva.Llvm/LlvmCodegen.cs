@@ -432,6 +432,7 @@ namespace Larva.Llvm
             Runtime("larva_region_enter", v, i32);
             Runtime("larva_region_exit", v, i32);
             Runtime("larva_gc_wb", v, ptr, ptr, i64);
+            Runtime("larva_gc_wb_at", v, ptr, i64);
             Runtime("larva_pin", v, ptr);
             Runtime("larva_unpin", v, ptr);
             Runtime("larva_poll", v);
@@ -1334,12 +1335,18 @@ namespace Larva.Llvm
             {
                 var (address, type) = Address(target);
                 var owner = lastOwner;
+                bool throughReference = lastThroughReference;
                 var stored = b.BuildStore(value, address);
                 if (IsScalarElement(target, type))
                     cg.TagElement(stored);
                 // Generations: a store into an old object remembers it (handles only: numbers need no barrier).
-                if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && owner.Handle != IntPtr.Zero && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
-                    cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
+                {
+                    if (owner.Handle != IntPtr.Zero)
+                        cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                    else if (throughReference)
+                        cg.CallRuntime("larva_gc_wb_at", address, I64(Layouts.Of(type, module)!.Size)); // the owner, if any, is the runtime's to find
+                }
             }
 
             // ── Terminators ────────────────────────────────────────
@@ -2074,11 +2081,15 @@ namespace Larva.Llvm
             /// <summary>The gc object the last <see cref="Address"/> went into (its last dereference), if it went into one.</summary>
             private LLVMValueRef lastOwner;
 
+            /// <summary>Whether the last <see cref="Address"/> went through a reference or pointer after its last gc object (so the memory may be inside an object this function cannot name).</summary>
+            private bool lastThroughReference;
+
             private (LLVMValueRef Pointer, IrType Type) Address(Place place)
             {
                 var address = locals[place.Local];
                 IrType type = function.Locals[place.Local].Type;
                 lastOwner = default;
+                lastThroughReference = false;
                 for (int p = 0; p < place.Projections.Length; p++)
                 {
                     switch (place.Projections[p])
@@ -2088,6 +2099,7 @@ namespace Larva.Llvm
                             if (type is OptionalType)
                                 Guard(b.BuildIsNotNull(address, ""), 5, I64(0), I64(0)); // null reference
                             lastOwner = type.Unoptional() is GcType ? address : default;
+                            lastThroughReference = type.Unoptional() is ReferenceType or PointerType;
                             type = type.Pointee()!;
                             break;
                         case FieldProjection field:
