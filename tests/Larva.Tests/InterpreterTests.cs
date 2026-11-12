@@ -193,6 +193,33 @@ public sealed class InterpreterTests : CheckedTest
     }
 
     [Fact]
+    public void Marking_a_long_linked_list_does_not_overflow_the_host_stack()
+    {
+        // fn chain(count: i32) -> i32 { let head: ?gc Node = null; for i in 0..count { head = gc Node{i, head} } head.value }
+        var node = IrType.Struct(0);
+        var link = new OptionalType(IrType.Gc(node));
+        var f = new FunctionBuilder("chain", IrType.I32);
+        int count = f.Argument(IrType.I32, "count");
+        int head = f.Local(link, "head", mutable: true);
+        int n = f.Local(node, "n", mutable: true);
+        int h = f.Local(IrType.Gc(node), "h", mutable: true);
+        int i = f.Local(IrType.I32, "i", mutable: true);
+        int c = f.Temp(IrType.Bool);
+        int loop = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(head, Rvalue.Zero(link)).Assign(i, Int(0)).Goto(loop);
+        f.At(loop).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(count))).If(Move(c), body, exit);
+        f.At(body).Assign(new Place(n).Field(0), Copy(i)).Assign(new Place(n).Field(1), Move(head))
+         .Assign(h, Rvalue.Gc(Move(n))).Assign(head, Rvalue.Wrap(Move(h)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1))).Goto(loop);
+        f.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(head).Deref().Field(0))).Return();
+
+        var module = new IrModule([new StructDef("Node", IrType.I32, link)], [f.Build()]);
+        var vm = Vm(module, gc: GcConfig.Default);
+        Check("chain(30000) = 29999 (the list is marked by collections during the loop)", Equal(vm.Run("chain", 30000), 29999L), vm.Stats.ToString());
+        Check("collections happened while the list was live", vm.Stats.Collections > 0, vm.Stats.ToString());
+    }
+
+    [Fact]
     public void Shift_amounts_are_masked_by_the_operand_width()
     {
         // The native back ends mask the amount (`shl cl` on x64, wasm, LLVM `and`): `1 << -1` is `1 << 31` for i32.

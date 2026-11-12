@@ -276,7 +276,17 @@ namespace Larva.Runtime.Vm
             }
         }
 
+        /// <summary>Objects marked but not yet scanned: marking is iterative (a long linked list must not recurse per node).</summary>
+        private readonly Stack<Allocation> markWork = new();
+
         private void Mark(Address address)
+        {
+            Push(address);
+            Drain();
+        }
+
+        /// <summary>Marks the object (if it is a live gc object not yet marked) and queues its contents for scanning.</summary>
+        private void Push(Address address)
         {
             if (address.IsNull)
                 return;
@@ -284,9 +294,16 @@ namespace Larva.Runtime.Vm
             if (allocation.Kind != AllocationKind.Gc || allocation.Marked)
                 return;
             allocation.Marked = true;
-            ScanContents(allocation);
+            markWork.Push(allocation);
         }
 
+        private void Drain()
+        {
+            while (markWork.Count > 0)
+                ScanContents(markWork.Pop());
+        }
+
+        /// <summary>Queues every handle stored in <paramref name="allocation"/> (an object, array, heap cell or global).</summary>
         private void ScanContents(Allocation allocation)
         {
             if (allocation.Kind is AllocationKind.Buffer or AllocationKind.Native)
@@ -301,12 +318,14 @@ namespace Larva.Runtime.Vm
                 for (ulong i = 0; i < length; i++)
                 {
                     foreach (int offset in offsets)
-                        Mark(Address.Unpack(BitConverter.ToUInt64(allocation.Data, header + (int)i * stride + offset)));
+                        Push(Address.Unpack(BitConverter.ToUInt64(allocation.Data, header + (int)i * stride + offset)));
                 }
+                Drain();
                 return;
             }
             foreach (int offset in Heap.LayoutOf(allocation.Type).GcOffsets)
-                Mark(Address.Unpack(BitConverter.ToUInt64(allocation.Data, offset)));
+                Push(Address.Unpack(BitConverter.ToUInt64(allocation.Data, offset)));
+            Drain();
         }
     }
 }
