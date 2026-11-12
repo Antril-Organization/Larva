@@ -339,7 +339,14 @@ namespace Larva.X64
 
         // ── Unwind info ────────────────────────────────────────
 
-        internal const int PrologueSize = 11; // push rbp (1) + mov rbp, rsp (3) + sub rsp, imm32 (7)
+        internal const int PrologueSize = 16; // push rbp (1) + mov rbp, rsp (3) + probe slot (5) + sub rsp, imm32 (7)
+
+        /// <summary>
+        /// A frame of this size or more must touch every page it spans before <c>rsp</c> moves (Windows commits the stack one
+        /// guard page at a time: skipping a page is an access violation, not growth). Smaller frames stay within a page of
+        /// the return address the call pushed.
+        /// </summary>
+        internal const int ProbeThreshold = 4096;
 
         /// <summary>
         /// UNWIND_INFO for the fixed prologue, with RBP as frame register; with scopes, followed by the exception handler
@@ -503,9 +510,14 @@ namespace Larva.X64
             PlanPins();
             PlanExceptions();
 
-            // Prologue (fixed size: the unwind info describes it).
+            // Prologue (fixed size: the unwind info describes it). The frame size is known only at the end, so the probe
+            // slot is a 5-byte nop, rewritten as a jump to the stack-probe loop (after the function) when the frame is large.
             a.PushRbp();
             a.Mov(Reg.Rbp, Reg.Rsp);
+            int probeSlotAt = a.Position;
+            a.Nop5();
+            var afterProbe = new Label();
+            a.Bind(afterProbe);
             int frameSizeAt = a.Position + 3;
             a.SubRsp32(0);
 
@@ -554,6 +566,8 @@ namespace Larva.X64
 
             int frameSize = (frame + outgoing + 15) / 16 * 16;
             a.PatchInt32(frameSizeAt, frameSize);
+            if (frameSize >= X64Codegen.ProbeThreshold)
+                EmitStackProbe(probeSlotAt, afterProbe, frameSize);
             int size = a.Position - start;
             var scopes = EmitFilters();
 
@@ -569,6 +583,29 @@ namespace Larva.X64
             }
             var (info, fixups) = X64Codegen.UnwindInfo(frameSize, scopes);
             return new X64Function(cg.Symbol(function), start, size, frameSize, [.. roots], info, fixups);
+        }
+
+        /// <summary>
+        /// The stack probe of a large frame (what MSVC's <c>__chkstk</c> does, inline so neither the in-process image nor the
+        /// linker needs the symbol): reads one byte per page from <c>rsp - 4096</c> down to the frame's end, in that order,
+        /// so each access lands at most one page past the committed stack and the guard page moves down with it. It runs
+        /// from the prologue slot, before <c>rsp</c> moves (the kernel may push an exception frame at <c>rsp</c> at any
+        /// time), using only <c>rax</c>, <c>r10</c> and <c>r11</c> (no argument register), and jumps back to the <c>sub rsp</c>.
+        /// </summary>
+        private void EmitStackProbe(int slotAt, Label afterProbe, int frameSize)
+        {
+            var probe = new Label();
+            var loop = new Label();
+            a.Bind(probe);
+            a.Mov(Reg.R10, Reg.Rbp);                      // rbp == rsp here
+            a.MovImm(Reg.R11, frameSize / 4096);          // pages crossed; the rest stays within a page of the last probe
+            a.Bind(loop);
+            a.SubImm(Reg.R10, 4096);
+            a.Load(Reg.Rax, Mem.At(Reg.R10), 1, false);   // touches the page (a read is enough for a guard page)
+            a.SubImm(Reg.R11, 1);
+            a.Jcc(Cond.NE, loop);
+            a.Jmp(afterProbe);
+            a.PatchJmp(slotAt, probe);
         }
 
         // ── Exceptions ─────────────────────────────────────────

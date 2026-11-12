@@ -229,9 +229,43 @@ public sealed unsafe class X64Tests : CheckedTest
         var (listing, invalid) = Disassemble(basics.Code, sum.Offset, sum.Size);
         Check("LLVM decodes every instruction of the generated code", invalid == 0 && Disassemble(basics.Code, 0, basics.Code.Length).Invalid == 0,
             $"{invalid} undecodable");
-        Check("prologue push rbp / mov rbp, rsp / sub rsp; lea rsp, [rbp] epilogue",
-            listing[0].Contains("push") && listing[1].Contains("mov") && listing[2].Contains("sub") && listing.Any(l => l.Contains("lea") && l.Contains("rsp")),
+        Check("prologue push rbp / mov rbp, rsp / nop (probe slot) / sub rsp; lea rsp, [rbp] epilogue",
+            listing[0].Contains("push") && listing[1].Contains("mov") && listing[2].Contains("nop") && listing[3].Contains("sub") && listing.Any(l => l.Contains("lea") && l.Contains("rsp")),
             string.Join(" / ", listing.Take(24)));
+    }
+
+    /// <summary>
+    /// A frame over a page must touch every page before <c>rsp</c> moves (Windows commits the stack one guard page at a
+    /// time): the prologue's slot becomes a jump to a probe loop, and a call from the bottom of a 40 KB frame runs.
+    /// </summary>
+    [Fact]
+    public void Large_frames_probe_the_stack()
+    {
+        var helper = new FunctionBuilder("helper", IrType.I32);
+        helper.Assign(FunctionBuilder.ReturnPlace, Int(7)).Return();
+        var big = new FunctionBuilder("big", IrType.I32);
+        big.Local(new FixedArrayType(IrType.U8, 40000), "buffer", mutable: true);
+        int after = big.NewBlock();
+        big.Call(0, [], FunctionBuilder.ReturnPlace, after);
+        big.At(after).Return();
+        var small = new FunctionBuilder("small", IrType.I32);
+        small.Local(new FixedArrayType(IrType.U8, 1000), "buffer", mutable: true);
+        int afterSmall = small.NewBlock();
+        small.Call(0, [], FunctionBuilder.ReturnPlace, afterSmall);
+        small.At(afterSmall).Return();
+        var module = new IrModule([], [helper.Build(), big.Build(), small.Build()]);
+
+        var program = Compile(module, GcConfig.Manual);
+        var bigFn = program.Function("big");
+        var smallFn = program.Function("small");
+        Check("the big frame holds the buffer", bigFn.FrameSize >= 40000, $"frame {bigFn.FrameSize}");
+        Check("the big frame's prologue slot is a jump to the probe loop (push rbp; mov rbp, rsp; jmp rel32)",
+            program.Code[bigFn.Offset + 4] == 0xE9, $"byte {program.Code[bigFn.Offset + 4]:X2}");
+        Check("a small frame keeps the 5-byte nop in the slot",
+            program.Code[smallFn.Offset + 4] == 0x0F && program.Code[smallFn.Offset + 9] == 0x48, $"byte {program.Code[smallFn.Offset + 4]:X2}");
+        using var image = program.Load();
+        Check("big() = 7 (the call from the bottom of the frame does not fault)", ((delegate* unmanaged<int>)image.Address("big"))() == 7);
+        Check("small() = 7", ((delegate* unmanaged<int>)image.Address("small"))() == 7);
     }
 
     /// <summary>The CLI: the linker tests' objects (geom.lvo, app.lvo) compiled by the x64 back end into a COFF object.</summary>
