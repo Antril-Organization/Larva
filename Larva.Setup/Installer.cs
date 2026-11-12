@@ -145,36 +145,39 @@ internal static class Installer
                 return new Result(false, null, "this setup carries no larva (build it with tools/build-installer.ps1)");
             folder = Path.GetFullPath(folder);
             Directory.CreateDirectory(folder);
-            // What an earlier Larva put here and this one does not bring (0.7.0's System.Core sources): only its files.
-            RemoveInstalled(folder, keep: Environment.ProcessPath is { } running ? Path.GetFullPath(running) : null);
+            string? self = Environment.ProcessPath is { } running ? Path.GetFullPath(running) : null;
+            string uninstaller = Path.Combine(folder, "uninstall.exe");
             string inside = Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar;
+            using var archive = new ZipArchive(payload, ZipArchiveMode.Read);
+            var entries = archive.Entries.Where(e => !e.FullName.EndsWith('/')).ToList();
+            // What stands in the way is found before anything is replaced or removed: larva running from the folder,
+            // and a file in use that this setup must overwrite or take away (an earlier Larva's).
+            var previous = Installed(folder);
+            if (RunningFrom(folder) > 0)
+                return new Result(false, null, $"larva is running from {folder}");
+            if (InUse(folder, previous.Concat(entries.Select(e => e.FullName)).Append("uninstall.exe"), keep: self) is { } busy)
+                return new Result(false, null, $"{busy} is in use");
             var installed = new List<string>();
-            using (var archive = new ZipArchive(payload, ZipArchiveMode.Read))
+            long total = Math.Max(1, entries.Sum(e => e.Length)), done = 0;
+            foreach (var entry in entries)
             {
-                long total = Math.Max(1, archive.Entries.Sum(e => e.Length)), done = 0;
-                foreach (var entry in archive.Entries)
-                {
-                    string target = Path.GetFullPath(Path.Combine(folder, entry.FullName));
-                    if (!target.StartsWith(inside, StringComparison.OrdinalIgnoreCase))
-                        continue; // never outside the folder
-                    if (entry.FullName.EndsWith('/'))
-                    {
-                        Directory.CreateDirectory(target);
-                        continue;
-                    }
-                    Step(0.85 * done / total, entry.FullName.Replace('/', '\\'));
-                    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                    entry.ExtractToFile(target, overwrite: true);
-                    installed.Add(Path.GetRelativePath(folder, target));
-                    done += entry.Length;
-                }
+                string target = Path.GetFullPath(Path.Combine(folder, entry.FullName));
+                if (!target.StartsWith(inside, StringComparison.OrdinalIgnoreCase))
+                    continue; // never outside the folder
+                Step(0.85 * done / total, entry.FullName.Replace('/', '\\'));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                entry.ExtractToFile(target, overwrite: true);
+                installed.Add(Path.GetRelativePath(folder, target));
+                done += entry.Length;
             }
             // This program, as the installed folder's uninstaller.
             Step(0.88, "uninstall.exe");
-            string uninstaller = Path.Combine(folder, "uninstall.exe");
-            if (Environment.ProcessPath is { } self && !string.Equals(Path.GetFullPath(self), uninstaller, StringComparison.OrdinalIgnoreCase))
+            if (self is not null && !string.Equals(self, uninstaller, StringComparison.OrdinalIgnoreCase))
                 File.Copy(self, uninstaller, overwrite: true);
             installed.Add("uninstall.exe");
+            // What an earlier Larva put here and this one does not bring (0.7.0's System.Core sources): only its files,
+            // and only now that the new ones are in place.
+            RemoveFiles(folder, Stale(previous, installed), keep: self);
             // The list of what is ours: the uninstaller removes these and nothing else that shares the folder.
             File.WriteAllLines(Path.Combine(folder, ManifestName), installed);
             if (path)
@@ -431,21 +434,79 @@ internal static class Installer
         ["larva.exe", "LLVM-C.dll", "libLLVMSharp.dll", "System.Core.dll", "README.txt", "uninstall.exe"];
 
     /// <summary>
-    /// The files an earlier installation put in <paramref name="folder"/> (its list, or what 0.7.0 brought), removed, and
-    /// the folders they were in when that leaves them empty; nothing else in the folder is touched. The file
-    /// <paramref name="keep"/> (the running uninstaller) stays.
+    /// The files an earlier installation put in <paramref name="folder"/> (its list, or what 0.7.0 brought), relative to
+    /// it; nothing else in the folder is ever touched.
     /// </summary>
-    private static void RemoveInstalled(string folder, string? keep)
+    private static List<string> Installed(string folder)
     {
         string manifest = Path.Combine(folder, ManifestName);
-        IEnumerable<string> ours = File.Exists(manifest)
-            ? File.ReadAllLines(manifest).Where(l => l.Length > 0)
-            : File.Exists(Path.Combine(folder, "larva.exe")) ? Known.Concat(OldLibrary(folder)) : [];
+        return File.Exists(manifest)
+            ? File.ReadAllLines(manifest).Where(l => l.Length > 0).ToList()
+            : File.Exists(Path.Combine(folder, "larva.exe")) ? Known.Concat(OldLibrary(folder)).ToList() : [];
+    }
+
+    /// <summary>A relative path as the lists compare it: one separator, no leading <c>.\</c>.</summary>
+    private static string Normal(string relative)
+    {
+        string path = relative.Replace('/', '\\').TrimStart('\\');
+        return path.StartsWith(@".\", StringComparison.Ordinal) ? path[2..] : path;
+    }
+
+    /// <summary>
+    /// What an earlier installation (<paramref name="previous"/>, relative paths) put in the folder and this one
+    /// (<paramref name="installed"/>) does not bring: what is removed once the new files are in place.
+    /// </summary>
+    internal static List<string> Stale(IEnumerable<string> previous, IEnumerable<string> installed)
+    {
+        var brought = new HashSet<string>(installed.Select(Normal), StringComparer.OrdinalIgnoreCase);
+        return previous.Where(p => p.Length > 0 && !brought.Contains(Normal(p))).ToList();
+    }
+
+    /// <summary>
+    /// The first of <paramref name="files"/> (relative to <paramref name="folder"/>) that exists and cannot be replaced
+    /// or removed now (open in another program, or not ours to write), or null; the file <paramref name="keep"/> is not
+    /// asked. Checked before anything is changed, so a failure leaves the installation as it was.
+    /// </summary>
+    internal static string? InUse(string folder, IEnumerable<string> files, string? keep)
+    {
+        folder = Path.GetFullPath(folder);
+        string inside = Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar;
+        var asked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string relative in files)
+        {
+            if (relative.Length == 0)
+                continue;
+            string file = Path.GetFullPath(Path.Combine(folder, relative));
+            if (!file.StartsWith(inside, StringComparison.OrdinalIgnoreCase) || string.Equals(file, keep, StringComparison.OrdinalIgnoreCase) || !asked.Add(file))
+                continue;
+            if (!File.Exists(file))
+                continue;
+            try
+            {
+                // Deleting or overwriting needs what no other open handle may share.
+                using var _ = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                return file;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The files <paramref name="relative"/> (to <paramref name="folder"/>) removed, and the folders they were in when
+    /// that leaves them empty; nothing else in the folder is touched. The file <paramref name="keep"/> (the running
+    /// uninstaller) stays, and so does the folder's list of files (<see cref="ManifestName"/>): its caller writes or
+    /// removes it.
+    /// </summary>
+    private static void RemoveFiles(string folder, IEnumerable<string> relative, string? keep)
+    {
         string inside = Path.TrimEndingDirectorySeparator(folder) + Path.DirectorySeparatorChar;
         var parents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (string relative in ours)
+        foreach (string name in relative)
         {
-            string file = Path.GetFullPath(Path.Combine(folder, relative));
+            string file = Path.GetFullPath(Path.Combine(folder, name));
             if (!file.StartsWith(inside, StringComparison.OrdinalIgnoreCase) || string.Equals(file, keep, StringComparison.OrdinalIgnoreCase))
                 continue;
             if (File.Exists(file))
@@ -458,8 +519,6 @@ internal static class Installer
             if (Directory.Exists(parent) && !Directory.EnumerateFileSystemEntries(parent).Any())
                 Directory.Delete(parent);
         }
-        if (File.Exists(manifest))
-            File.Delete(manifest);
     }
 
     /// <summary>0.7.0's System.Core sources (Library/System.Core/*.ant), relative to the folder.</summary>
@@ -482,24 +541,27 @@ internal static class Installer
             return $"no larva in {folder}";
         try
         {
-            if (path)
-                RemoveFromPath(folder);
+            string? self = Environment.ProcessPath is { } p ? Path.GetFullPath(p) : null;
+            // What stands in the way is found before anything is removed: larva running from the folder, and a file in
+            // use. The file types, Settings > Apps and the user's PATH go last, once the files are gone: a failure
+            // leaves a Larva that still works.
+            var files = Installed(folder);
+            if (RunningFrom(folder) > 0)
+                return $"larva is running from {folder}";
+            if (InUse(folder, files, keep: self) is { } busy)
+                return $"{busy} is in use";
+            RemoveFiles(folder, files, keep: self);
+            string manifest = Path.Combine(folder, ManifestName);
+            if (File.Exists(manifest))
+                File.Delete(manifest);
+            UnregisterFileTypes(folder);
             if (registry)
                 Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, throwOnMissingSubKey: false);
-            UnregisterFileTypes(folder);
-            string? self = Environment.ProcessPath is { } p ? Path.GetFullPath(p) : null;
-            RemoveInstalled(folder, keep: self);
+            if (path)
+                RemoveFromPath(folder);
             bool running = self is not null && string.Equals(Path.GetDirectoryName(self), folder, StringComparison.OrdinalIgnoreCase);
             if (running)
-            {
-                // The uninstaller cannot delete itself while it runs: a moment after it ends, it goes, and the folder
-                // with it only if nothing else is left there (rmdir without /s).
-                Process.Start(new ProcessStartInfo("cmd.exe", $"/c ping -n 3 127.0.0.1 >nul & del /f /q \"{self}\" & rmdir \"{folder}\"")
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                });
-            }
+                DeleteAfterExit(self!, folder);
             else if (Directory.Exists(folder) && !Directory.EnumerateFileSystemEntries(folder).Any())
                 Directory.Delete(folder);
             return null;
@@ -509,4 +571,41 @@ internal static class Installer
             return e.Message;
         }
     }
+
+    /// <summary>
+    /// The uninstaller cannot delete itself while it runs: a script of its own waits until this process has ended (its
+    /// last message closed too), then deletes <paramref name="self"/>, the folder with it only if nothing else is left
+    /// there (rmdir without /s), and itself.
+    /// </summary>
+    private static void DeleteAfterExit(string self, string folder)
+    {
+        string script = Path.Combine(Path.GetTempPath(), $"larva-uninstall-{Environment.ProcessId}.cmd");
+        File.WriteAllText(script, DeleteAfterExitScript(Environment.ProcessId, self, folder));
+        Process.Start(new ProcessStartInfo("cmd.exe", $"/c \"{script}\"")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetTempPath(),
+        });
+    }
+
+    /// <summary>
+    /// What <see cref="DeleteAfterExit"/> runs: waits (a second at a time, ten minutes at most) until the process
+    /// <paramref name="pid"/> is gone, then deletes <paramref name="self"/>, <paramref name="folder"/> if empty, and the
+    /// script.
+    /// </summary>
+    internal static string DeleteAfterExitScript(int pid, string self, string folder) =>
+        "@echo off\r\n"
+        + "set n=0\r\n"
+        + ":wait\r\n"
+        + $"tasklist /fi \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul\r\n"
+        + "if errorlevel 1 goto gone\r\n"
+        + "set /a n+=1\r\n"
+        + "if %n% gtr 600 goto gone\r\n"
+        + "ping -n 2 127.0.0.1 >nul\r\n"
+        + "goto wait\r\n"
+        + ":gone\r\n"
+        + $"del /f /q \"{self}\"\r\n"
+        + $"rmdir \"{folder}\"\r\n"
+        + "del \"%~f0\"\r\n";
 }

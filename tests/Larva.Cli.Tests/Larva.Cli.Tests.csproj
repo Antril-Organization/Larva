@@ -5,6 +5,8 @@
   <ItemGroup>
     <!-- Built first; the tests run its larva.dll with dotnet. -->
     <ProjectReference Include="..\..\Larva.Cli\Larva.Cli.csproj" ReferenceOutputAssembly="false" />
+    <!-- The Windows setup's registry-free helpers (InstallerTests). -->
+    <ProjectReference Include="..\..\Larva.Setup\Larva.Setup.csproj" />
   </ItemGroup>
 
 </Project>
