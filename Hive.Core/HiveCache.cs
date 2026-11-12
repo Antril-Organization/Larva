@@ -120,6 +120,7 @@ namespace Hive
         /// </summary>
         public void Trust(PackageReference package, string fingerprint)
         {
+            using var held = HiveFileLock.Acquire(KeysFile + ".lock");
             var keys = LoadKeys();
             if (keys.TryGetValue(package.Id, out var known))
             {
@@ -135,6 +136,7 @@ namespace Hive
         /// <summary><c>hive trust</c>: accepts another key for a package.</summary>
         public void AddTrusted(PackageReference package, string fingerprint)
         {
+            using var held = HiveFileLock.Acquire(KeysFile + ".lock");
             var keys = LoadKeys();
             if (!keys.TryGetValue(package.Id, out var known))
                 keys[package.Id] = known = [];
@@ -143,11 +145,48 @@ namespace Hive
             SaveKeys(keys);
         }
 
+        /// <summary>Written whole or not at all (a reader never sees half a file), under the keys lock.</summary>
         private void SaveKeys(Dictionary<string, List<string>> keys)
         {
             Directory.CreateDirectory(Root);
-            File.WriteAllBytes(KeysFile, JsonSerializer.SerializeToUtf8Bytes(keys, HiveManifest.Json));
+            string temporary = $"{KeysFile}.{Environment.ProcessId}.partial";
+            File.WriteAllBytes(temporary, JsonSerializer.SerializeToUtf8Bytes(keys, HiveManifest.Json));
+            File.Move(temporary, KeysFile, overwrite: true);
         }
+    }
+
+    /// <summary>
+    /// What one larva (process or thread) holds while it changes something in the cache others may be changing too: a
+    /// <c>.lock</c> file opened for exclusive access. Others wait for it (retrying briefly), then give up with a message.
+    /// </summary>
+    internal sealed class HiveFileLock : IDisposable
+    {
+        private readonly FileStream stream;
+
+        private HiveFileLock(FileStream stream) => this.stream = stream;
+
+        public static HiveFileLock Acquire(string path, TimeSpan? patience = null)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var limit = Environment.TickCount64 + (long)(patience ?? TimeSpan.FromSeconds(30)).TotalMilliseconds;
+            while (true)
+            {
+                try
+                {
+                    return new HiveFileLock(new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, 1));
+                }
+                catch (IOException e) when (Environment.TickCount64 >= limit)
+                {
+                    throw new HiveException($"another larva is using the package cache ({path}) and did not finish in time: {e.Message}");
+                }
+                catch (IOException)
+                {
+                    Thread.Sleep(Random.Shared.Next(10, 60));
+                }
+            }
+        }
+
+        public void Dispose() => stream.Dispose();
     }
 
     /// <summary>A package a lock pins: the exact version, the package file's hash, its signer and where it came from.</summary>

@@ -117,7 +117,6 @@ namespace Hive
         {
             var entry = new HiveLockEntry(package.Id, version.Version, version.Sha256, version.Key, provider.Address, version.Dependencies);
             string folder = cache.Folder(package, version.Version);
-            string stamp = Path.Combine(folder, HiveCache.StampFile);
             if (cache.Has(package, version.Version, version.Sha256))
                 return entry;
 
@@ -136,8 +135,8 @@ namespace Hive
                 throw new HiveException($"{provider.Address} gave {opened.Manifest.Package} {opened.Manifest.Version} for {package.Id} {version.Version}");
             if (version.Key is { } signer)
                 cache.Trust(package, signer);
-            HiveArchive.Extract(opened, folder);
-            File.WriteAllText(stamp, version.Sha256);
+            // The hash goes in with the files: the folder appears complete, with its stamp, or not at all.
+            HiveArchive.Extract(opened, folder, version.Sha256);
             return entry;
         }
     }

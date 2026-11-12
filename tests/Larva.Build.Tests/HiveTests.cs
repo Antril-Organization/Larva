@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
 using Hive;
 
 namespace Larva.Build.Tests;
@@ -258,6 +259,49 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
     }
 
     // ── the cache ──
+
+    /// <summary>Several larva processes share the cache: unpacking the same version and remembering keys at once loses nothing.</summary>
+    [Fact]
+    public void Cache_writes_survive_concurrent_larvas()
+    {
+        string root = Path.Combine(hive.Root, "concurrent");
+        var cache = new HiveCache(root);
+        string fingerprint = new string('f', 64);
+        var failures = new List<Exception>();
+        void Try(Action action)
+        {
+            try { action(); }
+            catch (Exception e) { lock (failures) failures.Add(e); }
+        }
+        Parallel.For(0, 24, i => Try(() => cache.Trust(PackageReference.Parse($"P/N{i}")!, fingerprint)));
+        Parallel.For(0, 24, i => Try(() => cache.AddTrusted(PackageReference.Parse("P/Shared")!, new string((char)('a' + i % 6), 60) + i.ToString("D4"))));
+        var keys = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllBytes(Path.Combine(root, "keys.json")), HiveManifest.Json)!;
+        Check("keys remembered at once are all kept", failures.Count == 0 && Enumerable.Range(0, 24).All(i => keys.GetValueOrDefault($"P/N{i}") is [var one] && one == fingerprint) && keys["P/Shared"].Count == 24,
+            failures.Count > 0 ? failures[0].ToString() : $"{keys.Count} packages, {keys.GetValueOrDefault("P/Shared")?.Count} shared keys");
+        Check("…through whole files only (no partial file is left)", !Directory.EnumerateFiles(root, "*.partial").Any());
+
+        string source = Path.Combine(root, "src");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "a.lvo"), new string('x', 200_000));
+        File.WriteAllText(Path.Combine(source, "b.txt"), "text");
+        string file = Path.Combine(root, "C-1.0.0.hive");
+        HiveArchive.Create(file, new HiveManifest { Package = "P/C", Version = "1.0.0" }, new Dictionary<string, string> { ["lib/a.lvo"] = Path.Combine(source, "a.lvo"), ["b.txt"] = Path.Combine(source, "b.txt") }, null);
+        var opened = HiveArchive.Open(File.ReadAllBytes(file), null, false);
+        string target = cache.Folder(PackageReference.Parse("P/C")!, "1.0.0");
+        Parallel.For(0, 8, _ => Try(() => HiveArchive.Extract(opened, target, "stamp")));
+        Check("the same version unpacked by several at once ends complete, stamped, with nothing half done beside it",
+            failures.Count == 0 && File.ReadAllText(Path.Combine(target, "b.txt")) == "text" && new FileInfo(Path.Combine(target, "lib", "a.lvo")).Length == 200_000
+            && cache.Stamp(PackageReference.Parse("P/C")!, "1.0.0") == "stamp" && !Directory.EnumerateDirectories(Path.GetDirectoryName(target)!, "*.partial").Any(),
+            failures.Count > 0 ? failures[0].ToString() : string.Join(", ", Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(target)!)));
+        Check("a folder another larva left half done is cleared when the version is unpacked again", Cleared());
+        bool Cleared()
+        {
+            string stale = $"{target}.deadbeef.partial";
+            Directory.CreateDirectory(stale);
+            HiveArchive.Extract(opened, target, "stamp");
+            return !Directory.Exists(stale) && File.Exists(Path.Combine(target, "b.txt"));
+        }
+    }
 
     /// <summary>The cache never mixes two packages up because the file system would (case, trailing dots), and a lock pins bytes, not just a version number.</summary>
     [Fact]
