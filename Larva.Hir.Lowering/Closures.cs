@@ -778,8 +778,7 @@ namespace Larva.Hir.Lowering
             b.Assign(function, Operand.Copy(handle.Deref().Field(2)))
              .Assign(environment, Operand.Copy(handle.Deref().Field(3)));
             var arguments = new List<Operand> { Operand.Copy(environment) };
-            foreach (var argument in invoke.Arguments)
-                arguments.Add(Value(argument));
+            arguments.AddRange(Operands(invoke.Arguments));
             int next = NewBlock();
             b.CallIndirect(Operand.Copy(function), [.. arguments], target, next, Handlers());
             At(next);
