@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Text;
 using Larva.IR;
 using Larva.Native;
@@ -204,6 +205,62 @@ public sealed unsafe class X64Tests : CheckedTest
         var soft = X64Backend.Compile(new IrModule([], [quad.Build()]));
         Check("f128 is compiled (soft-float routines in the runtime)", !soft.Skipped.ContainsKey("quad") && soft.Error is null, soft.Error);
     }
+
+    /// <summary>
+    /// Larva's rule for every back end: a float out of the integer's range gives the nearest limit and NaN gives 0 (LLVM's
+    /// fptosi.sat), never cvttsd2si's 0x8000… or a wrapped value; the VM agrees.
+    /// </summary>
+    [Fact]
+    public void Float_to_integer_conversions_saturate()
+    {
+        var targets = new[] { IrType.I8, IrType.I16, IrType.I32, IrType.I64, IrType.U8, IrType.U16, IrType.U32, IrType.U64 };
+        var functions = new List<IrFunction>();
+        foreach (var target in targets)
+        {
+            foreach (var source in new[] { IrType.F64, IrType.F32 })
+            {
+                var f = new FunctionBuilder($"{source}_to_{target}", target);
+                int x = f.Argument(source, "x");
+                f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(x), target)).Return();
+                functions.Add(f.Build());
+            }
+        }
+        var module = new IrModule([], [.. functions]);
+        using var image = Load(module);
+        var vm = Vm(module);
+        var inputs = new[] { 1e30, -1e30, double.NaN, double.PositiveInfinity, double.NegativeInfinity, 3.9, -3.9, 0.0, 2147483648.0, 255.5, -0.5 };
+        foreach (var target in targets)
+        {
+            long min = target.IsSigned ? -(1L << (target.BitWidth!.Value - 1)) : 0;
+            ulong max = target.IsSigned ? (1UL << (target.BitWidth!.Value - 1)) - 1 : target.BitWidth == 64 ? ulong.MaxValue : (1UL << target.BitWidth!.Value) - 1;
+            foreach (double x in inputs)
+            {
+                var expected = double.IsNaN(x) ? 0 : x >= max ? (BigInteger)max : x <= min ? min : new BigInteger(Math.Truncate(x));
+                var fromDouble = Call(image, $"f64_to_{target}", target, x);
+                var fromSingle = Call(image, $"f32_to_{target}", target, (float)x);
+                var expectedSingle = double.IsNaN(x) ? 0 : (float)x >= max ? (BigInteger)max : (float)x <= min ? min : new BigInteger(Math.Truncate((float)x));
+                Check($"({target}){x} = {expected}", fromDouble == expected, $"x64 gave {fromDouble}");
+                Check($"({target})(f32){x} = {expectedSingle}", fromSingle == expectedSingle, $"x64 gave {fromSingle}");
+                Check($"VM: ({target}){x} = {expected}", new BigInteger(System.Convert.ToDecimal(vm.Run($"f64_to_{target}", x))) == expected, $"VM gave {vm.Run($"f64_to_{target}", x)}");
+            }
+        }
+    }
+
+    private static BigInteger Call(X64Image image, string name, IrType target, double x) => target.BitWidth switch
+    {
+        8 => target.IsSigned ? ((delegate* unmanaged<double, sbyte>)image.Address(name))(x) : ((delegate* unmanaged<double, byte>)image.Address(name))(x),
+        16 => target.IsSigned ? ((delegate* unmanaged<double, short>)image.Address(name))(x) : ((delegate* unmanaged<double, ushort>)image.Address(name))(x),
+        32 => target.IsSigned ? ((delegate* unmanaged<double, int>)image.Address(name))(x) : ((delegate* unmanaged<double, uint>)image.Address(name))(x),
+        _ => target.IsSigned ? ((delegate* unmanaged<double, long>)image.Address(name))(x) : ((delegate* unmanaged<double, ulong>)image.Address(name))(x),
+    };
+
+    private static BigInteger Call(X64Image image, string name, IrType target, float x) => target.BitWidth switch
+    {
+        8 => target.IsSigned ? ((delegate* unmanaged<float, sbyte>)image.Address(name))(x) : ((delegate* unmanaged<float, byte>)image.Address(name))(x),
+        16 => target.IsSigned ? ((delegate* unmanaged<float, short>)image.Address(name))(x) : ((delegate* unmanaged<float, ushort>)image.Address(name))(x),
+        32 => target.IsSigned ? ((delegate* unmanaged<float, int>)image.Address(name))(x) : ((delegate* unmanaged<float, uint>)image.Address(name))(x),
+        _ => target.IsSigned ? ((delegate* unmanaged<float, long>)image.Address(name))(x) : ((delegate* unmanaged<float, ulong>)image.Address(name))(x),
+    };
 
     /// <summary>The object file, read back with LLVM's object reader and disassembled with LLVM's disassembler.</summary>
     [Fact]

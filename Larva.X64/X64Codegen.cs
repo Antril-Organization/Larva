@@ -1846,32 +1846,9 @@ namespace Larva.X64
             if (fromKind == X64Codegen.Kind.Float)
             {
                 a.LoadFloat(Xmm.X0, Frame(value), fromSize);
-                if (to == IrType.U64)
-                {
-                    // ≥ 2^63: convert x - 2^63 and set the top bit back.
-                    var small = new Label();
-                    var done = new Label();
-                    a.MovImm(Reg.Rax, fromSize == 4 ? 0x5F00_0000L : 0x43E0_0000_0000_0000L); // 2^63
-                    if (fromSize == 4)
-                        a.BitsToFloat(Xmm.X1, Reg.Rax);
-                    else
-                        a.BitsToFloat(Xmm.X1, Reg.Rax);
-                    a.FloatCompare(Xmm.X0, Xmm.X1, fromSize);
-                    a.Jcc(Cond.B, small);
-                    a.FloatSub(Xmm.X0, Xmm.X1, fromSize);
-                    a.FloatToInt(Reg.Rax, Xmm.X0, fromSize);
-                    a.MovImm(Reg.Rcx, long.MinValue);
-                    a.Xor(Reg.Rax, Reg.Rcx);
-                    a.Jmp(done);
-                    a.Bind(small);
-                    a.FloatToInt(Reg.Rax, Xmm.X0, fromSize);
-                    a.Bind(done);
-                }
-                else
-                {
-                    a.FloatToInt(Reg.Rax, Xmm.X0, fromSize);
-                }
-                Canonicalize(Reg.Rax, to);
+                if (fromSize == 4)
+                    a.FloatResize(Xmm.X0, Xmm.X0, 4); // a single widened to a double is exact: one set of bounds below
+                FloatToIntSaturating(to);
                 a.Store(Frame(value), Reg.Rax, 8);
                 return value;
             }
@@ -1909,6 +1886,64 @@ namespace Larva.X64
             Canonicalize(Reg.Rax, to);
             a.Store(Frame(value), Reg.Rax, 8);
             return value;
+        }
+
+        /// <summary>
+        /// The double in <c>xmm0</c> as the integer <paramref name="to"/> in <c>rax</c> (canonical), with Larva's rule for
+        /// every back end: a value out of the target's range gives the nearest limit and NaN gives 0 (LLVM's
+        /// <c>fptosi.sat</c>/<c>fptoui.sat</c>), never <c>cvttsd2si</c>'s "integer indefinite" 0x8000… or a wrapped value.
+        /// </summary>
+        private void FloatToIntSaturating(IrType to)
+        {
+            int size = cg.Shape(to).Size;
+            var done = new Label();
+            a.MovImm(Reg.Rax, 0);
+            a.FloatCompare(Xmm.X0, Xmm.X0, 8);
+            a.Jcc(Cond.P, done);                                        // NaN → 0
+            void Bound(double bound) { a.MovImm(Reg.Rcx, BitConverter.DoubleToInt64Bits(bound)); a.BitsToFloat(Xmm.X1, Reg.Rcx); }
+            if (to.IsSigned)
+            {
+                long max = size == 8 ? long.MaxValue : (1L << (8 * size - 1)) - 1;
+                long min = -max - 1;
+                Bound(size == 8 ? 9223372036854775808.0 : max + 1);     // 2^(bits-1): the first double past the maximum
+                a.MovImm(Reg.Rax, max);
+                a.FloatCompare(Xmm.X0, Xmm.X1, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≥ 2^(bits-1) → max
+                Bound(min);
+                a.MovImm(Reg.Rax, min);
+                a.FloatCompare(Xmm.X1, Xmm.X0, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≤ min → min
+                a.FloatToInt(Reg.Rax, Xmm.X0, 8);                       // in range: the truncation is exact
+            }
+            else
+            {
+                ulong max = size == 8 ? ulong.MaxValue : (1UL << (8 * size)) - 1;
+                Bound(size == 8 ? 18446744073709551616.0 : max + 1);    // 2^bits
+                a.MovImm(Reg.Rax, (long)max);
+                a.FloatCompare(Xmm.X0, Xmm.X1, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≥ 2^bits → max
+                a.MovImm(Reg.Rax, 0);
+                Bound(0.0);
+                a.FloatCompare(Xmm.X1, Xmm.X0, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≤ 0 → 0 (negatives, -0)
+                if (size == 8)
+                {
+                    // ≥ 2^63: convert x - 2^63 and set the top bit back.
+                    var small = new Label();
+                    Bound(9223372036854775808.0);
+                    a.FloatCompare(Xmm.X0, Xmm.X1, 8);
+                    a.Jcc(Cond.B, small);
+                    a.FloatSub(Xmm.X0, Xmm.X1, 8);
+                    a.FloatToInt(Reg.Rax, Xmm.X0, 8);
+                    a.MovImm(Reg.Rcx, long.MinValue);
+                    a.Xor(Reg.Rax, Reg.Rcx);
+                    a.Jmp(done);
+                    a.Bind(small);
+                }
+                a.FloatToInt(Reg.Rax, Xmm.X0, 8);
+            }
+            a.Bind(done);
+            Canonicalize(Reg.Rax, to);
         }
 
         private int WideConvert(int value, IrType from, IrType to, X64Codegen.Kind fromKind, bool fromSigned, X64Codegen.Kind toKind)

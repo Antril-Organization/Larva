@@ -592,14 +592,37 @@ namespace Larva.Runtime.Vm
                 ? Value.FromFloatBits(constant.Bits, constant.Type)
                 : Value.FromInt(constant.Bits, constant.Type);
 
+        /// <summary>
+        /// A float as an integer with Larva's rule for every back end: truncation; a value out of the target's range gives
+        /// the nearest limit, NaN gives 0 (LLVM's <c>fptosi.sat</c>), never a wrapped value.
+        /// </summary>
+        private static BigInteger SaturatedInteger(Value value, PrimitiveType target)
+        {
+            int bits = target.BitWidth!.Value;
+            BigInteger max = target.IsSigned ? (BigInteger.One << (bits - 1)) - 1 : (BigInteger.One << bits) - 1;
+            BigInteger min = target.IsSigned ? -max - 1 : BigInteger.Zero;
+            if (!Numbers.IsWide(value.Type))
+            {
+                double d = value.Float;
+                if (double.IsNaN(d))
+                    return BigInteger.Zero;
+                if (double.IsPositiveInfinity(d))
+                    return max;
+                if (double.IsNegativeInfinity(d))
+                    return min;
+            }
+            var truncated = Heap.AsInteger(value);
+            return truncated > max ? max : truncated < min ? min : truncated;
+        }
+
         private Value Convert(Value value, ConvertOp op, Frame frame, long operand)
         {
             switch (op)
             {
                 case ConvertOp.Conv or ConvertOp.Cast:
                     var target = frame.Resolve(operand);
-                    if (target is PrimitiveType { IsInteger: true } && value.Kind == ValueKind.Float)
-                        return Value.FromInt(Heap.AsInteger(value), target);
+                    if (target is PrimitiveType { IsInteger: true } integer && value.Kind == ValueKind.Float)
+                        return Value.FromInt(SaturatedInteger(value, integer), target);
                     return Heap.Coerce(value, target);
                 case ConvertOp.BitCast:
                     var to = frame.Resolve(operand);

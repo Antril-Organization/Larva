@@ -1265,9 +1265,17 @@ namespace Larva.Wasm
             {
                 c.LocalGet(Fp);
                 if (fromSize == 4) c.F32Load(value); else c.F64Load(value);
-                // Saturating truncation (no trap on NaN or overflow).
+                // Larva's rule for every back end: a value out of the target's range gives the nearest limit and NaN
+                // gives 0 (LLVM's fptosi.sat): i64.trunc_sat_f*_s/u saturates to 64 bits (0xFC 4..7), and a narrower
+                // target is clamped to its own range before the canonical wrap (which alone would turn i32 max into -1).
                 c.Prefixed(to == IrType.U64 ? (fromSize == 4 ? 5u : 7u) : (fromSize == 4 ? 4u : 6u));
                 c.LocalSet(A);
+                if (toSize < 8)
+                {
+                    long max = to.IsSigned ? (1L << (8 * toSize - 1)) - 1 : (1L << (8 * toSize)) - 1;
+                    long min = to.IsSigned ? -max - 1 : 0;
+                    ClampA(min, max);
+                }
                 Canonicalize(to);
                 StoreA(value);
                 return value;
@@ -1289,6 +1297,25 @@ namespace Larva.Wasm
         }
 
         /// <summary>Makes local <see cref="A"/> the canonical form of <paramref name="type"/> (truncated, then extended).</summary>
+        /// <summary>Clamps the signed i64 in <c>A</c> into [<paramref name="min"/>, <paramref name="max"/>] (with <c>select</c>).</summary>
+        private void ClampA(long min, long max)
+        {
+            c.LocalGet(A);
+            c.I64(max);
+            c.LocalGet(A);
+            c.I64(max);
+            c.I64Op(0x53); // i64.lt_s
+            c.Raw(0x1B);   // select: A when A < max, else max
+            c.LocalSet(A);
+            c.LocalGet(A);
+            c.I64(min);
+            c.LocalGet(A);
+            c.I64(min);
+            c.I64Op(0x55); // i64.gt_s
+            c.Raw(0x1B);   // select: A when A > min, else min
+            c.LocalSet(A);
+        }
+
         private void Canonicalize(IrType type)
         {
             var (kind, size, signed) = cg.Shape(type);
