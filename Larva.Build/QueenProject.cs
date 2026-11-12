@@ -243,6 +243,21 @@ namespace Larva.Build
         [ThreadStatic]
         private static (string Path, string Text)? pendingText;
 
+        /// <summary>
+        /// The BUILD settings in effect, as written: this machine's defaults (<c>larva config</c>), then the project's own
+        /// BUILD entries, which win. What a build is really made with (and what tells one build from the next: a change
+        /// of any of them, in the file or in the defaults, means building again).
+        /// </summary>
+        public SortedDictionary<string, string> EffectiveBuild()
+        {
+            var settings = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (key, value) in LarvaDefaults.Effective().Where(v => LarvaDefaults.IsBuildKey(v.Key)))
+                settings[key] = value;
+            foreach (var entry in Document.Named("BUILD").SelectMany(c => c.Entries))
+                settings[entry.Key] = entry.Value.Display;
+            return settings;
+        }
+
         /// <summary>Whether the project's BUILD chunk sets <paramref name="key"/> itself (not a default).</summary>
         public bool Sets(string key) =>
             Document.Chunks.Where(c => c.Name == "BUILD").SelectMany(c => c.Entries).Any(e => e.Key == key) || LarvaDefaults.Configured().ContainsKey(key);

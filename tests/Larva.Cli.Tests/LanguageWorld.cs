@@ -13,7 +13,24 @@ namespace Larva.Cli.Tests;
 /// </summary>
 internal sealed class LanguageWorld
 {
-    public static string SourcePack { get; } = Path.GetFullPath(Path.Combine(LarvaProcess.Repository, "..", "Antril", "artifacts", "pack", "Antril"));
+    public static string SourcePack { get; } = FindSourcePack();
+
+    /// <summary>
+    /// The Antril dev pack: <c>Antril/artifacts/pack/Antril</c> next to the repository (or next to the checkout a worktree
+    /// belongs to: the first `Antril` sibling going up), else the one LARVA_LANGUAGES names.
+    /// </summary>
+    private static string FindSourcePack()
+    {
+        for (var folder = new DirectoryInfo(LarvaProcess.Repository).Parent; folder is not null; folder = folder.Parent)
+        {
+            string candidate = Path.Combine(folder.FullName, "Antril", "artifacts", "pack", "Antril");
+            if (File.Exists(Path.Combine(candidate, "language.json")))
+                return candidate;
+        }
+        if (Environment.GetEnvironmentVariable("LARVA_LANGUAGES") is { Length: > 0 } packs)
+            return Path.Combine(packs, "Antril");
+        return Path.GetFullPath(Path.Combine(LarvaProcess.Repository, "..", "Antril", "artifacts", "pack", "Antril"));
+    }
 
     public static string Platform
     {
