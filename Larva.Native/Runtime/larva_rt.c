@@ -6998,6 +6998,7 @@ LARVA_API void larva_panic(int32_t code, int64_t a, int64_t b) {
     case 2: fputs("larva panic: division by zero\n", stderr); break;
     case 4: fprintf(stderr, "larva panic: invalid array length %lld\n", (long long)a); break;
     case 5: fputs("larva panic: null reference\n", stderr); break;
+    case 7: fputs("larva panic: an exception escaped a destructor while another was being handled\n", stderr); break;
     default: fprintf(stderr, "larva panic: trap %d\n", code); break;
     }
     fflush(stderr);

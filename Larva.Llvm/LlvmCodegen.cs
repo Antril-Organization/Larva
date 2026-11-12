@@ -1642,6 +1642,12 @@ namespace Larva.Llvm
                 b.PositionAtEnd(cleanup);
                 if (cg.flagExceptions)
                 {
+                    // The exception in flight is taken off the flag while the releases run their destructors (a destructor's
+                    // own calls would read it as thrown by them, and one that throws and catches would clear it), and put
+                    // back after; a destructor that lets an exception escape here ends the program, rather than hiding this one.
+                    var payload = b.BuildLoad2(cg.ptr, cg.payloadGlobal, "unwinding.payload");
+                    var type = b.BuildLoad2(Ctx.Int64Type, cg.typeGlobal, "unwinding.type");
+                    b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), cg.payloadGlobal);
                     for (int l = 0; l < function.Locals.Length; l++)
                         ReleaseOwned(new Place(l), []);
                     if (caughtPayload.Handle != IntPtr.Zero)
@@ -1650,6 +1656,16 @@ namespace Larva.Llvm
                         cg.CallRuntime("larva_unpin", b.BuildLoad2(cg.ptr, slot, ""));
                     if (regionDepth.Handle != IntPtr.Zero)
                         cg.CallRuntime("larva_region_unwind", regionDepth);
+                    var escaped = b.BuildIsNotNull(b.BuildLoad2(cg.ptr, cg.payloadGlobal, ""), "destructor.threw");
+                    var terminate = fn.AppendBasicBlock("destructor.threw");
+                    var restore = fn.AppendBasicBlock("unwinding.restored");
+                    cg.Unlikely(b.BuildCondBr(escaped, terminate, restore));
+                    b.PositionAtEnd(terminate);
+                    cg.CallRuntime("larva_panic", I32(7), I64(0), I64(0));
+                    b.BuildUnreachable();
+                    b.PositionAtEnd(restore);
+                    b.BuildStore(payload, cg.payloadGlobal);
+                    b.BuildStore(type, cg.typeGlobal);
                     b.BuildBr(Propagate());
                     return;
                 }

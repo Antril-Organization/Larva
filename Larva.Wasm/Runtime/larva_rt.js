@@ -504,7 +504,8 @@ export async function run(options = {}) {
     };
 
     const panics = { 1: (a, b) => `index ${a} out of bounds for length ${b}`, 2: () => "division by zero", 3: () => "unreachable code",
-        4: a => `invalid array length ${a}`, 5: () => "null reference", 6: () => "stack overflow" };
+        4: a => `invalid array length ${a}`, 5: () => "null reference", 6: () => "stack overflow",
+        7: () => "an exception escaped a destructor while another was being handled" };
 
     const imports = {
         env: {

@@ -178,6 +178,22 @@ public sealed unsafe class LlvmTests : CheckedTest
             $"y {y}, pins {NativeRuntime.Pins}, most at once {NativeRuntime.MaxPinned}, held {NativeRuntime.Pinned}");
     }
 
+    /// <summary>
+    /// Flag exceptions (Linux, WebAssembly): the cleanup takes the exception in flight off the flag while it runs the frame's
+    /// destructors (one that throws and catches its own would clear it; one that lets one escape ends the program), and puts
+    /// it back before continuing to the caller.
+    /// </summary>
+    [Fact]
+    public void Flag_exception_cleanups_keep_the_exception_in_flight_across_destructors()
+    {
+        string ir = Ir(MaybeGive(), "x86_64-unknown-linux-gnu", GcConfig.Manual);
+        string cleanup = Extract(ir, "cleanup:", null, 60);
+        Check("the cleanup saves the exception in flight and clears the flag before the releases", cleanup.Contains("%unwinding.payload = load ptr, ptr @larva_exception")
+            && cleanup.Contains("store ptr null, ptr @larva_exception"), cleanup);
+        Check("a destructor's escaped exception ends the program (larva_panic 7), else the saved exception is put back",
+            ir.Contains("call void @larva_panic(i32 7") && ir.Contains("store ptr %unwinding.payload, ptr @larva_exception") && ir.Contains("store i64 %unwinding.type, ptr @larva_exception_type"), ir);
+    }
+
     [Fact]
     public void A_linked_program_runs_across_modules()
     {
@@ -554,9 +570,9 @@ public sealed unsafe class LlvmTests : CheckedTest
     private static Interpreter Vm(IrModule module) => new(Compiler.Compile(module).Il!);
 
     /// <summary>The LLVM IR of <paramref name="module"/> for another target (not run).</summary>
-    private static string Ir(IrModule module, string triple)
+    private static string Ir(IrModule module, string triple, GcConfig? gc = null)
     {
-        var result = LlvmBackend.Compile(module, new LlvmOptions { Compilation = CompilationOptions.Default, OptimizationLevel = 0, Triple = triple });
+        var result = LlvmBackend.Compile(module, new LlvmOptions { Compilation = CompilationOptions.Default with { Gc = gc ?? GcConfig.Default }, OptimizationLevel = 0, Triple = triple });
         if (!result.Success)
             throw new InvalidOperationException(result.ToString());
         using var program = result.Program!;
