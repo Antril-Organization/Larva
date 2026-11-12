@@ -230,6 +230,33 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
         Check("an exe or a project without a version is not packed", Throws(() => HivePacker.Pack(project, library, packed, null, null), "packages are libraries"));
     }
 
+    // ── publishing ──
+
+    /// <summary>A project's .queen names where it publishes: the shared token must not follow that address.</summary>
+    [Fact]
+    public void Publishing_sends_the_token_only_to_configured_registries()
+    {
+        var antril = new Uri("https://antril.org/hive/");
+        var evil = new Uri("https://evil.example/hive/");
+        var local = new Uri("http://127.0.0.1:8080/");
+        string? Env(Dictionary<string, string> variables, string name) => variables.GetValueOrDefault(name);
+        var shared = new Dictionary<string, string> { ["HIVE_TOKEN"] = "shared" };
+        Check("HIVE_TOKEN goes to a registry configured on this machine (with or without a scheme)",
+            HiveHttpProvider.TokenFor(antril, ["antril.org/hive"], n => Env(shared, n)) == "shared"
+            && HiveHttpProvider.TokenFor(antril, ["https://antril.org/hive/"], n => Env(shared, n)) == "shared"
+            && HiveHttpProvider.TokenFor(antril, HiveSettings.Defaults(), n => Env(shared, n)) == "shared");
+        Check("HIVE_TOKEN does not go to a registry a project names", HiveHttpProvider.TokenFor(evil, ["antril.org/hive"], n => Env(shared, n)) is null
+            && HiveHttpProvider.TokenFor(evil, [], n => Env(shared, n)) is null && HiveHttpProvider.TokenFor(evil, ["../registry", "file:x", "C:/r"], n => Env(shared, n)) is null);
+        Check("nor over another scheme or port of a configured host", HiveHttpProvider.TokenFor(new Uri("http://antril.org/hive/"), ["antril.org/hive"], n => Env(shared, n)) is null
+            && HiveHttpProvider.TokenFor(local, ["http://127.0.0.1:9090/"], n => Env(shared, n)) is null);
+        var own = new Dictionary<string, string> { ["HIVE_TOKEN"] = "shared", ["HIVE_TOKEN_EVIL_EXAMPLE"] = "mine", ["HIVE_TOKEN_127_0_0_1"] = "loop" };
+        Check("a registry's own variable (HIVE_TOKEN_<HOST>) is sent to it wherever it is named",
+            HiveHttpProvider.TokenVariableFor(evil) == "HIVE_TOKEN_EVIL_EXAMPLE" && HiveHttpProvider.TokenFor(evil, [], n => Env(own, n)) == "mine"
+            && HiveHttpProvider.TokenFor(local, [], n => Env(own, n)) == "loop" && HiveHttpProvider.TokenFor(antril, ["antril.org/hive"], n => Env(own, n)) == "shared");
+        Check("publishing without a token the registry may have is refused, naming the variable", Throws(() =>
+            new HiveHttpProvider(evil).Publish(PackageReference.Parse("T/X")!, new HiveIndexVersion { Version = "1.0.0", File = "x", Sha256 = new string('0', 64) }, [1], null), "HIVE_TOKEN_EVIL_EXAMPLE"));
+    }
+
     // ── the cache ──
 
     /// <summary>The cache never mixes two packages up because the file system would (case, trailing dots), and a lock pins bytes, not just a version number.</summary>
