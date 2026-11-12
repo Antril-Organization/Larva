@@ -605,9 +605,11 @@ namespace Larva.Bindings
                     }
                     if (declaration.Contains("(*"))
                     {
-                        // a function pointer field: `ret (*name)(params)`
+                        // a function pointer field: `ret (*name)(params)`, or an array of them: `ret (*name[N])(params)`
                         var (type, fieldName) = SplitParameter(declaration, raw.Fields.Count + 1);
-                        raw.Fields.Add(new RawField(type, fieldName, null));
+                        int declaratorOpen = declaration.IndexOf("(*", StringComparison.Ordinal), declaratorClose = declaration.IndexOf(')', declaratorOpen);
+                        string declarator = declaratorClose < 0 ? declaration[declaratorOpen..] : declaration[declaratorOpen..declaratorClose];
+                        raw.Fields.Add(Field(type, 0, declarator, fieldName)); // `[N]` in the declarator: N function pointers in a row
                         continue;
                     }
                     var parts = BindingDescription.SplitTopLevel(declaration);
@@ -838,7 +840,10 @@ namespace Larva.Bindings
             int pointerOpen = p.IndexOf("(*", StringComparison.Ordinal);
             if (pointerOpen >= 0 && p.IndexOf(')', pointerOpen) is var pointerClose && pointerClose > 0)
             {
-                string name = Tokens(p[(pointerOpen + 2)..pointerClose]).LastOrDefault(IsIdentifier) ?? $"p{index}";
+                string declarator = p[(pointerOpen + 2)..pointerClose];
+                if (declarator.IndexOf('[') is var arrayOpen && arrayOpen >= 0)
+                    declarator = declarator[..arrayOpen]; // `(*name[N])`: the name is before the length
+                string name = Tokens(declarator).LastOrDefault(IsIdentifier) ?? $"p{index}";
                 return (p[..pointerOpen] + "(*)" + p[(pointerClose + 1)..], name);
             }
             int bracket = p.IndexOf('[');

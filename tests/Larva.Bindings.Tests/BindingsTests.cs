@@ -155,6 +155,29 @@ public sealed class BindingsTests : CheckedTest
             && reader.Enums.Single().Members.Select(m => m.Value).SequenceEqual([493, 8, 9, 3]));
     }
 
+    /// <summary>`void (*ops[4])(int)` in a struct: four function pointers in a row, the callback type kept, not one pointer.</summary>
+    [Fact]
+    public void Arrays_of_function_pointers_are_struct_fields_of_N_callbacks()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #define OPS 4
+            typedef struct { int tag; void (*ops[4])(int); int (*single)(void); double (*grid[2][3])(void); void (*named[OPS])(void*); } Table;
+            void Use(Table* t);
+            """, "lib.dll");
+        Log(description);
+        Check("the field is `func*<i32> : void[4]`; a single pointer stays as it was; a two-dimensional array is one row; a #define as the length",
+            description.Contains("struct Table { i32 tag; func*<i32> : void[4] ops; func*<> : i32 single; func*<> : f64[6] grid; func*<void*> : void[4] named }\n")
+            && description.Contains("Use(Table* t)\n"), string.Join("; ", reader.Opaque.Select(o => $"{o.Name}: {o.Why}")));
+        var parsed = BindingDescription.Parse(description);
+        Check("the layout counts the pointers: 4 (+4) + 32 + 8 + 48 + 32 bytes, 8-aligned", BindingDescription.Layout("Table", parsed.Structs) == (128, 8));
+        var assembly = BindingGenerator.Build(parsed);
+        var table = assembly.Types.Single(t => t.Name == "Table");
+        Check("the assembly's struct holds an inline array of 4 native function types",
+            table.Fields.Single(f => f.Name == "ops").Type is global::Larva.Hir.InlineArrayType { Count: 4, Element: global::Larva.Hir.NativeFuncType },
+            table.Fields.Single(f => f.Name == "ops").Type.ToString());
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
