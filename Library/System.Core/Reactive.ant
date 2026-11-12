@@ -167,8 +167,8 @@ into namespace System.Reactive
 				get
 				{
 					source.Track();
-					if (tracker.Stale)
-						tracker.Run();
+					if (tracker.Stale || tracker.Pending)
+						Reactive.Refresh(tracker);
 					return value;
 				}
 			}
@@ -231,6 +231,28 @@ into namespace System.Reactive
 					pending.Add(effect);
 				}
 			}
+
+		/// Computes a lazy effect now, also inside a batch: a read of a computed sees the current values, not what it
+		/// kept before the batch changed something it depends on. One scheduled in the batch is done with (it does
+		/// not go stale again when the batch ends).
+		internal static Refresh(Effect tracker)
+		{
+			if (tracker.Pending)
+			{
+				tracker.Pending = false;
+				loop (i32 i = 0..pending.Count)
+				{
+					if (pending[i] == tracker)
+					{
+						pending.RemoveAt(i);
+						break;
+					}
+				}
+				tracker.Trigger();
+			}
+			if (tracker.Stale)
+				tracker.Run();
+		}
 
 		static Flush()
 		{
