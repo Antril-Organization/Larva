@@ -96,10 +96,18 @@ into namespace System.Reactive
 				Release();
 				Effect? previous = Reactive.Current;
 				Reactive.Current = this;
-				body();
-				Reactive.Current = previous;
-				running = false;
-				Stale = false;
+				try
+				{
+					body();
+				}
+				finally
+				{
+					// Whatever the body does (even throw), the effect can run again and the one that was running
+					// is current again; the error goes on to whoever assigned the reactive value.
+					Reactive.Current = previous;
+					running = false;
+					Stale = false;
+				}
 			}
 
 			/// What a change does to it: runs it, or (lazy) marks it stale once and notifies what depends on it.
@@ -196,10 +204,17 @@ into namespace System.Reactive
 			static Batch(func<> : void body)
 			{
 				depth++;
-				body();
-				depth--;
-				if (depth == 0)
-					Flush();
+				try
+				{
+					body();
+				}
+				finally
+				{
+					// Even when the body throws: the batch ends, and the effects its changes scheduled run once.
+					depth--;
+					if (depth == 0)
+						Flush();
+				}
 			}
 
 			/// Runs an effect now, or once at the end of the batch in progress.
