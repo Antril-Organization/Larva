@@ -137,8 +137,13 @@ export async function run(options = {}) {
         const grown = (Kind, old) => { const a = new Kind(n); a.set(old); return a; };
         kinds = grown(Uint8Array, kinds); sizes = grown(Uint32Array, sizes); counts = grown(Int32Array, counts); owners = grown(Int32Array, owners);
     };
+    // Block sizes are kept in 32 bits (`sizes`) and a 32-bit memory holds at most 4 GB: a larger request is refused
+    // here, before any arithmetic truncates it (an array of 2^32 bytes was once reserved as one 16-byte block).
+    const MAX_BLOCK = 0xFFFF_FFF0;
+    const outOfMemory = () => { throw new LarvaPanic("larva: out of memory"); };
     const block = size => {
-        const n = (size + 15) >>> 4 || 1;
+        if (!(size >= 0 && size <= MAX_BLOCK)) outOfMemory();
+        const n = Math.floor((size + 15) / 16) || 1;
         let at = 0;
         if (n < 256) at = listPop(n);
         else { const list = freeLarge.get(n); if (list !== undefined && list.length) at = list.pop(); }
@@ -156,7 +161,7 @@ export async function run(options = {}) {
     function grow() {
         if (top > memory.buffer.byteLength) {
             const pages = Math.ceil((top - memory.buffer.byteLength) / 65536) + 16;
-            memory.grow(c64 ? BigInt(pages) : pages);
+            try { memory.grow(c64 ? BigInt(pages) : pages); } catch { outOfMemory(); } // past the memory's maximum
             refresh();
         }
         if (top >>> 4 > kinds.length) growFacts(top >>> 4);

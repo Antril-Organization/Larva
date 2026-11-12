@@ -111,6 +111,35 @@ public sealed class WasmTests : CheckedTest
             Lines(output).SequenceEqual(expected), $"got {string.Join(" ", Lines(output))}\nwant {string.Join(" ", expected)}");
     }
 
+    /// <summary>
+    /// The JavaScript runtime refuses a block the memory cannot hold (an array of 2^32 bytes was reserved as one 16-byte
+    /// block, by 32-bit truncation of its size, and corrupted the heap) through the panic path: exit code 101.
+    /// </summary>
+    [Fact]
+    public void Huge_arrays_are_refused_as_out_of_memory()
+    {
+        IrModule Program(long length)
+        {
+            var f = new FunctionBuilder("main", IrType.Unit);
+            int array = f.Local(IrType.Gc(new ArrayType(IrType.I64)), "array", mutable: true);
+            int last = f.Local(IrType.I64, "last");
+            int count = f.Temp(IrType.I64);
+            f.Assign(array, Rvalue.NewArray(AllocKind.Gc, IrType.I64, Int(length, IrType.I64)))
+             .Assign(count, Rvalue.Len(new Place(array).Deref()));
+            Print(f, "print.i64", Rvalue.Cast(Move(count), IrType.I64));
+            f.Assign(last, Int(length - 1, IrType.I64))
+             .Assign(new Place(array).Deref().Index(last), Int(3, IrType.I64));
+            Print(f, "print.i64", Copy(new Place(array).Deref().Index(last)));
+            f.Return();
+            return new IrModule([], [f.Build()]) { Name = "huge" };
+        }
+        var (exit, output, errors) = Node(Program(1L << 29)); // 4 GB of elements
+        Check("2^29 i64 (4 GB) is refused: exit code 101, larva: out of memory", exit == 101 && errors.Contains("larva: out of memory") && output.Trim().Length == 0,
+            $"exit {exit}, output {output}, errors {errors}");
+        (exit, output, errors) = Node(Program(3_000_000)); // 24 MB: grows the memory
+        Check("3,000,000 i64 (24 MB) is allocated and its last element written", exit == 0 && Lines(output).SequenceEqual(["3000000", "3"]), $"exit {exit}, {output} {errors}");
+    }
+
     private static Operand Rem32(FunctionBuilder f, int left, int right)
     {
         int temp = f.Temp(IrType.F32);
