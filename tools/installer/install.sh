@@ -36,7 +36,30 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# The number in what `larva --version` prints (`larva 0.8.0`): 0.8.0.
+version_number() {
+    sed -n 's/^[^0-9]*\([0-9][0-9.]*\).*/\1/p' | head -n 1
+}
+
 # ── File types ─────────────────────────────────────
+
+# A top-level value of a language pack's manifest (language.json), by its key: a string as it is, an array as its
+# values separated by spaces (`manifest_value file extensions` gives `.ant .antx`); nothing when the key is not there.
+# With python3 where there is one; otherwise from the text joined into one line (larva writes the manifest indented,
+# an array over several lines), its "files" object left out first (file names are its keys, and could be a key's name).
+manifest_value() {
+    if command -v python3 > /dev/null 2>&1; then
+        python3 -I -c 'import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], "")
+print(" ".join(str(v) for v in value) if isinstance(value, list) else value)' "$1" "$2" 2> /dev/null && return
+    fi
+    joined=$(tr -d '\n\r' < "$1" | sed 's/"files"[[:space:]]*:[[:space:]]*{[^}]*}//')
+    value=$(printf '%s\n' "$joined" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p")
+    if [ -z "$value" ]; then
+        value=$(printf '%s\n' "$joined" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p" | tr -d '" ' | tr ',' ' ')
+    fi
+    printf '%s\n' "$value"
+}
 
 # Each kind of file larva reads: extension, type name, what it is, icon (without its extension) in <folder>/icons or a
 # language pack; one per line, tab-separated. Language packs add their source files (their manifest's extensions).
@@ -51,11 +74,13 @@ file_types() {
     for manifest in "$prefix"/Languages/*/language.json; do
         [ -f "$manifest" ] || continue
         pack=$(dirname "$manifest")
-        id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1)
-        name=$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1)
-        icon=$(sed -n 's/.*"icon"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1)
+        id=$(manifest_value "$manifest" id)
+        name=$(manifest_value "$manifest" name)
+        icon=$(manifest_value "$manifest" icon)
         icon=${icon:+$pack/${icon%.*}}
-        for extension in $(sed -n 's/.*"extensions"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' "$manifest" | tr -d '" ' | tr ',' ' '); do
+        [ -n "$id" ] || id=$(basename "$pack" | tr 'A-Z' 'a-z')
+        [ -n "$name" ] || name=$(basename "$pack")
+        for extension in $(manifest_value "$manifest" extensions); do
             printf '%s\t%s\t%s\t%s\n' "${extension#.}" "source-$id" "$name source file" "${icon:-$prefix/icons/file-lva}"
         done
     done
@@ -98,6 +123,7 @@ lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchSe
 # macOS: an application bundle that declares the types (Uniform Type Identifiers) and their icons, registered with
 # Launch Services; it opens nothing (its handler rank is None), it only names and draws larva's files.
 mac_types() {
+    bundle_version=$("$prefix/larva" --version 2>/dev/null | version_number)
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     cp "$prefix/icons/larva-app.icns" "$app/Contents/Resources/Larva.icns"
     printf '#!/bin/sh\nexit 0\n' > "$app/Contents/MacOS/larva-files"
@@ -136,7 +162,7 @@ EOF
   <key>CFBundleExecutable</key><string>larva-files</string>
   <key>CFBundleIconFile</key><string>Larva.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$("$prefix/larva" --version 2>/dev/null | sed 's/[^0-9.].*//' | head -n 1)</string>
+  <key>CFBundleShortVersionString</key><string>${bundle_version:-0.0.0}</string>
   <key>LSUIElement</key><true/>
   <key>UTExportedTypeDeclarations</key>
   <array>$types
@@ -203,8 +229,8 @@ if [ ! -f "$here/larva" ]; then
     echo "install.sh: run the install.sh that comes with larva (next to it)" >&2
     exit 1
 fi
-version=$("$here/larva" --version 2>/dev/null || echo "?")
-echo "Larva $version into $prefix"
+version=$("$here/larva" --version 2>/dev/null | version_number)
+echo "Larva ${version:-?} into $prefix"
 mkdir -p "$prefix" "$bin"
 # Every file of the archive (this script too: in <folder> it is the uninstaller), and the list of them.
 (cd "$here" && find . -type f ! -name uninstall.files | sed 's|^\./||') > "$prefix/uninstall.files.new"
@@ -265,4 +291,4 @@ if command -v clang > /dev/null 2>&1; then
 else
     echo "  --   clang not found: larva bind reads headers without preprocessing"
 fi
-echo "Installed: $("$bin/larva" --version 2>/dev/null || echo "$version")"
+echo "Installed: $("$bin/larva" --version 2>/dev/null || echo "larva ${version:-?}")"

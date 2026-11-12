@@ -174,6 +174,17 @@
         }
       }
     },
+    "taskDefinitions": [
+      {
+        "type": "larva",
+        "properties": {
+          "id": {
+            "type": "number",
+            "description": "The number of the step (larva build, larva run, larva bind, or the program built) the Larva commands run as this task."
+          }
+        }
+      }
+    ],
     "semanticTokenTypes": [
       {
         "id": "genericBracket",
@@ -209,6 +220,7 @@
     "@vscode/vsce": "^3.2.1"
   },
   "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
     "package": "vsce package --allow-missing-repository --skip-license"
   },
   "icon": "images/larva.png"

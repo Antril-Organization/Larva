@@ -10,7 +10,7 @@ Each language comes in an extension of its own (its syntax, snippets and icons),
 - **Completion, hover, go to definition, signature help, outline, workspace symbols and highlights**, from the language server.
 - **`.queen` projects**: errors (QN…) as you type, completion of chunk names, of the keys of the chunk you are in and of the values a key takes, and hover on keys. A project's dependencies, its `assembly:` libraries (such as bindings) and the GC domains of its `gc:`-different dependencies are what its files are analyzed against.
 - **Icons** for `.queen` (a crown) and `.bind` files.
-- **Commands** (in a terminal named Larva):
+- **Commands** (run as tasks in a terminal named Larva):
   - *Larva: New Project from a Template*: `larva new` with one of Larva's templates (`Console-App`, `Library`…), written in the language you pick, in a folder of its own with its `.queen`; then opened.
   - *Larva: Run* (Ctrl+F5, or the play button): in a project, `larva run` (built only when something changed, then run); a lone file is built into a temporary folder and run.
   - *Larva: Check*: the errors only (`larva build --check`).

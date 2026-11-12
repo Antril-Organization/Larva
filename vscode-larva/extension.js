@@ -1,5 +1,5 @@
 // Larva for VS Code: starts the language server (`larva lsp`) for .queen projects and for every language whose VS Code
-// extension declares itself a Larva language, and adds commands that call `larva` (new, run, build, bind) in a terminal.
+// extension declares itself a Larva language, and adds commands that call `larva` (new, run, build, bind) as tasks.
 //
 // A language extension declares its languages in its package.json, by the VS Code language ids it contributes, which
 // are also the ids of its Larva language packs (`larva languages` lists them):
@@ -12,6 +12,7 @@ const fs = require('fs');
 const os = require('os');
 const { execFile } = require('child_process');
 const { LanguageClient, TransportKind } = require('vscode-languageclient/node');
+const { buildSteps, bindOptions, bindStep, bindProfileStep } = require('./commands');
 
 /** The oldest larva this extension works with (`larva --version`). */
 const MINIMUM_LARVA = '0.8.0';
@@ -198,7 +199,8 @@ async function restartClient(context) {
 // ── Commands ───────────────────────────────────────
 
 /**
- * What a command works on: the nearest .queen project (here or above), or the file itself. `name` names what is built.
+ * What a command works on: the nearest .queen project (here or above), or the file itself. `name` names what is built,
+ * `folder` is the workspace folder it is in (the task's scope), when it is in one.
  */
 function target() {
   const editor = vscode.window.activeTextEditor;
@@ -207,6 +209,7 @@ function target() {
     return undefined;
   }
   const file = editor.document.uri.fsPath;
+  const workspace = vscode.workspace.getWorkspaceFolder(editor.document.uri);
   for (let folder = path.dirname(file); ; folder = path.dirname(folder)) {
     let entries;
     try {
@@ -217,38 +220,59 @@ function target() {
     const queen = entries.find((f) => f.toLowerCase().endsWith('.queen'));
     if (queen) {
       // The project file itself: `larva build` reads its sources, dependencies, `assembly:` libraries and BUILD settings.
-      return { cwd: folder, name: path.basename(queen, path.extname(queen)), files: [path.join(folder, queen)], queen: true };
+      return { cwd: folder, name: path.basename(queen, path.extname(queen)), files: [path.join(folder, queen)], queen: true, folder: workspace };
     }
     if (path.dirname(folder) === folder) {
       break;
     }
   }
-  return { cwd: path.dirname(file), name: path.basename(file, path.extname(file)), files: [file] };
+  return { cwd: path.dirname(file), name: path.basename(file, path.extname(file)), files: [file], folder: workspace };
 }
 
-function quote(arg) {
-  return /[\s"&()]/.test(arg) ? `"${arg.replace(/"/g, '\\"')}"` : arg;
-}
+let stepNumber = 0;
 
-/** Runs command lines one after another in the Larva terminal, each only when the one before succeeded. */
-function inTerminal(where, lines) {
-  let terminal = vscode.window.terminals.find((t) => t.name === 'Larva');
-  if (!terminal) {
-    terminal = vscode.window.createTerminal({ name: 'Larva', cwd: where.cwd });
-  }
-  terminal.show(true);
-  const shell = (vscode.env.shell || '').toLowerCase();
-  const powershell = process.platform === 'win32' && (shell === '' || shell.includes('powershell') || shell.includes('pwsh'));
-  const text = lines.map((line) => {
-    const words = line.map(quote).join(' ');
-    return powershell && words.startsWith('"') ? `& ${words}` : words;
+/** Runs one program as a task in the Larva terminal: its exit code (not 0 when it could not start). */
+function runStep(where, step) {
+  const id = ++stepNumber;
+  const folder = where.folder || vscode.TaskScope.Workspace;
+  const task = new vscode.Task(
+    { type: 'larva', id },
+    folder,
+    'Larva',
+    'larva',
+    new vscode.ProcessExecution(step.command, step.args, { cwd: where.cwd })
+  );
+  task.presentationOptions = {
+    reveal: vscode.TaskRevealKind.Always,
+    panel: vscode.TaskPanelKind.Shared,
+    showReuseMessage: false,
+    clear: false,
+  };
+  return new Promise((resolve) => {
+    const ended = vscode.tasks.onDidEndTaskProcess((event) => {
+      if (event.execution.task.definition.id === id) {
+        ended.dispose();
+        resolve(event.exitCode === undefined ? 1 : event.exitCode);
+      }
+    });
+    vscode.tasks.executeTask(task).then(undefined, (error) => {
+      ended.dispose();
+      vscode.window.showErrorMessage(`Larva: ${step.command} could not start: ${error && error.message ? error.message : error}`);
+      resolve(1);
+    });
   });
-  // PowerShell 5 has no `&&`.
-  terminal.sendText(powershell ? text.join('; if ($?) { ') + ' }'.repeat(text.length - 1) : text.join(' && '));
 }
 
-function larvaBuild(larva, where, options) {
-  return [larva.command, ...larva.args, 'build', ...options, ...where.files];
+/**
+ * Runs programs one after another in the Larva terminal, each only when the one before succeeded. Each step is a
+ * program and its arguments (commands.js): they go to the process as they are, no shell reads them.
+ */
+async function runSteps(where, steps) {
+  for (const step of steps) {
+    if ((await runStep(where, step)) !== 0) {
+      return;
+    }
+  }
 }
 
 function folderOf() {
@@ -297,7 +321,7 @@ async function bind(context, listOnly) {
   }
   const where = { cwd: folderOf() };
   if (listOnly) {
-    inTerminal(where, [[larva.command, ...larva.args, 'bind', '--list', library]]);
+    runSteps(where, [bindStep(larva, library)]);
     return;
   }
   const picked = await vscode.window.showOpenDialog({
@@ -322,16 +346,7 @@ async function bind(context, listOnly) {
   if (!name) {
     return;
   }
-  const nativeFile = path.extname(library) ? path.basename(library) : path.basename(library) + '.dll';
-  const libraryFile = (name + '.dll').toLowerCase() === nativeFile.toLowerCase() ? name + '.Bindings.dll' : name + '.dll';
-  const options = ['-o', path.join(where.cwd, libraryFile)];
-  if (language && language.extensions.length > 0) {
-    options.push('--source', path.join(where.cwd, name + language.extensions[0]));
-  }
-  if (description.toLowerCase().endsWith('.h')) {
-    options.push('--describe', path.join(where.cwd, name + '.bind'));
-  }
-  inTerminal(where, [[larva.command, ...larva.args, 'bind', library, description, ...options]]);
+  runSteps(where, [bindStep(larva, library, description, bindOptions(where.cwd, name, library, description, language))]);
 }
 
 /** What `larva new` lists: the templates (identifier and description). */
@@ -413,34 +428,11 @@ async function build(context, kind) {
     return;
   }
   await vscode.workspace.saveAll(false);
-  const exe = process.platform === 'win32' ? '.exe' : '';
-  switch (kind) {
-    case 'run': {
-      if (where.queen) {
-        // A project: `larva run` builds it when something changed and runs it.
-        inTerminal(where, [[larva.command, ...larva.args, 'run', where.files[0]]]);
-        break;
-      }
-      // A lone file: built into a temporary folder, then run.
-      const folder = path.join(os.tmpdir(), 'larva-run');
-      fs.mkdirSync(folder, { recursive: true });
-      const output = path.join(folder, where.name + exe);
-      inTerminal(where, [larvaBuild(larva, where, ['-o', output]), [output]]);
-      break;
-    }
-    case 'check':
-      inTerminal(where, [larvaBuild(larva, where, ['--check'])]);
-      break;
-    case 'exe':
-      // A project builds where its BUILD `output` says (bin/NAME.exe by default); a lone file next to itself.
-      inTerminal(where, [larvaBuild(larva, where, where.queen ? [] : ['-o', path.join(where.cwd, where.name + exe)])]);
-      break;
-    case 'wasm': {
-      // NAME.wasm, NAME.js (`node NAME.js` runs it) and NAME.html, optimized by LLVM.
-      inTerminal(where, [larvaBuild(larva, where, ['--target', 'wasm-llvm', '-o', path.join(where.cwd, where.name + '.js')])]);
-      break;
-    }
+  if (kind === 'run' && !where.queen) {
+    // A lone file: built into a temporary folder, then run.
+    fs.mkdirSync(path.join(os.tmpdir(), 'larva-run'), { recursive: true });
   }
+  runSteps(where, buildSteps(kind, larva, where, { platform: process.platform, tmpdir: os.tmpdir() }));
 }
 
 async function bindProfile(context) {
@@ -458,7 +450,7 @@ async function bindProfile(context) {
     return;
   }
   const file = editor.document.uri.fsPath;
-  inTerminal({ cwd: path.dirname(file) }, [[larva.command, ...larva.args, 'bind', '--profile', file]]);
+  runSteps({ cwd: path.dirname(file), folder: vscode.workspace.getWorkspaceFolder(editor.document.uri) }, [bindProfileStep(larva, file)]);
 }
 
 async function showType() {
