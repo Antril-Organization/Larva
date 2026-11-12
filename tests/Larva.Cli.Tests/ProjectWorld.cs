@@ -36,7 +36,7 @@ internal sealed class ProjectWorld
     }
 
     /// <summary>Runs larva in <paramref name="folder"/> (the world's own settings and languages).</summary>
-    public LarvaProcess In(string folder) => new() { WorkingDirectory = folder, Config = Larva.Config, UserLanguages = Larva.UserLanguages };
+    public LarvaProcess In(string folder) => new() { WorkingDirectory = folder, Config = Larva.Config, UserLanguages = Larva.UserLanguages, Cache = Path.Combine(World.Root, "hive-cache") };
 
     public static string Program(string text = "Console.WriteLine(\"hello\");") =>
         $"import System;\n\ninto namespace App\n{{\n\tMain()\n\t{{\n\t\t{text}\n\t}}\n}}\n";

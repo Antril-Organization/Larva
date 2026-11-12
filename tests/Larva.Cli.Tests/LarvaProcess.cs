@@ -20,6 +20,9 @@ internal sealed class LarvaProcess
     public required string UserLanguages { get; init; }
     public string? Token { get; set; }
 
+    /// <summary>The Hive package cache (HIVE_CACHE): a folder of the test's, so the machine's is never written.</summary>
+    public string? Cache { get; init; }
+
     private static string FindRepository()
     {
         for (var folder = new DirectoryInfo(AppContext.BaseDirectory); folder is not null; folder = folder.Parent)
@@ -49,6 +52,8 @@ internal sealed class LarvaProcess
         start.Environment.Remove("HIVE_TOKEN");
         if (Token is not null)
             start.Environment["HIVE_TOKEN"] = Token;
+        if (Cache is not null)
+            start.Environment["HIVE_CACHE"] = Cache;
         using var process = Process.Start(start)!;
         var stderr = process.StandardError.ReadToEndAsync(); // both pipes at once: a full one would stop the child
         string output = process.StandardOutput.ReadToEnd() + stderr.Result;
