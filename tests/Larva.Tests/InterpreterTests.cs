@@ -192,6 +192,36 @@ public sealed class InterpreterTests : CheckedTest
         Check("f128: 1 + 1 = 2", Equal(vm.Run("quad"), 2.0));
     }
 
+    [Fact]
+    public void Shift_amounts_are_masked_by_the_operand_width()
+    {
+        // The native back ends mask the amount (`shl cl` on x64, wasm, LLVM `and`): `1 << -1` is `1 << 31` for i32.
+        static IrFunction Shift(string name, BinaryOp op, IrType type, BigInteger left, BigInteger amount)
+        {
+            var f = new FunctionBuilder(name, type);
+            f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Int(left, type), Int(amount, type))).Return();
+            return f.Build();
+        }
+        var module = new IrModule([],
+        [
+            Shift("shl_i32_neg", BinaryOp.Shl, IrType.I32, 1, -1),
+            Shift("shl_i32_33", BinaryOp.Shl, IrType.I32, 1, 33),
+            Shift("shr_i32_neg", BinaryOp.Shr, IrType.I32, -8, -1),
+            Shift("shl_i64_neg", BinaryOp.Shl, IrType.I64, 1, -1),
+            Shift("shr_u8_9", BinaryOp.Shr, IrType.U8, 0x80, 9),
+            Shift("shl_i128_neg", BinaryOp.Shl, IrType.I128, 1, -1),
+            Shift("shr_u64_neg", BinaryOp.Shr, IrType.U64, ulong.MaxValue, ulong.MaxValue),
+        ]);
+        var vm = Vm(module);
+        Check("i32: 1 << -1 = 1 << 31", Equal(vm.Run("shl_i32_neg"), (long)int.MinValue));
+        Check("i32: 1 << 33 = 1 << 1", Equal(vm.Run("shl_i32_33"), 2L));
+        Check("i32: -8 >> -1 = -8 >> 31", Equal(vm.Run("shr_i32_neg"), -1L));
+        Check("i64: 1 << -1 = 1 << 63", Equal(vm.Run("shl_i64_neg"), long.MinValue));
+        Check("u8: 0x80 >> 9 = 0x80 >> 1", Equal(vm.Run("shr_u8_9"), 64UL));
+        Check("i128: 1 << -1 = 1 << 127", Equal(vm.Run("shl_i128_neg"), -(BigInteger.One << 127)));
+        Check("u64: max >> max = max >> 63", Equal(vm.Run("shr_u64_neg"), 1UL));
+    }
+
     // ── Reflection ─────────────────────────────────────────────────
 
     [Fact]
