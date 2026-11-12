@@ -288,6 +288,90 @@ public sealed unsafe class RequirementTests : CheckedTest
         Check("`zeroed T` with `T: plain` is accepted", TypeChecker.Check(Module([plain.Build()], []), GcConfig.Default).Count == 0);
     }
 
+    // ── Constant propagation in instances ──────────────────────────
+
+    /// <summary>
+    /// fn second&lt;T: op+(T, T) -> T&gt;(xs: box [T]) -> T { i = 1; j = 2; require T.op+((*xs)[i], (*xs)[j]) } — the
+    /// index temporaries are constants the instance's constant propagation sees; it must keep them (an index is read
+    /// through the place, not as an operand). main: [10, 20, 30, 40, 50] → 50.
+    /// </summary>
+    private static IrModule IndexedProgram()
+    {
+        var t = IrType.Param(0);
+        var second = new FunctionBuilder("second", t);
+        second.Generic("T", TypeConstraint.Copy);
+        int plus = second.Require(0, PlusT);
+        int xs = second.Argument(IrType.Box(IrType.ArrayOf(t)), "xs");
+        int i = second.Local(IrType.I64, "i"), j = second.Local(IrType.I64, "j");
+        int done = second.NewBlock();
+        second.Assign(i, Int(1, IrType.I64)).Assign(j, Int(2, IrType.I64))
+            .CallRequired(0, plus, [Copy(new Place(xs).Deref().Index(i)), Copy(new Place(xs).Deref().Index(j))], FunctionBuilder.ReturnPlace, done);
+        second.At(done).Return();
+
+        var main = new FunctionBuilder("main", IrType.I64);
+        int a = main.Local(IrType.Box(IrType.ArrayOf(IrType.I64)), "a", mutable: true);
+        int k = main.Local(IrType.I64, "k", mutable: true);
+        int mainDone = main.NewBlock();
+        main.Assign(a, Rvalue.NewArray(AllocKind.Box, IrType.I64, Int(5, IrType.I64)));
+        for (int n = 0; n < 5; n++)
+            main.Assign(k, Int(n, IrType.I64)).Assign(new Place(a).Deref().Index(k), Int((n + 1) * 10, IrType.I64));
+        main.Call(0, [IrType.I64], [Move(new Place(a))], FunctionBuilder.ReturnPlace, mainDone);
+        main.At(mainDone).Return();
+        return new IrModule([], [second.Build(), main.Build()]);
+    }
+
+    [Fact]
+    public void Constant_indexes_survive_specialization()
+    {
+        var module = IndexedProgram();
+        var errors = TypeChecker.Check(module, GcConfig.Default);
+        Check("the program type-checks", errors.Count == 0, string.Join("; ", errors));
+        Require();
+
+        // The instance keeps every local an index projection reads: no index left pointing at an unassigned local.
+        var concrete = Larva.IR.Lowering.Monomorphizer.Run(module, GenericsMode.Specialize);
+        var instance = concrete.Functions.Single(f => f.Name == "second<i64>");
+        var assigned = instance.Blocks.SelectMany(b => b.Statements).OfType<AssignStatement>().Where(s => s.Target.IsLocal).Select(s => s.Target.Local).ToHashSet();
+        var indexed = instance.Blocks.SelectMany(b => b.Statements).OfType<AssignStatement>()
+            .SelectMany(s => s.Value switch
+            {
+                BinaryRvalue binary => new[] { binary.Left, binary.Right },
+                UseRvalue use => new[] { use.Operand },
+                _ => Array.Empty<Operand>(),
+            })
+            .OfType<CopyOperand>().SelectMany(c => c.Place.Projections.OfType<IndexProjection>().Select(p => p.Local)).ToList();
+        Check("the instance indexes the array", indexed.Count == 2, instance.ToString());
+        Check("every index local is still assigned", indexed.All(assigned.Contains), instance.ToString());
+
+        foreach (var mode in new[] { GenericsMode.Shared, GenericsMode.Specialize })
+        {
+            var compiled = Compiler.Compile(module, new CompilationOptions { Generics = mode });
+            if (compiled.Il is null)
+            {
+                Check($"VM ({mode})", false, string.Join("; ", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
+                continue;
+            }
+            long vm = System.Convert.ToInt64(new Interpreter(compiled.Il).Run("main"));
+            Check($"VM ({mode}) = 50", vm == 50, $"got {vm}");
+        }
+
+        long llvm = long.MinValue, x64 = long.MinValue;
+        var llvmResult = Larva.Llvm.LlvmBackend.Compile(module);
+        if (llvmResult.Success)
+        {
+            using var program = llvmResult.Program!;
+            using var jit = program.Jit();
+            llvm = ((delegate* unmanaged<long>)jit.Address("main"))();
+        }
+        var x64Result = Larva.X64.X64Backend.Compile(module);
+        if (x64Result.Success)
+        {
+            using var image = x64Result.Program!.Load();
+            x64 = ((delegate* unmanaged<long>)image.Address("main"))();
+        }
+        Check("LLVM and x64 = 50", llvm == 50 && x64 == 50, $"llvm {llvm} {llvmResult.Error}, x64 {x64} {x64Result.Error}");
+    }
+
     private static IrModule Module(IrFunction[] functions, Implementation[] implementations) =>
         new([new StructDef("Vec", IrType.I32, IrType.I32) { FieldNames = ["x", "y"] }], functions) { Implementations = implementations };
 
