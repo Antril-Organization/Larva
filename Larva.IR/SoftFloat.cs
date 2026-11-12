@@ -342,6 +342,13 @@ namespace Larva
         {
             if (digits.IsZero)
                 return f.Zero(negative);
+            // The decimal exponent of the value, roughly: an absurd one (`1e99999999`) is an infinity or a zero
+            // without raising 10 to it; the margins leave every borderline case to the exact path below.
+            double magnitude = exponent + digits.GetBitLength() * 0.30103;
+            if (magnitude > (f.MaxExponent + 1) * 0.30103 + 2)
+                return f.Infinity(negative);
+            if (magnitude < (f.MinExponent - f.FractionBits) * 0.30103 - 2)
+                return f.Zero(negative);
             if (exponent >= 0)
                 return Pack(negative, digits * BigInteger.Pow(10, exponent), 0, false, f);
             var divisor = BigInteger.Pow(10, -exponent);
@@ -361,7 +368,9 @@ namespace Larva
             int exponent = 0;
             if (e >= 0)
             {
-                exponent = int.Parse(text[(e + 1)..], System.Globalization.CultureInfo.InvariantCulture);
+                // Clamped: an exponent beyond ±10^9 is already far outside every format (see FromDecimal).
+                var parsed = BigInteger.Parse(text[(e + 1)..], System.Globalization.CultureInfo.InvariantCulture);
+                exponent = (int)BigInteger.Max(-1_000_000_000, BigInteger.Min(1_000_000_000, parsed));
                 text = text[..e];
             }
             int point = text.IndexOf('.');
