@@ -90,6 +90,8 @@ namespace Hive
 
                 if (signature is null && (requireSignature || publicKey is not null))
                     throw new HiveException($"{manifest.Package} {manifest.Version} is not signed (`verify: hashes` in HIVE accepts unsigned packages)");
+                if (signature is not null && requireSignature && publicKey is null)
+                    throw new HiveException($"{manifest.Package} {manifest.Version} cannot be verified: no key is given for it (`verify: hashes` in HIVE accepts unsigned packages)");
                 if (signature is not null && publicKey is not null)
                 {
                     if (manifest.Key != HiveKeys.Fingerprint(publicKey))
