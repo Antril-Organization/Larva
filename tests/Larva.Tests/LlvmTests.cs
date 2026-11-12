@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using Larva.IR;
 using Larva.IR.Analysis;
 using Larva.Llvm;
@@ -118,6 +118,80 @@ public sealed unsafe class LlvmTests : CheckedTest
         var unsignedLess = (delegate* unmanaged<uint, uint, int>)jit.Address("less_u32");
         var signedLess = (delegate* unmanaged<int, int, int>)jit.Address("less_i32");
         Check("comparisons honor signedness", unsignedLess(4_000_000_000, 1) == 0 && signedLess(-5, 1) == 1);
+    }
+
+    /// <summary>
+    /// LLVM's <c>sdiv</c> / <c>srem</c> leave <c>MIN / -1</c> undefined (a crash at -O0), and its <c>i128</c> division calls
+    /// compiler-rt's <c>__divti3</c>, which no executable links: both must compute as the VM does, at every level.
+    /// </summary>
+    [Fact]
+    public void Signed_division_wraps_at_min_and_wide_integers_divide()
+    {
+        var module = DivisionProgram();
+        var compiled = Compiler.Compile(module);
+        Check("the division program compiles", compiled.Il is not null, string.Join("; ", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
+        var vm = Vm(module);
+        foreach (int level in new[] { 0, 2 })
+        {
+            using var program = Compile(module, optimize: level);
+            using var jit = program.Jit();
+            var div32 = (delegate* unmanaged<int, int, int>)jit.Address("div_i32");
+            var rem32 = (delegate* unmanaged<int, int, int>)jit.Address("rem_i32");
+            var div64 = (delegate* unmanaged<long, long, long>)jit.Address("div_i64");
+            var rem64 = (delegate* unmanaged<long, long, long>)jit.Address("rem_i64");
+            Check($"O{level}: i32 MIN / -1 wraps to MIN and MIN % -1 is 0, like the VM", div32(int.MinValue, -1) == int.MinValue && rem32(int.MinValue, -1) == 0
+                && Equals(vm.Run("div_i32", int.MinValue, -1), (long)int.MinValue) && Equals(vm.Run("rem_i32", int.MinValue, -1), 0L));
+            Check($"O{level}: i64 MIN / -1 wraps to MIN and MIN % -1 is 0", div64(long.MinValue, -1) == long.MinValue && rem64(long.MinValue, -1) == 0);
+            Check($"O{level}: ordinary signed division is untouched", div32(-7, 2) == -3 && rem32(-7, 2) == -1 && div64(100, -7) == -14 && rem64(100, -7) == 2
+                && Equals(vm.Run("div_i64", 100L, -7L), -14L) && Equals(vm.Run("rem_i64", 100L, -7L), 2L));
+            var wideDiv = (delegate* unmanaged<long, long>)jit.Address("wide_div");
+            var wideRem = (delegate* unmanaged<long, long>)jit.Address("wide_rem");
+            var wideMin = (delegate* unmanaged<long, long>)jit.Address("wide_min_div_high");
+            Check($"O{level}: i128 (2^100 + 5) / 2^40 = 2^60 and % 2^40 = 5 (the runtime's limb division, no __divti3)",
+                wideDiv(1L << 40) == 1L << 60 && wideRem(1L << 40) == 5,
+                $"{wideDiv(1L << 40)} {wideRem(1L << 40)}");
+            Check($"O{level}: i128 MIN / -1 wraps to MIN (high word), MIN / 1 too", wideMin(-1) == long.MinValue && wideMin(1) == long.MinValue, $"{wideMin(-1)}");
+        }
+    }
+
+    /// <summary>Reference counting: `==` / `!=` on handles must not retain their operands (nothing would release them).</summary>
+    [Fact]
+    public void Handle_comparisons_keep_no_reference()
+    {
+        NativeRuntime.Reset();
+        using var program = Compile(ComparisonProgram(), GcConfig.RefCount);
+        using var jit = program.Jit();
+        long k = ((delegate* unmanaged<long, long>)jit.Address("compare"))(1000);
+        Check("RC: compare(1000) = 1000 and every compared object died at the end of its pass", k == 1000 && NativeRuntime.LiveGc == 0 && NativeRuntime.Errors == 0,
+            $"k {k}, live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
+    }
+
+    /// <summary>A borrow site inside a loop pins the object once per activation: the previous pass's pin is given back first.</summary>
+    [Fact]
+    public void Borrow_sites_pin_once_per_activation()
+    {
+        NativeRuntime.Reset();
+        using var program = Compile(PinLoopProgram());
+        using var jit = program.Jit();
+        int y = ((delegate* unmanaged<long, int>)jit.Address("pin_loop"))(5000);
+        Check("pin_loop(5000) = 5000 with at most one pin held at a time, none after the return", y == 5000 && NativeRuntime.MaxPinned == 1 && NativeRuntime.Pinned == 0,
+            $"y {y}, pins {NativeRuntime.Pins}, most at once {NativeRuntime.MaxPinned}, held {NativeRuntime.Pinned}");
+    }
+
+    /// <summary>
+    /// Flag exceptions (Linux, WebAssembly): the cleanup takes the exception in flight off the flag while it runs the frame's
+    /// destructors (one that throws and catches its own would clear it; one that lets one escape ends the program), and puts
+    /// it back before continuing to the caller.
+    /// </summary>
+    [Fact]
+    public void Flag_exception_cleanups_keep_the_exception_in_flight_across_destructors()
+    {
+        string ir = Ir(MaybeGive(), "x86_64-unknown-linux-gnu", GcConfig.Manual);
+        string cleanup = Extract(ir, "cleanup:", null, 60);
+        Check("the cleanup saves the exception in flight and clears the flag before the releases", cleanup.Contains("%unwinding.payload = load ptr, ptr @larva_exception")
+            && cleanup.Contains("store ptr null, ptr @larva_exception"), cleanup);
+        Check("a destructor's escaped exception ends the program (larva_panic 7), else the saved exception is put back",
+            ir.Contains("call void @larva_panic(i32 7") && ir.Contains("store ptr %unwinding.payload, ptr @larva_exception") && ir.Contains("store i64 %unwinding.type, ptr @larva_exception_type"), ir);
     }
 
     [Fact]
@@ -359,6 +433,23 @@ public sealed unsafe class LlvmTests : CheckedTest
         using var program = result.Program!;
         using var jit = program.Jit();
         Check("and still runs: squares(10) = 285", ((delegate* unmanaged<long, long>)jit.Address("squares"))(10) == 285);
+
+        // The stack maps are made on the module that came back from opt, not on the one it replaced (and disposed).
+        NativeRuntime.Reset();
+        var traced = LlvmBackend.Compile(TracingProgram(), new LlvmOptions
+        {
+            Compilation = CompilationOptions.Default with { Gc = GcConfig.Default },
+            Polly = new PollyOptions(standIn, Plugin: "LLVMPolly.dll", Arguments: ["-polly-vectorizer=stripmine"]),
+        });
+        Check("a tracing program goes through opt", traced.Success && traced.Program!.Polly, traced.ToString());
+        if (!traced.Success)
+            return;
+        using var tracedProgram = traced.Program!;
+        string ir = tracedProgram.IrText;
+        Check("its root markers were lowered to stack maps in the module that came back", !ir.Contains("@larva.gc.root(") && ir.Contains("llvm.experimental.stackmap"),
+            Extract(ir, "define", "keep"));
+        using var tracedJit = tracedProgram.Jit();
+        Check("and keep(50) = 8 with its roots found", ((delegate* unmanaged<long, int>)tracedJit.Address("keep"))(50) == 8 && NativeRuntime.Errors == 0);
     }
 
     [Fact]
@@ -439,6 +530,36 @@ public sealed unsafe class LlvmTests : CheckedTest
         return new IrModule([], [high.Build(), wrap.Build(), halves.Build(), quad.Build(), Less("less_u32", IrType.U32), Less("less_i32", IrType.I32)]);
     }
 
+    /// <summary>div_i32, rem_i32, div_i64, rem_i64 (a / b), and i128 divisions of (2^100 + 5) and MIN by an i64 argument.</summary>
+    private static IrModule DivisionProgram()
+    {
+        static IrFunction Divide(string name, IrType type, BinaryOp op)
+        {
+            var f = new FunctionBuilder(name, type);
+            int a = f.Argument(type, "a"), b = f.Argument(type, "b");
+            f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Copy(a), Copy(b))).Return();
+            return f.Build();
+        }
+        static IrFunction Wide(string name, BigInteger dividend, BinaryOp op, int shift)
+        {
+            var f = new FunctionBuilder(name, IrType.I64);
+            int n = f.Argument(IrType.I64, "n");
+            int d = f.Local(IrType.I128, "d");
+            int r = f.Local(IrType.I128, "r", mutable: true);
+            f.Assign(d, Rvalue.Cast(Copy(n), IrType.I128))
+             .Assign(r, Rvalue.Binary(op, Int(dividend, IrType.I128), Copy(d)));
+            if (shift > 0)
+                f.Assign(r, Rvalue.Binary(BinaryOp.Shr, Copy(r), Int(shift, IrType.I128)));
+            f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(r), IrType.I64)).Return();
+            return f.Build();
+        }
+        var big = BigInteger.Pow(2, 100) + 5;
+        var min = -BigInteger.Pow(2, 127);
+        return new IrModule([], [Divide("div_i32", IrType.I32, BinaryOp.Div), Divide("rem_i32", IrType.I32, BinaryOp.Rem),
+            Divide("div_i64", IrType.I64, BinaryOp.Div), Divide("rem_i64", IrType.I64, BinaryOp.Rem),
+            Wide("wide_div", big, BinaryOp.Div, 0), Wide("wide_rem", big, BinaryOp.Rem, 0), Wide("wide_min_div_high", min, BinaryOp.Div, 64)]);
+    }
+
     private static IrFunction Less(string name, IrType type)
     {
         var f = new FunctionBuilder(name, IrType.I32);
@@ -466,9 +587,9 @@ public sealed unsafe class LlvmTests : CheckedTest
     private static Interpreter Vm(IrModule module) => new(Compiler.Compile(module).Il!);
 
     /// <summary>The LLVM IR of <paramref name="module"/> for another target (not run).</summary>
-    private static string Ir(IrModule module, string triple)
+    private static string Ir(IrModule module, string triple, GcConfig? gc = null)
     {
-        var result = LlvmBackend.Compile(module, new LlvmOptions { Compilation = CompilationOptions.Default, OptimizationLevel = 0, Triple = triple });
+        var result = LlvmBackend.Compile(module, new LlvmOptions { Compilation = CompilationOptions.Default with { Gc = gc ?? GcConfig.Default }, OptimizationLevel = 0, Triple = triple });
         if (!result.Success)
             throw new InvalidOperationException(result.ToString());
         using var program = result.Program!;

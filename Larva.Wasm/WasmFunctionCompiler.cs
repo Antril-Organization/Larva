@@ -1013,6 +1013,8 @@ namespace Larva.Wasm
         private int Binary(BinaryRvalue binary)
         {
             var type = function.TypeOf(binary.Left, module);
+            if (Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType)
+                return HandleComparison(binary);
             int left = Operand(binary.Left);
             int right = Operand(binary.Right);
             var (kind, size, signed) = cg.Shape(type);
@@ -1104,6 +1106,34 @@ namespace Larva.Wasm
                     c.I64ExtendI32U();
                     break;
             }
+            c.LocalSet(A);
+            StoreA(left);
+            return left;
+        }
+
+        /// <summary>
+        /// Reference counting: <c>==</c> / <c>!=</c> on handles compare addresses and keep no reference, so the operands are
+        /// read without the retain an <see cref="Operand"/> read takes (which nothing would release).
+        /// </summary>
+        private int HandleComparison(BinaryRvalue binary)
+        {
+            int Read(Operand operand) => operand switch
+            {
+                CopyOperand copy => Load(copy.Place),
+                MoveOperand move => Load(move.Place),
+                _ => Operand(operand),
+            };
+            int left = Read(binary.Left);
+            int right = Read(binary.Right);
+            LoadTemp(left);
+            LoadTemp(right);
+            c.I64Op(binary.Op switch
+            {
+                BinaryOp.Eq => 0x51,
+                BinaryOp.Ne => 0x52,
+                _ => throw new WasmBackendException($"`{binary.Op}` on handles"),
+            });
+            c.I64ExtendI32U();
             c.LocalSet(A);
             StoreA(left);
             return left;
@@ -1663,6 +1693,12 @@ namespace Larva.Wasm
             if (!pins.TryGetValue(current, out int slot) || PinnedHandle(place) is not { } handle)
                 return;
             int value = Load(handle);
+            // One pin per site per activation: in a loop, the previous pass's pin is given back first (the slot is zero
+            // before the first), else the runtime's pin stack grows with every pass until the return.
+            c.LocalGet(Fp);
+            c.I64Load(slot);
+            c.I32WrapI64();
+            c.Call(cg.Runtime("larva_unpin"));
             c.LocalGet(Fp);
             LoadTemp(value);
             c.I64Store(slot);

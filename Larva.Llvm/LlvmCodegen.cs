@@ -432,6 +432,7 @@ namespace Larva.Llvm
             Runtime("larva_region_enter", v, i32);
             Runtime("larva_region_exit", v, i32);
             Runtime("larva_gc_wb", v, ptr, ptr, i64);
+            Runtime("larva_gc_wb_at", v, ptr, i64);
             Runtime("larva_pin", v, ptr);
             Runtime("larva_unpin", v, ptr);
             Runtime("larva_poll", v);
@@ -445,6 +446,11 @@ namespace Larva.Llvm
             Runtime("larva_float_mul", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_div", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_rem", v, ptr, ptr, ptr, i32);
+            // Wide integers (i128, i256): division by limbs, as the direct x86-64 back end calls it.
+            Runtime("larva_wide_udiv", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_urem", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_sdiv", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_srem", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_cmp", i32, ptr, ptr, i32, i32);
             Runtime("larva_float_conv", v, ptr, ptr, i32, i32);
             Runtime("larva_region_depth", i32);
@@ -1349,12 +1355,18 @@ namespace Larva.Llvm
             {
                 var (address, type) = Address(target);
                 var owner = lastOwner;
+                bool throughReference = lastThroughReference;
                 var stored = b.BuildStore(value, address);
                 if (IsScalarElement(target, type))
                     cg.TagElement(stored);
                 // Generations: a store into an old object remembers it (handles only: numbers need no barrier).
-                if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && owner.Handle != IntPtr.Zero && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
-                    cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
+                {
+                    if (owner.Handle != IntPtr.Zero)
+                        cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                    else if (throughReference)
+                        cg.CallRuntime("larva_gc_wb_at", address, I64(Layouts.Of(type, module)!.Size)); // the owner, if any, is the runtime's to find
+                }
             }
 
             // ── Terminators ────────────────────────────────────────
@@ -1650,6 +1662,12 @@ namespace Larva.Llvm
                 b.PositionAtEnd(cleanup);
                 if (cg.flagExceptions)
                 {
+                    // The exception in flight is taken off the flag while the releases run their destructors (a destructor's
+                    // own calls would read it as thrown by them, and one that throws and catches would clear it), and put
+                    // back after; a destructor that lets an exception escape here ends the program, rather than hiding this one.
+                    var payload = b.BuildLoad2(cg.ptr, cg.payloadGlobal, "unwinding.payload");
+                    var type = b.BuildLoad2(Ctx.Int64Type, cg.typeGlobal, "unwinding.type");
+                    b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), cg.payloadGlobal);
                     for (int l = 0; l < function.Locals.Length; l++)
                         ReleaseOwned(new Place(l), []);
                     if (caughtPayload.Handle != IntPtr.Zero)
@@ -1658,6 +1676,16 @@ namespace Larva.Llvm
                         cg.CallRuntime("larva_unpin", b.BuildLoad2(cg.ptr, slot, ""));
                     if (regionDepth.Handle != IntPtr.Zero)
                         cg.CallRuntime("larva_region_unwind", regionDepth);
+                    var escaped = b.BuildIsNotNull(b.BuildLoad2(cg.ptr, cg.payloadGlobal, ""), "destructor.threw");
+                    var terminate = fn.AppendBasicBlock("destructor.threw");
+                    var restore = fn.AppendBasicBlock("unwinding.restored");
+                    cg.Unlikely(b.BuildCondBr(escaped, terminate, restore));
+                    b.PositionAtEnd(terminate);
+                    cg.CallRuntime("larva_panic", I32(7), I64(0), I64(0));
+                    b.BuildUnreachable();
+                    b.PositionAtEnd(restore);
+                    b.BuildStore(payload, cg.payloadGlobal);
+                    b.BuildStore(type, cg.typeGlobal);
                     b.BuildBr(Propagate());
                     return;
                 }
@@ -1846,6 +1874,8 @@ namespace Larva.Llvm
             private LLVMValueRef Binary(BinaryRvalue binary)
             {
                 var type = function.TypeOf(binary.Left, module);
+                if (Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType)
+                    return HandleComparison(binary);
                 var left = Operand(binary.Left);
                 var right = Operand(binary.Right);
                 if (IsWideFloat(type))
@@ -1877,9 +1907,11 @@ namespace Larva.Llvm
                 {
                     case BinaryOp.Div or BinaryOp.Rem:
                         CheckNotZero(right);
-                        return binary.Op == BinaryOp.Div
-                            ? signed ? b.BuildSDiv(left, right, "") : b.BuildUDiv(left, right, "")
-                            : signed ? b.BuildSRem(left, right, "") : b.BuildURem(left, right, "");
+                        if (type.BitWidth > 64)
+                            return WideIntDivide(binary.Op, left, right, type);
+                        if (!signed)
+                            return binary.Op == BinaryOp.Div ? b.BuildUDiv(left, right, "") : b.BuildURem(left, right, "");
+                        return SignedDivide(binary.Op, left, right);
                     case BinaryOp.Shl or BinaryOp.Shr:
                         // Shift amounts wrap at the width, as in the VM (an oversized LLVM shift would be poison).
                         var amount = b.BuildAnd(right, LLVMValueRef.CreateConstInt(right.TypeOf, (ulong)(type.BitWidth!.Value - 1)), "");
@@ -1902,6 +1934,75 @@ namespace Larva.Llvm
                     BinaryOp.Ge => b.BuildICmp(signed ? LLVMIntPredicate.LLVMIntSGE : LLVMIntPredicate.LLVMIntUGE, left, right, ""),
                     _ => throw new LlvmBackendException($"`{binary.Op}`"),
                 };
+            }
+
+            /// <summary>
+            /// Reference counting: <c>==</c> / <c>!=</c> on handles compare addresses and keep no reference, so the operands are
+            /// read without a retain (an <see cref="Operand"/> read would take one that nothing releases); a read that transfers
+            /// a local's reference (its last use) releases it here, since its drop flag is cleared for it.
+            /// </summary>
+            private LLVMValueRef HandleComparison(BinaryRvalue binary)
+            {
+                LLVMValueRef Read(Operand operand) => operand switch
+                {
+                    CopyOperand copy => Load(copy.Place),
+                    MoveOperand move => Load(move.Place),
+                    _ => Operand(operand),
+                };
+                var left = Read(binary.Left);
+                var right = Read(binary.Right);
+                var result = binary.Op switch
+                {
+                    BinaryOp.Eq => b.BuildICmp(LLVMIntPredicate.LLVMIntEQ, left, right, ""),
+                    BinaryOp.Ne => b.BuildICmp(LLVMIntPredicate.LLVMIntNE, left, right, ""),
+                    _ => throw new LlvmBackendException($"`{binary.Op}` on handles"),
+                };
+                if (Transfers(binary.Left, current))
+                    cg.ReleaseHandle(fn, left);
+                if (Transfers(binary.Right, current))
+                    cg.ReleaseHandle(fn, right);
+                return result;
+            }
+
+            /// <summary>
+            /// Signed <c>/</c> and <c>%</c> as the VM and the x86-64 back end define them: <c>MIN / -1</c> wraps to <c>MIN</c> and
+            /// <c>MIN % -1</c> is 0. LLVM's <c>sdiv</c> / <c>srem</c> leave that overflow undefined (a #DE crash at -O0, anything
+            /// at -O3), so a divisor that may be -1 is tested first and takes the negation (or 0) instead of the instruction.
+            /// </summary>
+            private LLVMValueRef SignedDivide(BinaryOp op, LLVMValueRef left, LLVMValueRef right)
+            {
+                var minusOne = LLVMValueRef.CreateConstInt(right.TypeOf, ulong.MaxValue, true);
+                LLVMValueRef Regular() => op == BinaryOp.Div ? b.BuildSDiv(left, right, "") : b.BuildSRem(left, right, "");
+                LLVMValueRef Negated() => op == BinaryOp.Div ? b.BuildNeg(left, "") : LLVMValueRef.CreateConstInt(left.TypeOf, 0);
+                if (right.IsAConstantInt.Handle != IntPtr.Zero)
+                    return right.ConstIntSExt == -1 ? Negated() : Regular();
+                var special = fn.AppendBasicBlock("div.neg");
+                var regular = fn.AppendBasicBlock("div");
+                var join = fn.AppendBasicBlock("divided");
+                cg.Unlikely(b.BuildCondBr(b.BuildICmp(LLVMIntPredicate.LLVMIntEQ, right, minusOne, ""), special, regular));
+                b.PositionAtEnd(special);
+                var negated = Negated();
+                b.BuildBr(join);
+                b.PositionAtEnd(regular);
+                var divided = Regular();
+                b.BuildBr(join);
+                b.PositionAtEnd(join);
+                var result = b.BuildPhi(left.TypeOf, "");
+                result.AddIncoming([negated, divided], [special, regular], 2);
+                return result;
+            }
+
+            /// <summary>
+            /// <c>/</c> and <c>%</c> on integers wider than 64 bits: the runtime's limb routines (as the x86-64 back end calls them),
+            /// since LLVM would call compiler-rt's <c>__divti3</c>, which no Larva executable links.
+            /// </summary>
+            private LLVMValueRef WideIntDivide(BinaryOp op, LLVMValueRef left, LLVMValueRef right, IrType type)
+            {
+                int limbs = type.BitWidth!.Value / 64;
+                string name = op == BinaryOp.Div ? (type.IsSigned ? "larva_wide_sdiv" : "larva_wide_udiv") : (type.IsSigned ? "larva_wide_srem" : "larva_wide_urem");
+                var result = EntryAlloca(cg.ValueType(type), "wi.r");
+                cg.CallRuntime(name, Spilled(left, "wi.a"), Spilled(right, "wi.b"), result, I32(limbs));
+                return b.BuildLoad2(cg.ValueType(type), result, "");
             }
 
             /// <summary>Numeric conversion with Larva semantics (sign follows the source type).</summary>
@@ -2046,11 +2147,15 @@ namespace Larva.Llvm
             /// <summary>The gc object the last <see cref="Address"/> went into (its last dereference), if it went into one.</summary>
             private LLVMValueRef lastOwner;
 
+            /// <summary>Whether the last <see cref="Address"/> went through a reference or pointer after its last gc object (so the memory may be inside an object this function cannot name).</summary>
+            private bool lastThroughReference;
+
             private (LLVMValueRef Pointer, IrType Type) Address(Place place)
             {
                 var address = locals[place.Local];
                 IrType type = function.Locals[place.Local].Type;
                 lastOwner = default;
+                lastThroughReference = false;
                 for (int p = 0; p < place.Projections.Length; p++)
                 {
                     switch (place.Projections[p])
@@ -2060,6 +2165,7 @@ namespace Larva.Llvm
                             if (type is OptionalType)
                                 Guard(b.BuildIsNotNull(address, ""), 5, I64(0), I64(0)); // null reference
                             lastOwner = type.Unoptional() is GcType ? address : default;
+                            lastThroughReference = type.Unoptional() is ReferenceType or PointerType;
                             type = type.Pointee()!;
                             break;
                         case FieldProjection field:
@@ -2274,12 +2380,15 @@ namespace Larva.Llvm
                     if (place.Projections[j] is DerefProjection && function.TypeOf(handle, module).Unoptional() is GcType)
                     {
                         var value = Load(handle);
-                        cg.CallRuntime("larva_pin", value);
                         var here = b.InsertBlock;
                         b.PositionBefore(entry.FirstInstruction);
                         var slot = b.BuildAlloca(cg.ptr, "pin");
                         b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), slot);
                         b.PositionAtEnd(here);
+                        // One pin per site per activation: in a loop, the previous pass's pin is given back first (the slot is
+                        // null before the first), else the runtime's pin stack grows with every pass until the return.
+                        cg.CallRuntime("larva_unpin", b.BuildLoad2(cg.ptr, slot, ""));
+                        cg.CallRuntime("larva_pin", value);
                         b.BuildStore(value, slot);
                         pinSlots.Add(slot);
                         return;

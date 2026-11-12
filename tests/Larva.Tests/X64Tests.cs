@@ -61,6 +61,13 @@ public sealed unsafe class X64Tests : CheckedTest
                 $"live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
         }
         NativeRuntime.Reset();
+        using (var image = Load(NativePrograms.ComparisonProgram(), GcConfig.RefCount))
+        {
+            long k = ((delegate* unmanaged<long, long>)image.Address("compare"))(1000);
+            Check("RC: compare(1000) = 1000, `==` / `!=` on handles keep no reference", k == 1000 && NativeRuntime.LiveGc == 0 && NativeRuntime.Errors == 0,
+                $"k {k}, live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
+        }
+        NativeRuntime.Reset();
         using (var image = Load(NativePrograms.RegionProgram(), GcConfig.Arena))
         {
             Check("arena: in_region() = 4", ((delegate* unmanaged<int>)image.Address("in_region"))() == 4);

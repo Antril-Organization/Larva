@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 ﻿using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -37,6 +37,21 @@ namespace Larva.Native
         public static int Releases { get; private set; }
         public static int Barriers { get; private set; }
         public static int Pins { get; private set; }
+
+        /// <summary>The most handles pinned at once since the last <see cref="Reset"/> (a borrow site in a loop pins once per activation, not per pass).</summary>
+        public static int MaxPinned { get; private set; }
+
+        /// <summary>How many pins are held now.</summary>
+        public static int Pinned
+        {
+            get
+            {
+                int depth = 0;
+                foreach (int count in pinned.Values)
+                    depth += count;
+                return depth;
+            }
+        }
         public static int Polls { get; private set; }
         public static int Finalized { get; private set; }
         public static string? LastPanic { get; private set; }
@@ -65,7 +80,7 @@ namespace Larva.Native
             finalizers.Clear();
             finalizing = 0;
             Finalized = 0;
-            Allocations = Frees = Errors = Retains = Releases = Barriers = Pins = Polls = 0;
+            Allocations = Frees = Errors = Retains = Releases = Barriers = Pins = Polls = MaxPinned = 0;
             Collections = Collected = 0;
             sinceCollection = 0;
             StressGc = false;
@@ -146,6 +161,7 @@ namespace Larva.Native
             ["larva_region_depth"] = (nint)(delegate* unmanaged<int>)&RegionDepth,
             ["larva_region_unwind"] = (nint)(delegate* unmanaged<int, void>)&RegionUnwind,
             ["larva_gc_wb"] = (nint)(delegate* unmanaged<void*, void*, long, void>)&WriteBarrier,
+            ["larva_gc_wb_at"] = (nint)(delegate* unmanaged<void*, long, void>)&WriteBarrierAt,
             ["larva_pin"] = (nint)(delegate* unmanaged<void*, void>)&Pin,
             ["larva_unpin"] = (nint)(delegate* unmanaged<void*, void>)&Unpin,
             ["larva_poll"] = (nint)(delegate* unmanaged<void>)&Poll,
@@ -873,12 +889,20 @@ namespace Larva.Native
         [UnmanagedCallersOnly]
         private static void WriteBarrier(void* owner, void* slot, long size) => Barriers++;
 
+        [UnmanagedCallersOnly]
+        private static void WriteBarrierAt(void* slot, long size) => Barriers++;
+
         /// <summary>A borrow into a gc object: the object stays alive (and, for a moving collector, in place) until unpinned.</summary>
         [UnmanagedCallersOnly]
         private static void Pin(void* handle)
         {
             Pins++;
             pinned[(nint)handle] = pinned.GetValueOrDefault((nint)handle) + 1;
+            int depth = 0;
+            foreach (int count in pinned.Values)
+                depth += count;
+            if (depth > MaxPinned)
+                MaxPinned = depth;
         }
 
         [UnmanagedCallersOnly]
