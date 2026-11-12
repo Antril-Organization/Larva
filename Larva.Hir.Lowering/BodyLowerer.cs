@@ -1455,8 +1455,15 @@ namespace Larva.Hir.Lowering
         /// (reads, arithmetic, conversions, allocations), 1 through a call (fields, elements, statics, anything reached
         /// by reference), 2 a local or parameter of this function written outright (<c>i++</c>, <c>i = …</c>, a block).
         /// </summary>
-        private static int Effects(H.Expr e)
+        private static int Effects(H.Expr e) => Effects(e, 0);
+
+        /// <summary>Past a few hundred levels the answer is "the worst" (a copy), so a deep tree never costs the stack.</summary>
+        private const int EffectsDepth = 256;
+
+        private static int Effects(H.Expr e, int depth)
         {
+            if (depth > EffectsDepth)
+                return 2;
             switch (e)
             {
                 case H.LiteralExpr or H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.TypeOfExpr or H.SizeOfExpr
@@ -1465,59 +1472,59 @@ namespace Larva.Hir.Lowering
                 case H.LambdaExpr:
                     return 1;
                 case H.FieldExpr f:
-                    return f.Instance is null ? 0 : Effects(f.Instance);
+                    return f.Instance is null ? 0 : Effects(f.Instance, depth + 1);
                 case H.ElementExpr x:
-                    return Math.Max(Effects(x.Array), Effects(x.Indices));
+                    return Math.Max(Effects(x.Array, depth + 1), Effects(x.Indices, depth + 1));
                 case H.ArrayLengthExpr l:
-                    return Math.Max(Effects(l.Array), l.Dimension is null ? 0 : Effects(l.Dimension));
+                    return Math.Max(Effects(l.Array, depth + 1), l.Dimension is null ? 0 : Effects(l.Dimension, depth + 1));
                 case H.UnaryExpr { Op: H.UnaryOp.PreIncrement or H.UnaryOp.PostIncrement or H.UnaryOp.PreDecrement or H.UnaryOp.PostDecrement } u:
-                    return WritesLocal(u.Operand) ? 2 : Math.Max(1, Effects(u.Operand));
+                    return WritesLocal(u.Operand) ? 2 : Math.Max(1, Effects(u.Operand, depth + 1));
                 case H.UnaryExpr u:
-                    return Effects(u.Operand);
+                    return Effects(u.Operand, depth + 1);
                 case H.BinaryExpr bin:
-                    return Math.Max(Effects(bin.Left), Effects(bin.Right));
+                    return Math.Max(Effects(bin.Left, depth + 1), Effects(bin.Right, depth + 1));
                 case H.AssignExpr a:
-                    return WritesLocal(a.Target) ? 2 : Math.Max(1, Math.Max(Effects(a.Target), Effects(a.Value)));
+                    return WritesLocal(a.Target) ? 2 : Math.Max(1, Math.Max(Effects(a.Target, depth + 1), Effects(a.Value, depth + 1)));
                 case H.ConvertExpr { Kind: H.ConversionKind.User } c:
-                    return Math.Max(1, Effects(c.Value));
+                    return Math.Max(1, Effects(c.Value, depth + 1));
                 case H.ConvertExpr c:
-                    return Effects(c.Value);
+                    return Effects(c.Value, depth + 1);
                 case H.AsExpr a:
-                    return Effects(a.Value);
+                    return Effects(a.Value, depth + 1);
                 case H.CheckedExpr c:
-                    return Effects(c.Value);
+                    return Effects(c.Value, depth + 1);
                 case H.IsExpr i:
-                    return Math.Max(Effects(i.Value), Effects(i.Pattern));
+                    return Math.Max(Effects(i.Value, depth + 1), Effects(i.Pattern));
                 case H.ConditionalExpr c:
-                    return Math.Max(Effects(c.Condition), Math.Max(Effects(c.Then), Effects(c.Else)));
+                    return Math.Max(Effects(c.Condition, depth + 1), Math.Max(Effects(c.Then, depth + 1), Effects(c.Else, depth + 1)));
                 case H.CoalesceExpr c:
-                    return Math.Max(Effects(c.Left), Effects(c.Right));
+                    return Math.Max(Effects(c.Left, depth + 1), Effects(c.Right, depth + 1));
                 case H.ConditionalAccessExpr c:
-                    return Math.Max(Effects(c.Receiver), Effects(c.Access));
+                    return Math.Max(Effects(c.Receiver, depth + 1), Effects(c.Access, depth + 1));
                 case H.RangeExpr r:
-                    return Math.Max(r.Low is null ? 0 : Effects(r.Low), r.High is null ? 0 : Effects(r.High));
+                    return Math.Max(r.Low is null ? 0 : Effects(r.Low, depth + 1), r.High is null ? 0 : Effects(r.High, depth + 1));
                 case H.NewArrayExpr n:
-                    return Effects(n.Lengths);
+                    return Effects(n.Lengths, depth + 1);
                 case H.ArrayLiteralExpr a:
-                    return Effects(a.Items);
+                    return Effects(a.Items, depth + 1);
                 case H.BorrowExpr b:
-                    return Effects(b.Place);
+                    return Effects(b.Place, depth + 1);
                 case H.AddressOfExpr a:
-                    return Effects(a.Place);
+                    return Effects(a.Place, depth + 1);
                 case H.DerefExpr d:
-                    return Effects(d.Pointer);
+                    return Effects(d.Pointer, depth + 1);
                 case H.CallExpr call:
-                    return Math.Max(1, Math.Max(call.Receiver is null ? 0 : Effects(call.Receiver), Effects(call.Arguments)));
+                    return Math.Max(1, Math.Max(call.Receiver is null ? 0 : Effects(call.Receiver, depth + 1), Effects(call.Arguments, depth + 1)));
                 case H.InvokeExpr invoke:
-                    return Math.Max(1, Math.Max(Effects(invoke.Function), Effects(invoke.Arguments)));
+                    return Math.Max(1, Math.Max(Effects(invoke.Function, depth + 1), Effects(invoke.Arguments, depth + 1)));
                 case H.NewExpr n:
-                    return Math.Max(1, Math.Max(Effects(n.Arguments), Effects(n.Initializers.Select(i => i.Value))));
+                    return Math.Max(1, Math.Max(Effects(n.Arguments, depth + 1), Effects(n.Initializers.Select(i => i.Value), depth + 1)));
                 case H.WithExpr w:
-                    return Math.Max(1, Math.Max(Effects(w.Value), Effects(w.Changes.Select(c => c.Value))));
+                    return Math.Max(1, Math.Max(Effects(w.Value, depth + 1), Effects(w.Changes.Select(c => c.Value), depth + 1)));
                 case H.PropertyExpr p:
-                    return Math.Max(1, Math.Max(p.Instance is null ? 0 : Effects(p.Instance), Effects(p.Indices)));
+                    return Math.Max(1, Math.Max(p.Instance is null ? 0 : Effects(p.Instance, depth + 1), Effects(p.Indices, depth + 1)));
                 case H.InterpolatedExpr i:
-                    return Math.Max(1, Effects(i.Parts.Select(p => p.Value)));
+                    return Math.Max(1, Effects(i.Parts.Select(p => p.Value), depth + 1));
                 default:
                     // Blocks, switches, awaits and anything new: assume the worst.
                     return 2;
@@ -1542,12 +1549,12 @@ namespace Larva.Hir.Lowering
             _ => 2,
         };
 
-        private static int Effects(IEnumerable<H.Expr> operands)
+        private static int Effects(IEnumerable<H.Expr> operands, int depth = 0)
         {
             int result = 0;
             foreach (var operand in operands)
             {
-                result = Math.Max(result, Effects(operand));
+                result = Math.Max(result, Effects(operand, depth));
                 if (result == 2)
                     break;
             }
