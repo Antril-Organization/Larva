@@ -886,11 +886,22 @@ namespace Larva.Hir.Lowering
 
         // ── Exceptions ─────────────────────────────────────
 
+        /// <summary>
+        /// The exception each enclosing <c>catch</c> handler is handling (innermost last): its own local, taken at the
+        /// handler's entry, so that a <c>throw;</c> rethrows it even after a nested try/catch or finally handled another.
+        /// </summary>
+        private readonly List<int> handled = [];
+
         private void Throw(H.Expr? value)
         {
             if (value is null)
             {
-                b.Resume(Handlers());
+                // `throw;`: the exception of the innermost catch around, from its local (`resume` would re-raise whatever the
+                // frame handled last, which a nested handler in between may have replaced).
+                if (handled.Count > 0)
+                    b.Throw(Operand.Copy(handled[^1]), Handlers());
+                else
+                    b.Resume(Handlers());
                 open = false;
                 return;
             }
@@ -915,8 +926,10 @@ namespace Larva.Hir.Lowering
 
         /// <summary>
         /// <c>try</c>: one handler takes every exception (all are objects, thrown as the root) and tests the clauses in
-        /// order; none matching, it goes on outward. <c>finally</c> is a catch-all that runs the block and re-raises, plus a
-        /// copy of the block on every way out of the try.
+        /// order; none matching, it throws it on outward. <c>finally</c> is a handler of the same kind that runs the block
+        /// and throws the exception on, plus a copy of the block on every way out of the try. Both handlers keep the
+        /// exception in a local of their own from their entry: the frame-wide "exception being handled" (<c>caught</c>,
+        /// <c>resume</c>) is replaced by any handler entered in between, a nested try/catch or finally in the body.
         /// </summary>
         private void Try(H.TryStmt s)
         {
@@ -925,7 +938,7 @@ namespace Larva.Hir.Lowering
             int finallyHandler = s.Finally is null ? -1 : NewBlock();
             int normalExit = s.Finally is null ? after : NewBlock();
             int handler = s.Catches.Length > 0 ? NewBlock() : -1;
-            CatchClause[] finallyClause = finallyHandler < 0 ? [] : [new CatchClause(null, finallyHandler)];
+            CatchClause[] finallyClause = finallyHandler < 0 ? [] : [new CatchClause(root, finallyHandler)];
             CatchClause[] clauses = [.. handler < 0 ? [] : new[] { new CatchClause(root, handler) }, .. finallyClause];
 
             tries.Add(new TryFrame(clauses, s.Finally));
@@ -947,6 +960,7 @@ namespace Larva.Hir.Lowering
                 At(handler);
                 int caught = Temp(root);
                 b.Assign(caught, Rvalue.Caught);
+                handled.Add(caught);
                 foreach (var clause in s.Catches)
                 {
                     int body = NewBlock(), next = NewBlock();
@@ -967,7 +981,8 @@ namespace Larva.Hir.Lowering
                     Goto(normalExit);
                     At(next);
                 }
-                b.Resume(Handlers());
+                handled.RemoveAt(handled.Count - 1);
+                b.Throw(Operand.Copy(caught), Handlers());
                 open = false;
             }
             tries.RemoveAt(tries.Count - 1);
@@ -984,9 +999,11 @@ namespace Larva.Hir.Lowering
                 }
                 else
                 {
+                    int passing = Temp(root);
+                    b.Assign(passing, Rvalue.Caught);
                     Block(finallyBlock);
                     if (open)
-                        b.Resume(Handlers());
+                        b.Throw(Operand.Copy(passing), Handlers());
                 }
                 open = false;
             }

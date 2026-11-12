@@ -33,6 +33,10 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         ("ReturnFinally", null, 57, "return inside try runs finally first"),
         ("BreakFinally", null, 303, "break inside try runs finally"),
         ("Rethrow", -4, -12, "rethrow from a catch, caught again"),
+        ("NestedRethrow", -4, -39, "rethrow after a nested try/catch handled another exception"),
+        ("RethrowAfterFinally", -4, -389, "rethrow after a nested finally ran in the catch"),
+        ("NestedFinally", -4, -3877, "a finally with nested handlers goes on with the exception that was passing"),
+        ("NestedFinally", 2, 123, "a finally with nested handlers on the normal path"),
         ("Nulls", null, 12, "null, ?? and == null"),
         ("Statics", null, 8, "static fields"),
     ];
