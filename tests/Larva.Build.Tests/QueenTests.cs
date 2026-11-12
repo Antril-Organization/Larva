@@ -117,6 +117,12 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
         ExpectLoad("known keys check their values", Path.Combine(root, "Bad/Bad.queen"), "QN124");
         ExpectLoad("a project has a PROJ chunk", Path.Combine(root, "NoName/NoName.queen"), "QN120");
         ExpectLoad("dependencies are libraries", Path.Combine(root, "ExeDep/ExeDep.queen"), "QN103");
+        ExpectLoad("FILES into: cannot climb out with ..", Path.Combine(root, "IntoUp/IntoUp.queen"), "QN131");
+        ExpectLoad("FILES into: cannot be a drive path", Path.Combine(root, "IntoDrive/IntoDrive.queen"), "QN131");
+        ExpectLoad("FILES into: cannot be a rooted path", Path.Combine(root, "IntoRoot/IntoRoot.queen"), "QN131");
+        var diagnostics = new List<QueenDiagnostic>();
+        var project = QueenProject.Load(Path.Combine(root, "IntoOk/IntoOk.queen"), null, diagnostics);
+        Check("FILES into: a folder under the build's is fine", project is not null && project.CopiedFiles.Any(f => f.Target == "data/conf/Main.ant"), string.Join("; ", diagnostics));
     }
 
     private void ExpectLoad(string name, string path, string code)
@@ -169,6 +175,11 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
             Write("Bad/Bad.queen", "queen 1.0;\nchunk PROJ:\n   name: Bad,\n   type: plugin\nchunk BUILD:\n   gc: magic\n");
             Write("NoName/NoName.queen", "queen 1.0;\nchunk BUILD:\n   gc: arena\n");
             Write("ExeDep/ExeDep.queen", "queen 1.0;\nchunk PROJ:\n   name: ExeDep\nchunk DEPS:\n   App: ../App\n");
+            foreach (var (name, into) in new[] { ("IntoUp", "../../out"), ("IntoDrive", "C:/Windows/Temp"), ("IntoRoot", "/etc"), ("IntoOk", "data/conf") })
+            {
+                Write($"{name}/{name}.queen", $"queen 1.0;\nchunk PROJ:\n   name: {name}\nchunk BUILD:\n   stdlib: none\nchunk FILES:\n   copy: Main.ant,\n   into: \"{into}\"\n");
+                Write($"{name}/Main.ant", "Main() : i32 => 0;\n");
+            }
         }
 
         private void Write(string relative, string text)
