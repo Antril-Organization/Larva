@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Larva native runtime for ahead-of-time executables: Windows x64 (MSVC or clang-cl), Linux and macOS (gcc or clang).
  *
  * The same C ABI as the in-process runtime the JITs use (Larva.Native.NativeRuntime): heap cells, gc objects with a
@@ -2464,6 +2464,10 @@ static int open_block_for(LarvaHeap *heap, size_t *current) {
             return 0;
 #endif
     } else {
+        /* The reserve is used up: retained blocks hold it (a major collection frees those whose pinned objects died), and
+           objects are made old meanwhile. Without this the old generation would have to fill on its own first. */
+        major_due = 1;
+        larva_poll_pending = 1;
         return 0;
     }
     if (nursery_blocks[block].dirty) {
@@ -2531,6 +2535,15 @@ static void *old_allocate(const LarvaType *type, int64_t payload) {
     gc_live++;
     allocations++;
     since_collection++;
+    /* An object made old by the program grows the old generation like a promotion does (a collection's own promotions are
+       counted by the collection): without this, a program whose objects skip the nursery (too large, conservative, or the
+       nursery's reserve used up) would never make a major collection due. */
+    if (!collecting) {
+        old_bytes += total;
+        old_objects++;
+        if (old_bytes > major_bytes || old_objects > major_objects)
+            major_due = 1;
+    }
     return object;
 }
 
@@ -3964,23 +3977,22 @@ static void collect_minor(int walk_stack) {
     for (;;) {
         /* Young objects with a finalizer that nothing reached: kept (with what they reach), their finalizers run after. */
         int kept = 0;
-        size_t still = 0;
         for (size_t i = 0; i < young_finalizable_count; i++) {
             void *object = young_finalizable[i];
             GcHeader *header = header_of(object);
             if (header->flags & FLAG_FORWARDED)
                 continue;  /* reached: old now (its finalizer entry moved with it) */
-            if (header->flags & FLAG_PINNED) {
-                young_finalizable[still++] = object;
-                continue;
-            }
+            if (header->flags & FLAG_PINNED)
+                continue;  /* reached too: old where it is once its block is retained (below); its entry in `finalizers`
+                              stays at the same address, and a major collection finalizes it when it dies. Kept here it
+                              would look dead at the next minor collection and be finalized alive. */
             void *slot = object;
             gc_worker = &gc_workers[0];
             evacuate(&slot);
             push_pointer(&run_after, &run_after_count, &run_after_capacity, slot);
             kept = 1;
         }
-        young_finalizable_count = still;
+        young_finalizable_count = 0;  /* every entry was copied out, pinned in place, or kept for its finalizer */
         if (!kept)
             break;
         copy_all(0);
@@ -4010,6 +4022,9 @@ static void collect_minor(int walk_stack) {
         if (block->pinned) {
             block->state = BLOCK_RETAINED;
             retained_blocks++;
+            /* The whole block leaves the nursery's reserve: it weighs on the old generation (and so on when the next major
+               collection, the only thing that frees it, is due), however little of it the pinned objects take. */
+            old_bytes += NURSERY_BLOCK;
             for (uint32_t at = 0; at < block->used;) {
                 GcHeader *header = (GcHeader *)(base + at);
                 if (header->flags & FLAG_PINNED) {
@@ -4183,7 +4198,6 @@ static void collect_major(int walk_stack) {
             if (header->mark) {
                 header->mark = 0;
                 alive = 1;
-                survived += payload_bytes(header);
             } else if (header->age == AGE_OLD && !(header->flags & FLAG_FORWARDED)) {
                 /* A pinned object that died. */
                 header->age = AGE_YOUNG;
@@ -4199,6 +4213,8 @@ static void collect_major(int walk_stack) {
             block->used = 0;
             free_blocks[free_block_count++] = index;
             retained_blocks--;
+        } else {
+            survived += NURSERY_BLOCK;  /* what a kept block costs: the whole block, not its pinned objects */
         }
     }
     forget_walks();

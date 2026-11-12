@@ -123,6 +123,41 @@ public sealed unsafe class AotTests : CheckedTest
             $"{output.Trim()} {errors.Trim()}");
     }
 
+    [Fact]
+    public void Llvm_pinned_young_objects_keep_collecting_and_are_not_finalized_alive() => PinnedNursery("llvm");
+
+    /// <summary>
+    /// Young objects the stack pins stay in their nursery block, which the old generation keeps until a major collection
+    /// frees it: those blocks must weigh on the old generation (else the nursery's reserve runs out after 16384 of them and
+    /// nothing collects again), and a pinned object with a finalizer, old in place, must not be finalized while alive.
+    /// Only the LLVM back end makes young objects (x64 allocates every object old, without a type map).
+    /// </summary>
+    private void PinnedNursery(string backend)
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string pins = Save(NativePrograms.PinnedProgram() with { Name = "pins" }, "pins.lvo");
+        string Exe(string name) => Path.Combine(Directory, $"{name}-{backend}.exe");
+
+        // One block per minor collection: every one pins the newest object and retains its block, 40000 times (2.5 GB of
+        // blocks, were none freed); the collections must go on past the 16384 blocks of the reserve, one per iteration.
+        var (code, log) = Cli("native", "--exe", "--backend", backend, "--entry", "pinned_churn", "-o", Exe("pinned"), pins);
+        Check($"{backend}: larva native --exe --entry pinned_churn", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(Exe("pinned"), ["40000"], stats: true, nursery: 1);
+        var collections = Regex.Match(errors, @"collections (\d+) \((\d+) minor\)");
+        var pinnedCount = Regex.Match(errors, @"pinned (\d+)");
+        Check($"{backend}: pinned.exe 40000 = 39999, 40000 pins and more than 39000 minor collections with a one-block nursery",
+            exit == 0 && output.Trim() == "39999" && collections.Success && long.Parse(collections.Groups[2].Value) > 39000
+            && pinnedCount.Success && long.Parse(pinnedCount.Groups[1].Value) >= 39000 && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
+
+        Cli("native", "--exe", "--backend", backend, "--entry", "finalized_alive", "-o", Exe("alive"), pins);
+        (exit, output, errors) = Execute(Exe("alive"), ["1000000"], stats: true);
+        Check($"{backend}: alive.exe 1000000 = 8: keep (pinned by the first minor collection) not finalized while held", exit == 0 && output.Trim() == "8"
+            && Regex.IsMatch(errors, @"collections [2-9]\d* \(") && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)
@@ -135,7 +170,7 @@ public sealed unsafe class AotTests : CheckedTest
         return path;
     }
 
-    private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false)
+    private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false, int nursery = 0)
     {
         var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         foreach (var argument in arguments ?? [])
@@ -144,6 +179,8 @@ public sealed unsafe class AotTests : CheckedTest
             start.Environment["LARVA_GC_STRESS"] = "1";
         if (stats)
             start.Environment["LARVA_STATS"] = "1";
+        if (nursery > 0)
+            start.Environment["LARVA_GC_NURSERY"] = nursery.ToString();
         using var process = Process.Start(start)!;
         var errors = process.StandardError.ReadToEndAsync();
         string output = process.StandardOutput.ReadToEnd();
