@@ -116,7 +116,7 @@ namespace Larva.Bindings
                 }
             }
             currentFile = null;
-            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(Decorations.Replace(d, " "), "(*").Trim())
+            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(StripDecorations(d), "(*").Trim())
                 .Where(d => d.Length > 0).ToList();
             // Types first, prototypes after: a prototype may use a typedef written below it in another header.
             foreach (string declaration in declarations)
@@ -400,8 +400,38 @@ namespace Larva.Bindings
         }
 
         private static readonly System.Text.RegularExpressions.Regex Decorations = new(
-            @"__declspec\s*\([^)]*\)|__attribute__\s*\(\(.*?\)\)|__pragma\s*\([^)]*\)|\b(extern|static|inline|__inline|__forceinline|__inline__|_Noreturn|__restrict|restrict|__unaligned)\b",
+            @"\b(extern|static|inline|__inline|__forceinline|__inline__|_Noreturn|__restrict|restrict|__unaligned)\b",
             System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static readonly string[] DecoratingKeywords = ["__attribute__", "__declspec", "__pragma"];
+
+        /// <summary>
+        /// A declaration without its decorations: `__attribute__((…))`, `__declspec(…)` and `__pragma(…)` with their
+        /// parentheses matched (`visibility("default")`, `align(16)` nest), wherever they stand, and the storage words.
+        /// </summary>
+        private static string StripDecorations(string declaration)
+        {
+            var text = new StringBuilder(declaration.Length);
+            for (int i = 0; i < declaration.Length;)
+            {
+                string? keyword = DecoratingKeywords.FirstOrDefault(k => string.CompareOrdinal(declaration, i, k, 0, k.Length) == 0
+                    && (i == 0 || !(char.IsLetterOrDigit(declaration[i - 1]) || declaration[i - 1] == '_')));
+                if (keyword is not null)
+                {
+                    int open = i + keyword.Length;
+                    while (open < declaration.Length && char.IsWhiteSpace(declaration[open]))
+                        open++;
+                    if (open < declaration.Length && declaration[open] == '(' && MatchingParenthesis(declaration, open) is var close && close > open)
+                    {
+                        text.Append(' ');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                text.Append(declaration[i++]);
+            }
+            return Decorations.Replace(text.ToString(), " ");
+        }
 
         /// <summary>`(__cdecl *name)`, `( * name)`: a function pointer's declarator, written `(*name)` for the rest of the reader.</summary>
         private static readonly System.Text.RegularExpressions.Regex Callable = new(

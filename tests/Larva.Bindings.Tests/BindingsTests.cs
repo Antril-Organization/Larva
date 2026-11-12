@@ -178,6 +178,33 @@ public sealed class BindingsTests : CheckedTest
             table.Fields.Single(f => f.Name == "ops").Type.ToString());
     }
 
+    /// <summary>Attributes with nested parentheses (`visibility("default")`, `align(16)`), before, inside or after a declarator, leave it readable.</summary>
+    [Fact]
+    public void Attributes_around_declarations_are_stripped_with_their_parentheses_matched()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            __attribute__((visibility("default"))) int Visible(int x);
+            int __attribute__((visibility("default"))) Middle(int x);
+            int After(int x) __attribute__((nonnull(1), warn_unused_result));
+            extern __attribute__((visibility("default"))) __attribute__((noinline)) int Twice(int x);
+            __declspec(dllexport) int Exported(int x);
+            __declspec(align(16)) int Aligned(int x);
+            extern int Plain(int x);
+            static inline int Inlined(int x) { return x; }
+            typedef struct __attribute__((packed)) { unsigned char c; unsigned int v; } Tight;
+            int __attribute__((format(printf, 1, 2))) Formatted(const char* fmt, ...);
+            void Use(Tight* t);
+            """, "lib.dll");
+        Log(description);
+        Check("every attributed prototype is read; only the variadic one is skipped, for being variadic",
+            description.Contains("Visible(i32 x) : i32\n") && description.Contains("Middle(i32 x) : i32\n") && description.Contains("After(i32 x) : i32\n")
+            && description.Contains("Twice(i32 x) : i32\n") && description.Contains("Exported(i32 x) : i32\n") && description.Contains("Aligned(i32 x) : i32\n")
+            && description.Contains("Plain(i32 x) : i32\n") && description.Contains("Inlined(i32 x) : i32\n") && description.Contains("Use(Tight* t)\n")
+            && reader.Skipped.Count == 1 && reader.Skipped[0] == ("Formatted", "variadic"),
+            string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
