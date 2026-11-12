@@ -79,6 +79,7 @@ into namespace System
 				loop (i32 i = index..count - 1)
 					items[i] = items[i + 1];
 				count--;
+				items[count] = default(T);
 				return removed;
 			}
 
@@ -88,10 +89,18 @@ into namespace System
 				if (count == 0)
 					throw new InvalidOperationError("Pop on an empty list");
 				count--;
-				return items[count];
+				T last = items[count];
+				items[count] = default(T);
+				return last;
 			}
 
-			Clear() { count = 0; }
+			/// Empties the list (the vacated slots hold no references, so their objects can be collected).
+			Clear()
+			{
+				loop (i32 i = 0..count)
+					items[i] = default(T);
+				count = 0;
+			}
 
 			/// The items in a new array.
 			ToArray() : T[]
@@ -232,6 +241,8 @@ into namespace System
 					}
 				}
 				i32 removed = count - kept;
+				loop (i32 i = kept..count)
+					items[i] = default(T);
 				count = kept;
 				return removed;
 			}
@@ -311,6 +322,7 @@ into namespace System
 				if (count == 0)
 					throw new InvalidOperationError("Dequeue on an empty queue");
 				T item = items[head];
+				items[head] = default(T);
 				head++;
 				if (head == items.Length)
 					head = 0;
@@ -327,6 +339,8 @@ into namespace System
 
 			Clear()
 			{
+				loop (i32 i = 0..count)
+					items[(head + i) % items.Length] = default(T);
 				head = 0;
 				count = 0;
 			}
@@ -367,7 +381,9 @@ into namespace System
 				if (count == 0)
 					throw new InvalidOperationError("Pop on an empty stack");
 				count--;
-				return items[count];
+				T top = items[count];
+				items[count] = default(T);
+				return top;
 			}
 
 			Peek() : T
@@ -377,7 +393,12 @@ into namespace System
 				return items[count - 1];
 			}
 
-			Clear() { count = 0; }
+			Clear()
+			{
+				loop (i32 i = 0..count)
+					items[i] = default(T);
+				count = 0;
+			}
 	}
 
 	/// Throws the library's errors from one place, so the methods that check stay small (and are inlined).
