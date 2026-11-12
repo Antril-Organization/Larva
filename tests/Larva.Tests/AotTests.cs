@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using Larva.IR;
 using Larva.IR.Linking;
 using Larva.Llvm;
+using Larva.Driver;
 using Larva.Native;
 using Larva.X64;
 using LLVMSharp.Interop;
@@ -188,6 +189,134 @@ public sealed unsafe class AotTests : CheckedTest
         }
     }
 
+    /// <summary>
+    /// Reference counting with threads: the inline counts are atomic in a program that starts threads, and the runtime's
+    /// dead list (and the allocator it frees into) is locked. Two threads making and dropping a million objects each must
+    /// free them all without a crash (unlocked frees corrupted the allocator's chunks; plain counts lost updates).
+    /// </summary>
+    [Fact]
+    public void Llvm_reference_counts_are_atomic_and_the_dead_list_is_locked_with_threads()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.RcThreadsProgram() with { Name = "rcthreads" }, "rcthreads.lvo", GcConfig.RefCount);
+        string exe = Path.Combine(Directory, "rcthreads-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "rc_threads", "-o", exe, program);
+        Check("llvm: larva native --exe --entry rc_threads (gc: refcount)", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        for (int run = 0; run < 3; run++)
+        {
+            var (exit, output, errors) = Execute(exe, ["7"], stats: true);
+            var frees = Regex.Match(errors, @"frees (\d+)");
+            Check($"llvm: rcthreads.exe 7 = 7 (run {run}): two threads freed their 2000000 objects, no errors",
+                exit == 0 && output.Trim() == "7" && frees.Success && long.Parse(frees.Groups[1].Value) >= 2000000 && errors.Contains("errors 0"),
+                $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        }
+    }
+
+    /// <summary>
+    /// Mixed GC domains: an object promoted out of the nursery keeps its header's domain byte (worker_promote and evacuate
+    /// rebuilt the header without it: retain and release then counted an uncounted object, or stopped counting a counted
+    /// one). The in-process runtime of the linker tests is not larva_rt.c: this runs the program as an executable.
+    /// </summary>
+    [Fact]
+    public void Llvm_promoted_objects_keep_their_domain_byte()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        var linked = Linker.Link([LinkerPrograms.Object(MixedDomainPrograms.GcLib()), LinkerPrograms.Object(MixedDomainPrograms.RcLib(), GcConfig.RefCount),
+            LinkerPrograms.Object(MixedDomainPrograms.DomainPromotionApp())], new LinkOptions { MixedDomains = true, Entry = "dpromo::main", LowerToIl = false });
+        Check("Default + RefCount + dpromo link with mixed domains", linked.Success, string.Join(" | ", linked.Errors));
+        if (!linked.Success)
+            return;
+        string exe = Path.Combine(Directory, "dpromo-llvm.exe");
+        var (built, message) = ExecutableBuilder.Build(linked, exe, new ExecutableOptions { Compilation = CompilationOptions.Default });
+        Check("llvm: dpromo.exe built", built, message);
+        if (!built)
+            return;
+        var (exit, output, errors) = Execute(exe);
+        Check("llvm: dpromo.exe = 11: rclib's object keeps domain 1 across the collections (gc.domain), collections happened",
+            exit == 0 && output.Trim() == "11", $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        // The copy itself, in the source: the runtime pins (in place) every young object a conservative word names, which
+        // in this program includes the cell, so the executable above exercises the domain byte across collections but
+        // not the promotion path.
+        string source = Toolchain.RuntimeSource();
+        Check("evacuate copies the header's domain byte to the promoted copy", source.Contains("moved->domain = header->domain;"));
+        Check("worker_promote writes the type's domain into the new header", Regex.IsMatch(source, @"worker_promote[\s\S]{0,800}header->domain = \(int8_t\)\(type->flags >> 8\);"));
+    }
+
+    /// <summary>
+    /// A raw copy (mem.copy) of handles into an old array is a store of handles the compiled code puts no write barrier
+    /// on: the runtime's copy must card the array (when its type holds handles), or the next minor collection leaves the
+    /// copied slots pointing at forwarded nursery objects. LARVA_GC_VERIFY reports such a slot after every collection.
+    /// </summary>
+    [Fact]
+    public void Llvm_raw_copies_of_handles_into_old_objects_take_the_write_barrier()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.CopyBarrierProgram() with { Name = "copy" }, "copy.lvo");
+        string exe = Path.Combine(Directory, "copy-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "copy_churn", "-o", exe, program);
+        Check("llvm: larva native --exe --entry copy_churn", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, ["300000"], stats: true, verify: true);
+        var barriers = Regex.Match(errors, @"barrier calls (\d+)");
+        Check("llvm: copy.exe 300000 = 299999 under LARVA_GC_VERIFY: the copied handles survive the minor collections, each copy a barrier call",
+            exit == 0 && output.Trim() == "299999" && !errors.Contains("larva verify") && Regex.IsMatch(errors, @"collections [1-9]\d* \(")
+            && barriers.Success && long.Parse(barriers.Groups[1].Value) >= 300000 && errors.Contains("errors 0"),
+            $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
+    /// <summary>
+    /// A thread blocked in a read of the standard input must not hold up the collections of the other threads: the
+    /// runtime's blocking calls (console and file reads and writes, name resolution, a command) leave managed code around
+    /// the wait, as sleeping, joining and the socket calls already did. The reader never gets its line: before the fix the
+    /// first collection waited for it forever (the test's input stays open and the process is killed after the timeout).
+    /// </summary>
+    [Fact]
+    public void Llvm_a_thread_blocked_reading_input_does_not_stop_collections()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.BlockedReaderProgram() with { Name = "reader" }, "reader.lvo");
+        string exe = Path.Combine(Directory, "reader-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "read_blocked", "-o", exe, program);
+        Check("llvm: larva native --exe --entry read_blocked", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, ["2000000"], stats: true, holdInput: true, timeout: 30_000);
+        Check("llvm: reader.exe 2000000 = 2000000 with a thread blocked in read.line: the main thread's collections went on and it finished",
+            exit == 0 && output.Trim() == "2000000" && Regex.IsMatch(errors, @"collections [1-9]\d* \(") && errors.Contains("errors 0"),
+            $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
+    /// <summary>
+    /// Listing a folder from two threads at once: the listing's entries and their count were per thread, but the
+    /// capacity that grows the buffer was shared, so the second thread took the first one's capacity for its own empty
+    /// buffer and wrote through null (a crash in next_entry). Every piece of the listing is per thread now.
+    /// </summary>
+    [Fact]
+    public void Llvm_folder_listings_from_two_threads_do_not_crash()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.DirectoryThreadsProgram() with { Name = "lister" }, "lister.lvo");
+        string exe = Path.Combine(Directory, "lister-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "list_threads", "-o", exe, program);
+        Check("llvm: larva native --exe --entry list_threads", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        for (int run = 0; run < 3; run++)
+        {
+            var (exit, output, errors) = Execute(exe, ["5"], stats: true, timeout: 60_000);
+            Check($"llvm: lister.exe 5 = 5 (run {run}): two threads listed the folder 200 times each without a crash",
+                exit == 0 && output.Trim() == "5" && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)
@@ -201,9 +330,10 @@ public sealed unsafe class AotTests : CheckedTest
     }
 
     private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false, int nursery = 0,
-        bool generations = true)
+        bool generations = true, bool verify = false, bool holdInput = false, int timeout = 60_000)
     {
-        var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        // holdInput: the standard input is a pipe that stays open (a read of it blocks) until the process ends or the timeout kills it.
+        var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, RedirectStandardInput = holdInput, UseShellExecute = false };
         foreach (var argument in arguments ?? [])
             start.ArgumentList.Add(argument);
         if (stress)
@@ -214,11 +344,22 @@ public sealed unsafe class AotTests : CheckedTest
             start.Environment["LARVA_GC_NURSERY"] = nursery.ToString();
         if (!generations)
             start.Environment["LARVA_GC_GENERATIONS"] = "0";
+        if (verify)
+            start.Environment["LARVA_GC_VERIFY"] = "1";
         using var process = Process.Start(start)!;
         var errors = process.StandardError.ReadToEndAsync();
-        string output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit(60_000);
-        return (process.ExitCode, output, errors.Result);
+        var output = process.StandardOutput.ReadToEndAsync();
+        if (!process.WaitForExit(timeout))
+        {
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit();
+            if (holdInput)
+                process.StandardInput.Close();
+            return (-1, output.Result, errors.Result + $" [killed after {timeout} ms]");
+        }
+        if (holdInput)
+            process.StandardInput.Close();
+        return (process.ExitCode, output.Result, errors.Result);
     }
 
     /// <summary>larva with LARVA_DIAGNOSTICS (the programs run under LARVA_GC_STRESS and print LARVA_STATS).</summary>

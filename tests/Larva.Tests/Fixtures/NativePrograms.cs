@@ -168,6 +168,185 @@ internal static class NativePrograms
     }
 
     /// <summary>
+    /// Reference counting from two threads (functions 0..1):
+    /// rc_worker(env: ptr unit) { for i in 0..1000000 { let g = gc Point{i, i}; let h = g } }  — every object is retained
+    /// (the copy) and released twice, inline in compiled code, and freed by the runtime when its count reaches 0;
+    /// rc_threads(n: i64) -> i32 { let a = thread.start(rc_worker, null); let b = thread.start(rc_worker, null); join a; join b; n }
+    /// — the counts and the runtime's dead list are shared between the threads.
+    /// </summary>
+    public static IrModule RcThreadsProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var environment = IrType.Ptr(IrType.Unit);
+        var worker = new FunctionBuilder("rc_worker", IrType.Unit);
+        worker.Argument(environment, "env");
+        int i = worker.Local(IrType.I64, "i", mutable: true);
+        int p = worker.Local(Point, "p", mutable: true);
+        int g = worker.Local(gcPoint, "g", mutable: true);
+        int h = worker.Local(gcPoint, "h", mutable: true);
+        int c = worker.Local(IrType.Bool, "c", mutable: true);
+        int head = worker.NewBlock(), body = worker.NewBlock(), exit = worker.NewBlock();
+        worker.Assign(i, Int(0, IrType.I64)).Goto(head);
+        worker.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(1000000, IrType.I64))).If(Copy(c), body, exit);
+        worker.At(body)
+              .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+              .Assign(g, Rvalue.Gc(Move(p)))
+              .Assign(h, Copy(g))
+              .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        worker.At(exit).Return();
+
+        var main = new FunctionBuilder("rc_threads", IrType.I32) { Unsafe = true };
+        int n = main.Argument(IrType.I64, "n");
+        int code = main.Local(new FunctionType([environment], IrType.Unit), "code", mutable: true);
+        int zero = main.Local(IrType.U64, "zero");
+        int env = main.Local(environment, "env");
+        int a = main.Local(IrType.I64, "a"), b = main.Local(IrType.I64, "b");
+        int joined = main.Local(IrType.I64, "joined", mutable: true);
+        main.Assign(code, Rvalue.FunctionRef(0))
+            .Assign(zero, Int(0, IrType.U64))
+            .Assign(env, Rvalue.Cast(Copy(zero), environment))
+            .Assign(a, new IntrinsicRvalue("thread.start", [Copy(code), Copy(env)]))
+            .Assign(b, new IntrinsicRvalue("thread.start", [Copy(code), Copy(env)]))
+            .Assign(joined, new IntrinsicRvalue("thread.join", [Copy(a), Int(-1, IrType.I64)]))
+            .Assign(joined, new IntrinsicRvalue("thread.join", [Copy(b), Int(-1, IrType.I64)]))
+            .Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(n), IrType.I32))
+            .Return();
+        return new IrModule(GcPrograms.StructDefs, [worker.Build(), main.Build()]);
+    }
+
+    /// <summary>
+    /// unsafe copy_churn(n: i64) -> i32 { let arr = gc [gc Point; 100000]; for i in 0..n { let tmp = gc [gc Point; 1]; tmp[0] = gc Point{i,i};
+    /// mem.copy(&amp;arr[0], &amp;tmp[0], 8) } arr[0].y }  — every iteration copies a young handle into the old array by a raw copy
+    /// (mem.copy, not a store: no write barrier in compiled code), so the runtime's copy must card the array, or the minor
+    /// collections the churn triggers leave arr[0] pointing into the nursery (→ n - 1; LARVA_GC_VERIFY=1 reports the slot).
+    /// </summary>
+    public static IrModule CopyBarrierProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var pointer = IrType.PtrMut(IrType.U8);
+        var f = new FunctionBuilder("copy_churn", IrType.I32) { Unsafe = true };
+        int n = f.Argument(IrType.I64, "n");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int zero = f.Local(IrType.I64, "zero");
+        int p = f.Local(Point, "p", mutable: true);
+        int arr = f.Local(IrType.Gc(new ArrayType(gcPoint)), "arr");
+        int tmp = f.Local(IrType.Gc(new ArrayType(gcPoint)), "tmp", mutable: true);
+        int targetRef = f.Local(IrType.RefMut(gcPoint), "target_ref", mutable: true), sourceRef = f.Local(IrType.RefMut(gcPoint), "source_ref", mutable: true);
+        int target = f.Local(pointer, "target", mutable: true), source = f.Local(pointer, "source", mutable: true);
+        int moved = f.Local(IrType.Unit, "moved", mutable: true);
+        int last = f.Local(gcPoint, "last", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int head = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(zero, Int(0, IrType.I64))
+         .Assign(arr, Rvalue.NewArray(AllocKind.Gc, gcPoint, Int(100000, IrType.I64)))
+         .Assign(i, Int(0, IrType.I64)).Goto(head);
+        f.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(c), body, exit);
+        f.At(body)
+         .Assign(tmp, Rvalue.NewArray(AllocKind.Gc, gcPoint, Int(1, IrType.I64)))
+         .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+         .Assign(new Place(tmp).Deref().Index(zero), Rvalue.Gc(Move(p)))
+         .Assign(targetRef, Rvalue.RefMut(new Place(arr).Deref().Index(zero)))
+         .Assign(target, Rvalue.Cast(Move(targetRef), pointer))
+         .Assign(sourceRef, Rvalue.RefMut(new Place(tmp).Deref().Index(zero)))
+         .Assign(source, Rvalue.Cast(Move(sourceRef), pointer))
+         .Assign(moved, new IntrinsicRvalue("mem.copy", [Copy(target), Copy(source), Int(8, IrType.I64)]))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        f.At(exit).Assign(last, Copy(new Place(arr).Deref().Index(zero))).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(last).Deref().Field(1))).Return();
+        return new IrModule(GcPrograms.StructDefs, [f.Build()]);
+    }
+
+    /// <summary>
+    /// A thread blocked reading the standard input while the main thread collects (functions 0..1):
+    /// read_worker(env: ptr unit) { read.line }  — blocks until a line comes (the test never sends one);
+    /// read_blocked(n: i64) -> i32 { thread.start(read_worker, null); time.sleep(300); for i in 0..n { gc Point{i,i} }; gc.request; n }
+    /// — the collections the churn triggers must not wait for the reader (it is out of managed code while it waits).
+    /// </summary>
+    public static IrModule BlockedReaderProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var environment = IrType.Ptr(IrType.Unit);
+        var worker = new FunctionBuilder("read_worker", IrType.Unit);
+        worker.Argument(environment, "env");
+        int line = worker.Local(IrType.I64, "line", mutable: true);
+        worker.Assign(line, new IntrinsicRvalue("read.line", [])).Return();
+
+        var main = new FunctionBuilder("read_blocked", IrType.I32) { Unsafe = true };
+        int n = main.Argument(IrType.I64, "n");
+        int code = main.Local(new FunctionType([environment], IrType.Unit), "code", mutable: true);
+        int zero = main.Local(IrType.U64, "zero");
+        int env = main.Local(environment, "env");
+        int thread = main.Local(IrType.I64, "thread");
+        int unit = main.Local(IrType.Unit, "unit", mutable: true);
+        int i = main.Local(IrType.I64, "i", mutable: true);
+        int p = main.Local(Point, "p", mutable: true);
+        int g = main.Local(gcPoint, "g", mutable: true);
+        int c = main.Local(IrType.Bool, "c", mutable: true);
+        int head = main.NewBlock(), body = main.NewBlock(), exit = main.NewBlock();
+        main.Assign(code, Rvalue.FunctionRef(0))
+            .Assign(zero, Int(0, IrType.U64))
+            .Assign(env, Rvalue.Cast(Copy(zero), environment))
+            .Assign(thread, new IntrinsicRvalue("thread.start", [Copy(code), Copy(env)]))
+            .Assign(unit, new IntrinsicRvalue("time.sleep", [Int(300, IrType.I64)]))
+            .Assign(i, Int(0, IrType.I64)).Goto(head);
+        main.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(c), body, exit);
+        main.At(body)
+            .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+            .Assign(g, Rvalue.Gc(Move(p)))
+            .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        main.At(exit).Assign(unit, new IntrinsicRvalue("gc.request", [])).Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(n), IrType.I32)).Return();
+        return new IrModule(GcPrograms.StructDefs, [worker.Build(), main.Build()]);
+    }
+
+    /// <summary>
+    /// Two threads listing a folder at once (functions 0..1):
+    /// list_worker(env: ptr unit) { let path = gc [u16; 1]; path[0] = '.'; for i in 0..200 { dir.list(&amp;path) } }
+    /// list_threads(n: i64) -> i32 { let a = thread.start(list_worker, null); let b = ...; join a; join b; n }
+    /// — the listing's buffer is per thread; a capacity shared between threads made the second one write through a null buffer.
+    /// </summary>
+    public static IrModule DirectoryThreadsProgram()
+    {
+        var environment = IrType.Ptr(IrType.Unit);
+        var units = new ArrayType(IrType.U16);
+        var worker = new FunctionBuilder("list_worker", IrType.Unit) { Unsafe = true };
+        worker.Argument(environment, "env");
+        int path = worker.Local(IrType.Gc(units), "path");
+        int zero = worker.Local(IrType.I64, "zero");
+        int text = worker.Local(IrType.Ref(units), "text", mutable: true);
+        int count = worker.Local(IrType.I64, "count", mutable: true);
+        int i = worker.Local(IrType.I64, "i", mutable: true);
+        int c = worker.Local(IrType.Bool, "c", mutable: true);
+        int head = worker.NewBlock(), body = worker.NewBlock(), exit = worker.NewBlock();
+        worker.Assign(zero, Int(0, IrType.I64))
+              .Assign(path, Rvalue.NewArray(AllocKind.Gc, IrType.U16, Int(1, IrType.I64)))
+              .Assign(new Place(path).Deref().Index(zero), Int('.', IrType.U16))
+              .Assign(i, Int(0, IrType.I64)).Goto(head);
+        worker.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(200, IrType.I64))).If(Copy(c), body, exit);
+        worker.At(body)
+              .Assign(text, Rvalue.Ref(new Place(path).Deref()))
+              .Assign(count, new IntrinsicRvalue("dir.list", [Move(text)]))
+              .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        worker.At(exit).Return();
+
+        var main = new FunctionBuilder("list_threads", IrType.I32) { Unsafe = true };
+        int n = main.Argument(IrType.I64, "n");
+        int code = main.Local(new FunctionType([environment], IrType.Unit), "code", mutable: true);
+        int mzero = main.Local(IrType.U64, "zero");
+        int env = main.Local(environment, "env");
+        int a = main.Local(IrType.I64, "a"), b = main.Local(IrType.I64, "b");
+        int joined = main.Local(IrType.I64, "joined", mutable: true);
+        main.Assign(code, Rvalue.FunctionRef(0))
+            .Assign(mzero, Int(0, IrType.U64))
+            .Assign(env, Rvalue.Cast(Copy(mzero), environment))
+            .Assign(a, new IntrinsicRvalue("thread.start", [Copy(code), Copy(env)]))
+            .Assign(b, new IntrinsicRvalue("thread.start", [Copy(code), Copy(env)]))
+            .Assign(joined, new IntrinsicRvalue("thread.join", [Copy(a), Int(-1, IrType.I64)]))
+            .Assign(joined, new IntrinsicRvalue("thread.join", [Copy(b), Int(-1, IrType.I64)]))
+            .Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(n), IrType.I32))
+            .Return();
+        return new IrModule([], [worker.Build(), main.Build()]);
+    }
+
+    /// <summary>
     /// unsafe remember_churn(n: i64) -> i32 { let mut last; for i in 0..n { let arr = gc [gc Point; 100000]; arr[0] = gc Point{i,i}; last = arr[0] } last.y }
     /// — every iteration stores a handle into a large array (800 KB: old at once, its memory given back to the system when
     /// it dies), so the write barrier lists it (cards), and it dies before the next collection (→ n - 1).

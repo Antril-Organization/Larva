@@ -291,6 +291,57 @@ internal static class MixedDomainPrograms
     }
 
     /// <summary>
+    /// module dpromo (Default): rclib's counted cell (domain 1, young when made) is kept only in a young Holder of the
+    /// app's domain, made in a callee (whose frame is gone: a stack word naming the cell would pin it in place), across
+    /// two collections gclib's churn triggers; the stack pins the holder, whose slot is scanned, so the cell is copied out
+    /// of the nursery (promoted); main = 10 × its domain afterwards (gc.domain) + (collections happened) → 11. A
+    /// promotion that rebuilt the header without the domain byte gave 1.
+    /// </summary>
+    public static IrModule DomainPromotionApp()
+    {
+        var rcCell = IrType.Gc(IrType.Struct(1));
+        var holderType = IrType.Struct(2);
+        var rc = new FunctionBuilder("rc_new", rcCell).ImportFrom("rclib::rc_new");
+        rc.Argument(IrType.I32, "x");
+        var churn = new FunctionBuilder("churn", IrType.Unit).ImportFrom("gclib::churn");
+        churn.Argument(IrType.I32, "n");
+
+        var make = new FunctionBuilder("make_holder", IrType.Gc(holderType));
+        int mx = make.Argument(IrType.I32, "x");
+        int mb = make.Local(rcCell, "b", mutable: true);
+        int mv = make.Local(holderType, "value", mutable: true);
+        int m1 = make.NewBlock();
+        make.Call(0, [Copy(mx)], mb, m1);
+        make.At(m1).Assign(new Place(mv).Field(0), Move(mb)).Assign(FunctionBuilder.ReturnPlace, Rvalue.Gc(Move(mv))).Return();
+
+        var main = new FunctionBuilder("main", IrType.I32) { Unsafe = true };
+        int b = main.Local(rcCell, "b", mutable: true);
+        int holder = main.Local(IrType.Gc(holderType), "holder", mutable: true);
+        int unit = main.Local(IrType.Unit, null, mutable: true);
+        int collections = main.Local(IrType.I64, "collections", mutable: true);
+        int some = main.Local(IrType.Bool, null, mutable: true);
+        int rb = main.Local(IrType.PtrMut(IrType.U8), "rb", mutable: true);
+        int domain = main.Local(IrType.I64, "domain", mutable: true);
+        int sum = main.Local(IrType.I64, "sum", mutable: true);
+        int b1 = main.NewBlock(), b2 = main.NewBlock(), b3 = main.NewBlock(), yes = main.NewBlock(), no = main.NewBlock();
+        main.Call(2, [Int(2)], holder, b1);
+        main.At(b1).Assign(unit, new IntrinsicRvalue("gc.request", [])).Call(1, [Int(4000)], unit, b2);
+        main.At(b2).Assign(unit, new IntrinsicRvalue("gc.request", [])).Call(1, [Int(4000)], unit, b3);
+        main.At(b3).Assign(collections, new IntrinsicRvalue("gc.collections", []))
+            .Assign(some, Rvalue.Binary(BinaryOp.Gt, Copy(collections), Operand.Const(0, IrType.I64)))
+            .Assign(b, Copy(new Place(holder).Deref().Field(0)))
+            .Assign(rb, Rvalue.Cast(Copy(b), IrType.PtrMut(IrType.U8)))
+            .Assign(domain, new IntrinsicRvalue("gc.domain", [Copy(rb)]))
+            .Assign(sum, Rvalue.Binary(BinaryOp.Mul, Copy(domain), Operand.Const(10, IrType.I64)))
+            .If(Copy(some), yes, no);
+        main.At(yes).Assign(sum, Rvalue.Binary(BinaryOp.Add, Copy(sum), Operand.Const(1, IrType.I64))).Goto(no);
+        main.At(no).Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(sum), IrType.I32)).Return();
+
+        return new IrModule([CellDef(Linkage.Import, "gclib::Cell"), new StructDef("RcCell", IrType.I32) { FieldNames = ["v"], Linkage = Linkage.Import, Symbol = "rclib::Cell" },
+            new StructDef("Holder", rcCell) { FieldNames = ["h"] }], [rc.Build(), churn.Build(), make.Build(), main.Build()]) { Name = "dpromo" };
+    }
+
+    /// <summary>
     /// module rcapp (RefCount, the program's GC): keeps a cell of the tracing gclib across two collections its churn
     /// triggers; main = cell.v + 100 × (collections happened) → 107.
     /// </summary>

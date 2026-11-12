@@ -1977,6 +1977,7 @@ static int table_remove(Table *t, uintptr_t key) {
 /* ── State ───────────────────────────────────────────────────────── */
 
 static Table live;          /* payload / cell → size, kind (heap cells, large gc objects) */
+static int large_index_stale = 1;  /* a large object was made or freed since index_large (a copy into one looks it up) */
 static Table frames;        /* function address → index into root_sets */
 static Table finalizers;    /* gc payload → its finalizer */
 static Table region_of;     /* gc payload → its arena region + 1 */
@@ -2525,6 +2526,8 @@ static void *old_allocate(const LarvaType *type, int64_t payload) {
         ((LargeInfo *)block)->size = payload;
         bytes_since += total;
     }
+    if (!small)
+        large_index_stale = 1;
     header->type = type;
     header->refcount = 1;
     header->domain = (int8_t)(type->flags >> 8);
@@ -2615,6 +2618,7 @@ static void gc_free(void *payload) {
         return;
     }
     table_remove(&live, (uintptr_t)payload);
+    large_index_stale = 1;
     if (header->flags & FLAG_LARGE) {
         free(large_info(header)->cards);
         larva_aligned_free(large_info(header));
@@ -2677,6 +2681,18 @@ static int counted_handle(void *payload) {
     return in_nursery(payload) || is_gc(payload);
 }
 
+/* A reference count moved by `n`: the new value. Plain while one thread runs, atomic once threads exist (compiled code
+   counts inline the same way: an atomic add in a program that starts threads). */
+#ifdef _WIN32
+static int32_t rc_add(int32_t *count, int32_t n) {
+    return threading ? _InterlockedExchangeAdd((volatile long *)count, n) + n : (*count += n);
+}
+#else
+static int32_t rc_add(int32_t *count, int32_t n) {
+    return threading ? __atomic_add_fetch(count, n, __ATOMIC_ACQ_REL) : (*count += n);
+}
+#endif
+
 LARVA_API void larva_gc_retain(void *handle) {
     if (!handle)
         return;
@@ -2686,7 +2702,7 @@ LARVA_API void larva_gc_retain(void *handle) {
     }
     if (header_of(handle)->domain & DOMAIN_UNCOUNTED)
         return;
-    header_of(handle)->refcount++;
+    rc_add(&header_of(handle)->refcount, 1);
 }
 
 static void push_pointer(void ***list, size_t *count, size_t *capacity, void *item) {
@@ -2748,15 +2764,19 @@ static void rc_drop_slot(void **slot) {
     GcHeader *header = header_of(child);
     if (header->domain & DOMAIN_UNCOUNTED)  /* also a free slot (SLOT_FREE) */
         return;
-    if (--header->refcount == 0)
+    if (rc_add(&header->refcount, -1) == 0)
         push_pointer(&rc_dying, &rc_dying_count, &rc_dying_capacity, child);
 }
 
-/* An object's count reached 0: it dies, and the handles it holds lose an owner. */
+/* An object's count reached 0: it dies, and the handles it holds lose an owner. The dying list, the draining flag and the
+   allocator it frees into are shared: under the runtime's lock once threads exist (the count itself was moved atomically). */
 LARVA_API void larva_rc_dead(void *handle) {
+    int locked = rt_enter();
     push_pointer(&rc_dying, &rc_dying_count, &rc_dying_capacity, handle);
-    if (rc_draining)
+    if (rc_draining) {
+        rt_leave(locked);
         return;
+    }
     rc_draining = 1;
     while (rc_dying_count > 0) {
         void *object = rc_dying[--rc_dying_count];
@@ -2768,7 +2788,7 @@ LARVA_API void larva_rc_dead(void *handle) {
                after it; the object dies then unless the finalizer kept it. */
             header->refcount = 1;
             finalize(object);
-            if (--header->refcount == 0)
+            if (rc_add(&header->refcount, -1) == 0)
                 push_pointer(&rc_dying, &rc_dying_count, &rc_dying_capacity, object);
             continue;
         }
@@ -2776,6 +2796,7 @@ LARVA_API void larva_rc_dead(void *handle) {
         gc_free(object);
     }
     rc_draining = 0;
+    rt_leave(locked);
 }
 
 LARVA_API void larva_gc_release(void *handle) {
@@ -2788,7 +2809,7 @@ LARVA_API void larva_gc_release(void *handle) {
     GcHeader *header = header_of(handle);
     if (header->domain & DOMAIN_UNCOUNTED)
         return;
-    if (--header->refcount == 0)
+    if (rc_add(&header->refcount, -1) == 0)
         larva_rc_dead(handle);
 }
 
@@ -3146,6 +3167,7 @@ static int compare_addresses(const void *a, const void *b) {
 }
 
 static void index_large(void) {
+    large_index_stale = 0;
     large_count = 0;
     for (size_t i = 0; i < live.capacity; i++) {
         Entry *e = &live.entries[i];
@@ -3581,6 +3603,7 @@ static void *worker_promote(GcWorker *w, const LarvaType *type, int64_t payload)
     GcHeader *header = (GcHeader *)slot;
     memset(header, 0, GC_HEADER);
     header->type = type;
+    header->domain = (int8_t)(type->flags >> 8);
     header->age = AGE_OLD;
     w->live++;
     return slot + GC_HEADER;
@@ -3681,6 +3704,7 @@ static void evacuate(void **slot) {
     GcHeader *moved = header_of(copy);
     memcpy(copy, target, (size_t)(payload < 8 ? 8 : payload));
     moved->refcount = header->refcount;
+    moved->domain = header->domain;  /* its GC domain (and the uncounted bit) go with it: retain and release read them */
     moved->flags |= header->flags & FLAG_FINALIZER;
     int64_t before = cas_word(word, seen, (int64_t)copy | 1);
     if (before != seen) {
@@ -4454,10 +4478,55 @@ LARVA_API void *larva_mem_alloc(int64_t size) {
 
 LARVA_API void larva_mem_free(void *block) { free(block); }
 
-/* `count` bytes from `source` to `target` (the ranges may overlap). */
+/* The old gc object (a chunk slot or a large object, never a young one) that `address` lies in, or NULL. Under the
+   runtime's lock when threads exist (the large index is rebuilt here when a large object was made or freed since). */
+static GcHeader *old_object_at(uintptr_t address) {
+    if (address >= small_low && address < small_high) {
+        uintptr_t base = address & ~(uintptr_t)(CHUNK - 1);
+        if (!chunk_map[(base - small_low) / CHUNK])
+            return NULL;
+        Chunk *chunk = (Chunk *)base;
+        uintptr_t offset = address - base;
+        if (offset < CHUNK_DATA)
+            return NULL;
+        size_t slot = (offset - CHUNK_DATA) / chunk->block;
+        if (slot >= chunk->bump)
+            return NULL;
+        GcHeader *header = (GcHeader *)chunk_slot(chunk, slot);
+        return header->domain == SLOT_FREE ? NULL : header;
+    }
+    if (live.count == 0)
+        return NULL;
+    if (large_index_stale)
+        index_large();
+    if (large_count == 0 || address < large_starts[0] - GC_HEADER)
+        return NULL;
+    size_t low = 0, high = large_count;
+    while (high - low > 1) {
+        size_t middle = (low + high) / 2;
+        if (large_starts[middle] - GC_HEADER <= address)
+            low = middle;
+        else
+            high = middle;
+    }
+    return address <= large_ends[low] ? header_of((void *)large_starts[low]) : NULL;
+}
+
+/* `count` bytes from `source` to `target` (the ranges may overlap). A copy into an old gc object that holds handles is a
+   store of handles into it: the generational write barrier applies (the object is remembered, or its cards marked), or a
+   minor collection would leave the copied handles pointing into the nursery. A copy into a young object, into memory
+   that is no gc object, or into an object without handles costs the lookup only. */
 LARVA_API void larva_mem_copy(void *target, const void *source, int64_t count) {
-    if (count > 0)
-        memmove(target, source, (size_t)count);
+    if (count <= 0)
+        return;
+    memmove(target, source, (size_t)count);
+    if (!nursery_high || in_nursery(target))
+        return;
+    int locked = rt_enter();
+    GcHeader *header = old_object_at((uintptr_t)target);
+    if (header && header->age == AGE_OLD && ((header->type->flags & TYPE_CONSERVATIVE) || header->type->handles > 0))
+        gc_wb_unlocked((char *)header + GC_HEADER, target, count);
+    rt_leave(locked);
 }
 
 /* The first `count` bytes of `left` and `right` compared as unsigned values: < 0, 0 or > 0. */
@@ -4624,27 +4693,35 @@ LARVA_API int64_t larva_read_line(void) {
     if (GetConsoleMode(in, &mode)) {
         /* A console gives UTF-16 itself. */
         int any = 0;
+        int64_t result = -1;
+        BLOCKING_ENTER();
         for (;;) {
             wchar_t unit;
             DWORD read = 0;
-            if (!ReadConsoleW(in, &unit, 1, &read, NULL) || read == 0)
-                return any ? input_line.length : -1;
+            if (!ReadConsoleW(in, &unit, 1, &read, NULL) || read == 0) {
+                result = any ? input_line.length : -1;
+                goto console_done;
+            }
             any = 1;
             if (unit == L'\n')
                 break;
             if (unit == 0x1A && input_line.length == 0)
-                return -1; /* Ctrl+Z */
+                goto console_done; /* Ctrl+Z */
             units_add(&input_line, (uint16_t)unit);
         }
         if (input_line.length > 0 && input_line.units[input_line.length - 1] == '\r')
             input_line.length--;
-        return input_line.length;
+        result = input_line.length;
+    console_done:
+        blocking_leave();
+        return result;
     }
 #endif
-    static unsigned char *bytes;
-    static size_t capacity;
+    static THREAD_LOCAL unsigned char *bytes;
+    static THREAD_LOCAL size_t capacity;
     size_t count = 0;
     int c, any = 0;
+    BLOCKING_ENTER();
     while ((c = getchar()) != EOF) {
         any = 1;
         if (c == '\n')
@@ -4659,6 +4736,7 @@ LARVA_API int64_t larva_read_line(void) {
         }
         bytes[count++] = (unsigned char)c;
     }
+    blocking_leave();
     if (!any)
         return -1;
     if (count > 0 && bytes[count - 1] == '\r')
@@ -4764,16 +4842,13 @@ static char *io_text(const int64_t *text) {
 #endif
 
 /* Reads the whole file into the runtime's buffer: its size, or -1. */
-LARVA_API int64_t larva_file_read(const int64_t *path) {
-    file_size = 0;
 #ifdef _WIN32
-    wchar_t *name = io_text(path);
-    FILE *file = name ? _wfopen(name, L"rb") : NULL;
+static int64_t file_read_blocking(const wchar_t *name) {
+    FILE *file = _wfopen(name, L"rb");
 #else
-    char *name = io_text(path);
-    FILE *file = name ? fopen(name, "rb") : NULL;
+static int64_t file_read_blocking(const char *name) {
+    FILE *file = fopen(name, "rb");
 #endif
-    free(name);
     if (!file)
         return -1;
     /* The size first, then one read into a buffer that large (it doubles if the file grows meanwhile). */
@@ -4819,6 +4894,23 @@ LARVA_API int64_t larva_file_read(const int64_t *path) {
     return file_size;
 }
 
+LARVA_API int64_t larva_file_read(const int64_t *path) {
+    file_size = 0;
+#ifdef _WIN32
+    wchar_t *name = io_text(path);
+#else
+    char *name = io_text(path);
+#endif
+    if (!name)
+        return -1;
+    /* Opening and reading may wait (a slow disk, a network path): a collection goes on meanwhile. */
+    BLOCKING_ENTER();
+    int64_t result = file_read_blocking(name);
+    blocking_leave();
+    free(name);
+    return result;
+}
+
 /* Copies the file read last into a u8[] (its length, then the bytes). */
 LARVA_API void larva_file_take(int64_t *bytes) {
     int64_t count = bytes[0] < file_size ? bytes[0] : file_size;
@@ -4838,8 +4930,10 @@ LARVA_API int64_t larva_file_write(const int64_t *path, const int64_t *bytes, in
     free(name);
     if (!file)
         return -1;
+    BLOCKING_ENTER();
     size_t written = bytes[0] > 0 ? fwrite(bytes + 1, 1, (size_t)bytes[0], file) : 0;
     int closed = fclose(file);
+    blocking_leave();
     return written == (size_t)bytes[0] && closed == 0 ? 0 : -1;
 }
 
@@ -4948,7 +5042,7 @@ static int compare_entries(const void *a, const void *b) {
 }
 
 static Units *next_entry(void) {
-    static int64_t capacity;
+    static THREAD_LOCAL int64_t capacity;  /* with folder_entries: each thread lists on its own */
     if (folder_count == capacity) {
         capacity = capacity ? capacity * 2 : 32;
         folder_entries = (Units *)realloc(folder_entries, (size_t)capacity * sizeof(Units));
@@ -5157,7 +5251,10 @@ LARVA_API int64_t larva_net_connect(const int64_t *host, int64_t port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    if (GetAddrInfoW(name, wservice, &hints, &found) != 0) { free(name); return -1; }
+    BLOCKING_ENTER();  /* resolving the name waits on the network too */
+    int unresolved = GetAddrInfoW(name, wservice, &hints, &found) != 0;
+    blocking_leave();
+    if (unresolved) { free(name); return -1; }
     BLOCKING_ENTER();
     for (ADDRINFOW *a = found; a; a = a->ai_next) {
         s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -5178,7 +5275,10 @@ LARVA_API int64_t larva_net_connect(const int64_t *host, int64_t port) {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    if (getaddrinfo(name, service, &hints, &found) != 0) { free(name); return -1; }
+    BLOCKING_ENTER();  /* resolving the name waits on the network too */
+    int unresolved = getaddrinfo(name, service, &hints, &found) != 0;
+    blocking_leave();
+    if (unresolved) { free(name); return -1; }
     BLOCKING_ENTER();
     for (struct addrinfo *a = found; a; a = a->ai_next) {
         s = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
@@ -5507,7 +5607,9 @@ LARVA_API int64_t larva_stream_read(int64_t handle, int64_t *bytes, int64_t offs
         fflush(stdout);
     else
         fseek(file, 0, SEEK_CUR); /* a read may follow a write */
+    BLOCKING_ENTER();  /* the standard input waits for the user; a file for the disk */
     size_t read = fread((uint8_t *)(bytes + 1) + offset, 1, (size_t)count, file);
+    blocking_leave();
     return read == 0 && ferror(file) ? -1 : (int64_t)read;
 }
 
@@ -5537,7 +5639,9 @@ LARVA_API int64_t larva_stream_write(int64_t handle, const int64_t *bytes, int64
         return -1;
     if (handle >= 3)
         fseek(file, 0, SEEK_CUR); /* a write may follow a read */
+    BLOCKING_ENTER();
     size_t written = fwrite((const uint8_t *)(bytes + 1) + offset, 1, (size_t)count, file);
+    blocking_leave();
     return written == (size_t)count ? (int64_t)written : -1;
 }
 
@@ -6212,12 +6316,20 @@ LARVA_API int64_t larva_process_run(const int64_t *command) {
     fflush(stderr);
 #ifdef _WIN32
     wchar_t *line = io_text(command);
-    int code = line ? _wsystem(line) : -1;
+    if (!line)
+        return -1;
+    BLOCKING_ENTER();  /* the command runs as long as it takes */
+    int code = _wsystem(line);
+    blocking_leave();
     free(line);
     return code;
 #else
     char *line = io_text(command);
-    int status = line ? system(line) : -1;
+    if (!line)
+        return -1;
+    BLOCKING_ENTER();
+    int status = system(line);
+    blocking_leave();
     free(line);
     return status == -1 ? -1 : WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
