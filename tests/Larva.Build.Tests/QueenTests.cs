@@ -51,6 +51,25 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
         Expect("lists close", "queen 1.0;\nchunk PROJ:\n tags: [a, b", "QN012");
     }
 
+    /// <summary>A hostile file with 200,000 `[` must not take larva (or the language server) down with the stack.</summary>
+    [Fact]
+    public void Format_limits_how_deep_lists_nest()
+    {
+        var diagnostics = new List<QueenDiagnostic>();
+        string nested(int depth) => new string('[', depth) + "a" + new string(']', depth);
+        var document = QueenParser.Parse($"queen 1.0;\nchunk PROJ:\n name: A,\n tags: {nested(QueenParser.MaxListDepth)},\n type: library", "test.queen", diagnostics);
+        Check("lists nest up to the limit", diagnostics.Count == 0 && document?.Named("PROJ").Single()["tags"]?.Value is QueenList, string.Join("; ", diagnostics));
+
+        diagnostics.Clear();
+        document = QueenParser.Parse($"queen 1.0;\nchunk PROJ:\n name: A,\n tags: {nested(QueenParser.MaxListDepth + 1)},\n type: library", "test.queen", diagnostics);
+        Check("one level more is QN017, and the entries after the list are still read", diagnostics.Count(d => d.Code == "QN017") == 1 && diagnostics.Count == 1
+            && document?.Named("PROJ").Single()["type"]?.Value is QueenIdentifier { Name: "library" }, string.Join("; ", diagnostics));
+
+        diagnostics.Clear();
+        document = QueenParser.Parse("queen 1.0;\nchunk PROJ:\n name: A,\n tags: " + new string('[', 200_000) + "\n type: library", "test.queen", diagnostics);
+        Check("200,000 `[` is one diagnostic, not a crash", diagnostics.Any(d => d.Code == "QN017") && document is not null, string.Join("; ", diagnostics.Take(3)));
+    }
+
     private void Expect(string name, string text, string code)
     {
         var diagnostics = new List<QueenDiagnostic>();
