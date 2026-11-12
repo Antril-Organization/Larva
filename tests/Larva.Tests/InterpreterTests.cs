@@ -193,6 +193,64 @@ public sealed class InterpreterTests : CheckedTest
     }
 
     [Fact]
+    public void Deep_recursion_runs_without_the_host_stack_and_the_depth_limit_is_a_vm_error()
+    {
+        // fn deep(n: i32) -> i32 { if n == 0 { 0 } else { deep(n - 1) + 1 } }
+        var deep = new FunctionBuilder("deep", IrType.I32);
+        int n = deep.Argument(IrType.I32, "n");
+        int c = deep.Temp(IrType.Bool);
+        int m = deep.Local(IrType.I32, "m");
+        int t = deep.Local(IrType.I32, "t");
+        int zero = deep.NewBlock(), recurse = deep.NewBlock(), after = deep.NewBlock();
+        deep.Assign(c, Rvalue.Binary(BinaryOp.Eq, Copy(n), Int(0))).If(Move(c), zero, recurse);
+        deep.At(zero).Assign(FunctionBuilder.ReturnPlace, Int(0)).Return();
+        deep.At(recurse).Assign(m, Rvalue.Binary(BinaryOp.Sub, Copy(n), Int(1))).Call(0, [Copy(m)], t, after);
+        deep.At(after).Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Add, Copy(t), Int(1))).Return();
+
+        // fn deep_throw(n: i32) -> i32 { if n == 0 { throw 7 } deep_throw(n - 1) }
+        var thrower = new FunctionBuilder("deep_throw", IrType.I32);
+        int tn = thrower.Argument(IrType.I32, "n");
+        int tc = thrower.Temp(IrType.Bool);
+        int tm = thrower.Local(IrType.I32, "m");
+        int raise = thrower.NewBlock(), descend = thrower.NewBlock(), back = thrower.NewBlock();
+        thrower.Assign(tc, Rvalue.Binary(BinaryOp.Eq, Copy(tn), Int(0))).If(Move(tc), raise, descend);
+        thrower.At(raise).Throw(Int(7));
+        thrower.At(descend).Assign(tm, Rvalue.Binary(BinaryOp.Sub, Copy(tn), Int(1))).Call(1, [Copy(tm)], FunctionBuilder.ReturnPlace, back);
+        thrower.At(back).Return();
+
+        // fn catch_deep(n: i32) -> i32 { try { deep_throw(n) } catch (e: i32) { -e } }
+        var catcher = new FunctionBuilder("catch_deep", IrType.I32);
+        int cn = catcher.Argument(IrType.I32, "n");
+        int e = catcher.Local(IrType.I32, "e");
+        int ok = catcher.NewBlock(), handler = catcher.NewBlock();
+        catcher.Call(1, [], [Copy(cn)], FunctionBuilder.ReturnPlace, ok, [new CatchClause(IrType.I32, handler)]);
+        catcher.At(ok).Return();
+        catcher.At(handler).Assign(e, Rvalue.Caught).Assign(FunctionBuilder.ReturnPlace, Rvalue.Unary(UnaryOp.Neg, Copy(e))).Return();
+
+        // fn forever(n: i32) -> i32 { forever(n + 1) }
+        var forever = new FunctionBuilder("forever", IrType.I32);
+        int fn = forever.Argument(IrType.I32, "n");
+        int fm = forever.Local(IrType.I32, "m");
+        int done = forever.NewBlock();
+        forever.Assign(fm, Rvalue.Binary(BinaryOp.Add, Copy(fn), Int(1))).Call(3, [Copy(fm)], FunctionBuilder.ReturnPlace, done);
+        forever.At(done).Return();
+
+        var module = new IrModule([], [deep.Build(), thrower.Build(), catcher.Build(), forever.Build()]);
+        var vm = Vm(module);
+        Check("deep(50000) = 50000 (far beyond what the host stack allows)", Equal(vm.Run("deep", 50_000), 50_000L), vm.Stats.ToString());
+        Check("frames released after the recursion", vm.Heap.Live.Count() == 0);
+        Check("an exception thrown 20000 frames down is caught at the top: catch_deep(20000) = -7", Equal(vm.Run("catch_deep", 20_000), -7L));
+        Check("frames released after unwinding", vm.Heap.Live.Count() == 0);
+        Check("uncaught at depth surfaces as UnhandledException", Throws<UnhandledException>(() => vm.Run("deep_throw", 1000), "unhandled"));
+
+        var limited = new Interpreter(Compile(module), options: new InterpreterOptions { MaxCallDepth = 2000 });
+        Check("unbounded recursion stops at the depth limit with a VM error, not a host crash",
+            Throws<VmException>(() => limited.Run("forever", 0), "call depth"));
+        Check("frames released after the depth error", limited.Heap.Live.Count() == 0);
+        Check("the interpreter is usable afterwards", Equal(limited.Run("deep", 1500), 1500L));
+    }
+
+    [Fact]
     public void A_callee_closing_its_region_keeps_the_callers_region_objects()
     {
         // Both functions number their region 0: the ids are per function, the regions are per activation.
