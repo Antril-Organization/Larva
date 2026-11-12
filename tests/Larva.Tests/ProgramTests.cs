@@ -321,6 +321,76 @@ public sealed class ProgramTests : CheckedTest
         }
     }
 
+    /// <summary>
+    /// A reference to a reference (or to a struct holding one) carries the loans of what it points at: what is read back
+    /// through it (<c>*rr</c>, <c>(*h).field</c>) still borrows the original place, which can neither change nor die meanwhile.
+    /// </summary>
+    [Fact]
+    public void Borrow_checker_keeps_loans_through_references_to_references()
+    {
+        StructDef[] structs = [.. BorrowStructs, new StructDef("Holder", IrType.Ref(IrType.I32))];
+        var holder = IrType.Struct(BorrowStructs.Length);
+
+        void ExpectWith(FunctionBuilder f, BorrowErrorKind? expected)
+        {
+            var function = f.Build();
+            var errors = BorrowChecker.Check(function, new IrModule(structs, [function]) { Globals = [new GlobalDef("kept", IrType.Ref(IrType.I32))] });
+            bool pass = expected is null ? errors.Count == 0 : errors.Count == 1 && errors[0].Kind == expected;
+            Check($"{function.Name}: expected {expected?.ToString() ?? "no errors"}", pass,
+                $"got {errors.Count}: " + string.Join(" | ", errors.Select(e => e.ToString())));
+        }
+
+        { // x = 1; r = &x; rr = &r; p = *rr; x = 2; return *p
+            var f = Fn("write_through_ref_to_ref", IrType.I32);
+            int x = f.Local(IrType.I32, "x", mutable: true);
+            int r = f.Local(IrType.Ref(IrType.I32), "r");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.Assign(x, Int(1)).Assign(r, Rvalue.Ref(x)).Assign(rr, Rvalue.Ref(r)).Assign(p, Copy(new Place(rr).Deref()))
+             .Assign(x, Int(2)).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.ConflictingBorrow);
+        }
+        { // the same, with x's storage ending while *rr is still used
+            var f = Fn("dead_through_ref_to_ref", IrType.I32);
+            int x = f.Local(IrType.I32, "x");
+            int r = f.Local(IrType.Ref(IrType.I32), "r");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.StorageLive(x).Assign(x, Int(1)).Assign(r, Rvalue.Ref(x)).Assign(rr, Rvalue.Ref(r)).Assign(p, Copy(new Place(rr).Deref()))
+             .StorageDead(x).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.DroppedWhileBorrowed);
+        }
+        { // through a struct: h.0 = &x; rh = &h; p = (*rh).0; x dies; *p
+            var f = Fn("dead_through_ref_to_holder", IrType.I32);
+            int x = f.Local(IrType.I32, "x");
+            int h = f.Local(holder, "h");
+            int rh = f.Local(IrType.Ref(holder), "rh");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.StorageLive(x).Assign(x, Int(1)).Assign(new Place(h).Field(0), Rvalue.Ref(x)).Assign(rh, Rvalue.Ref(h))
+             .Assign(p, Copy(new Place(rh).Deref().Field(0)))
+             .StorageDead(x).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.DroppedWhileBorrowed);
+        }
+        { // a reference read back through a reference to a reference still cannot be kept in a global
+            var f = Fn("global_through_ref_to_ref", IrType.Unit);
+            int v = f.Argument(IrType.Ref(IrType.I32), "v");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.Assign(rr, Rvalue.Ref(v)).Assign(p, Copy(new Place(rr).Deref())).StoreGlobal(0, Copy(p)).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // a reference to a reference is used, and the original place changes only after both are dead
+            var f = Fn("ref_to_ref_then_write", IrType.I32);
+            int x = f.Local(IrType.I32, "x", mutable: true);
+            int r = f.Local(IrType.Ref(IrType.I32), "r");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int y = f.Local(IrType.I32, "y");
+            f.Assign(x, Int(1)).Assign(r, Rvalue.Ref(x)).Assign(rr, Rvalue.Ref(r)).Assign(y, Copy(new Place(rr).Deref().Deref()))
+             .Assign(x, Int(2)).Assign(FunctionBuilder.ReturnPlace, Copy(y)).Return();
+            ExpectWith(f, null);
+        }
+    }
+
     [Fact]
     public void Borrow_check_mode_decides_between_error_warning_and_nothing()
     {

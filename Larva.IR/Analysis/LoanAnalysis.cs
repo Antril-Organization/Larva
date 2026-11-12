@@ -91,8 +91,10 @@ namespace Larva.IR.Analysis
             if (assign.Value is RefRvalue reference)
             {
                 incoming.Add(loansByLocation[location].Id);
-                // Reborrowing through a reference keeps the original loans alive too.
-                if (reference.Place.HasDeref())
+                // Reborrowing through a reference keeps the original loans alive too; so does borrowing a place that
+                // itself holds references (`&r` with `r = &x`, `&holder`): what is read back through the new reference
+                // (`*rr`, `(*h).field`) still borrows what the place borrowed.
+                if (reference.Place.HasDeref() || function.TypeOf(reference.Place, module).ContainsReference(context))
                     incoming.UnionWith(state.LoansOf(reference.Place.Local));
             }
             else if (assign.Value is not IntrinsicRvalue)
