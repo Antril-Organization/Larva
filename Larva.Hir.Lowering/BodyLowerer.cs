@@ -1268,27 +1268,69 @@ namespace Larva.Hir.Lowering
         /// <summary>Jumps on a boolean expression; <c>&amp;&amp;</c>, <c>||</c> and <c>!</c> become branches.</summary>
         private void Condition(H.Expr condition, int yes, int no)
         {
+            Enter();
+            try
+            {
+                ConditionChain(condition, yes, no);
+            }
+            finally
+            {
+                depth--;
+            }
+        }
+
+        /// <summary>
+        /// The left spine of <c>&amp;&amp;</c>, <c>||</c> and <c>!</c> walked in a loop (a condition of thousands of
+        /// terms is left-deep): the targets of each step are known going down, the leaf jumps first, then each step's
+        /// right operand from the innermost out.
+        /// </summary>
+        private void ConditionChain(H.Expr condition, int yes, int no)
+        {
+            // Each step: the node, its targets, and the block its right operand starts in (-1 for `!`).
+            var steps = new List<(H.Expr Node, int Yes, int No, int Mid)>();
+            while (true)
+            {
+                switch (condition)
+                {
+                    case H.BinaryExpr { Op: H.BinaryOp.And } and:
+                    {
+                        int mid = NewBlock();
+                        steps.Add((and, yes, no, mid));
+                        condition = and.Left;
+                        yes = mid;
+                        continue;
+                    }
+                    case H.BinaryExpr { Op: H.BinaryOp.Or } or:
+                    {
+                        int mid = NewBlock();
+                        steps.Add((or, yes, no, mid));
+                        condition = or.Left;
+                        no = mid;
+                        continue;
+                    }
+                    case H.UnaryExpr { Op: H.UnaryOp.Not } not:
+                        steps.Add((not, yes, no, -1));
+                        (condition, yes, no) = (not.Operand, no, yes);
+                        continue;
+                }
+                break;
+            }
+            ConditionCore(condition, yes, no);
+            for (int i = steps.Count - 1; i >= 0; i--)
+            {
+                var (node, stepYes, stepNo, mid) = steps[i];
+                if (node is not H.BinaryExpr bin)
+                    continue;
+                At(mid);
+                Condition(bin.Right, stepYes, stepNo);
+            }
+        }
+
+        /// <summary>A condition that is not <c>&amp;&amp;</c>, <c>||</c> or <c>!</c> (those are <see cref="ConditionChain"/>'s).</summary>
+        private void ConditionCore(H.Expr condition, int yes, int no)
+        {
             switch (condition)
             {
-                case H.BinaryExpr { Op: H.BinaryOp.And } and:
-                {
-                    int mid = NewBlock();
-                    Condition(and.Left, mid, no);
-                    At(mid);
-                    Condition(and.Right, yes, no);
-                    return;
-                }
-                case H.BinaryExpr { Op: H.BinaryOp.Or } or:
-                {
-                    int mid = NewBlock();
-                    Condition(or.Left, yes, mid);
-                    At(mid);
-                    Condition(or.Right, yes, no);
-                    return;
-                }
-                case H.UnaryExpr { Op: H.UnaryOp.Not } not:
-                    Condition(not.Operand, no, yes);
-                    return;
                 case H.IsExpr test:
                 {
                     var place = PlaceOrTemp(test.Value);
@@ -1536,8 +1578,102 @@ namespace Larva.Hir.Lowering
             _ => throw new LoweringException($"the operator {op} is lowered in a later phase"),
         };
 
+        /// <summary>The nesting of expressions a body may have; deeper ones are reported, not lowered (the host stack is finite).</summary>
+        internal const int MaxDepth = 10_000;
+
+        /// <summary>A left spine longer than this is lowered in a loop instead of by recursion (<see cref="Chain"/>).</summary>
+        private const int ChainThreshold = 32;
+
+        /// <summary>How many expressions are being lowered one inside the other (<see cref="Into"/>, <see cref="Condition"/>).</summary>
+        private int depth;
+
+        private void Enter()
+        {
+            if (++depth > MaxDepth || !System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                throw new LoweringException($"the expression is nested too deeply (more than {Math.Min(depth, MaxDepth)} levels): split it");
+        }
+
         /// <summary>Evaluates <paramref name="e"/> into <paramref name="target"/>.</summary>
         private void Into(Place target, H.Expr e)
+        {
+            Enter();
+            try
+            {
+                if (IsChain(e))
+                    Chain(target, e);
+                else
+                    IntoCore(target, e);
+            }
+            finally
+            {
+                depth--;
+            }
+        }
+
+        /// <summary>
+        /// The left operand of a step of a left-deep chain: <c>x + y</c> has <c>x</c>; a call has its receiver, or (static)
+        /// its first argument, when that is a call of the same method (<c>Concat(Concat(a, b), c)</c>, <c>s.A(x).A(y)</c>),
+        /// not on a struct receiver (a struct method evaluates its arguments before borrowing the receiver). Null otherwise.
+        /// </summary>
+        private H.Expr? Spine(H.Expr e) => e switch
+        {
+            H.BinaryExpr { Op: not (H.BinaryOp.And or H.BinaryOp.Or) } bin => bin.Left,
+            H.CallExpr { Receiver: H.CallExpr inner } call when inner.Method == call.Method
+                && !(inner.Type is H.NamedType { Type.IsDefinition: true } n && lowerer.Types[n.Type.Index].IsStruct) => inner,
+            H.CallExpr { Receiver: null, Arguments: [H.CallExpr inner, ..] } call when inner.Method == call.Method => inner,
+            _ => null,
+        };
+
+        /// <summary>Whether <paramref name="e"/> heads a left spine deeper than <see cref="ChainThreshold"/>.</summary>
+        private bool IsChain(H.Expr e)
+        {
+            int length = 0;
+            for (var step = Spine(e); step is not null; step = Spine(step))
+            {
+                if (++length > ChainThreshold)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// A long left-deep chain (<c>a + a + … + a</c>, a string joined of thousands of pieces) lowered in a loop: the
+        /// leftmost leaf first, then each step in order with its left operand already in a temporary (the order recursion
+        /// gives: the left value exists before the right operand is evaluated).
+        /// </summary>
+        private void Chain(Place target, H.Expr e)
+        {
+            var steps = new List<H.Expr>();
+            var leaf = e;
+            for (var left = Spine(leaf); left is not null; left = Spine(leaf))
+            {
+                steps.Add(leaf);
+                leaf = left;
+            }
+            int held = Temp(Lower(leaf.Type));
+            IntoCore(new Place(held), leaf);
+            H.Expr value = new HeldExpr(held, leaf.Type);
+            for (int i = steps.Count - 1; i >= 0; i--)
+            {
+                H.Expr step = steps[i] switch
+                {
+                    H.BinaryExpr bin => bin with { Left = value },
+                    H.CallExpr { Receiver: not null } call => call with { Receiver = value },
+                    H.CallExpr call => call with { Arguments = [value, .. call.Arguments[1..]] },
+                    var other => throw new LoweringException($"{other.GetType().Name} in a chain"),
+                };
+                if (i == 0)
+                {
+                    IntoCore(target, step);
+                    return;
+                }
+                int temp = Temp(Lower(step.Type));
+                IntoCore(new Place(temp), step);
+                value = new HeldExpr(temp, step.Type);
+            }
+        }
+
+        private void IntoCore(Place target, H.Expr e)
         {
             var type = Lower(e.Type);
             switch (e)
@@ -1571,7 +1707,7 @@ namespace Larva.Hir.Lowering
                 case H.LiteralExpr literal:
                     b.Assign(target, Constant(literal.Value, type));
                     return;
-                case H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.FieldExpr { Instance: not null } or H.ElementExpr or H.DerefExpr or PendingExpr when AsPlace(e) is { } place:
+                case H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.FieldExpr { Instance: not null } or H.ElementExpr or H.DerefExpr or PendingExpr or HeldExpr when AsPlace(e) is { } place:
                     b.Assign(target, Copied(place, e.Type));
                     return;
                 case H.FieldExpr f:
