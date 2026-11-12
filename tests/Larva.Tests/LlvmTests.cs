@@ -154,6 +154,18 @@ public sealed unsafe class LlvmTests : CheckedTest
         }
     }
 
+    /// <summary>Reference counting: `==` / `!=` on handles must not retain their operands (nothing would release them).</summary>
+    [Fact]
+    public void Handle_comparisons_keep_no_reference()
+    {
+        NativeRuntime.Reset();
+        using var program = Compile(ComparisonProgram(), GcConfig.RefCount);
+        using var jit = program.Jit();
+        long k = ((delegate* unmanaged<long, long>)jit.Address("compare"))(1000);
+        Check("RC: compare(1000) = 1000 and every compared object died at the end of its pass", k == 1000 && NativeRuntime.LiveGc == 0 && NativeRuntime.Errors == 0,
+            $"k {k}, live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
+    }
+
     [Fact]
     public void A_linked_program_runs_across_modules()
     {

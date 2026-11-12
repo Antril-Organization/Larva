@@ -1472,6 +1472,8 @@ namespace Larva.X64
         private int Binary(BinaryRvalue binary)
         {
             var type = function.TypeOf(binary.Left, module);
+            if (Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType)
+                return HandleComparison(binary);
             int left = Operand(binary.Left);
             int right = Operand(binary.Right);
             var (kind, size, signed) = cg.Shape(type);
@@ -1548,6 +1550,43 @@ namespace Larva.X64
             }
             a.Store(Frame(left), Reg.Rax, 8);
             return left;
+        }
+
+        /// <summary>
+        /// Reference counting: <c>==</c> / <c>!=</c> on handles compare addresses and keep no reference, so the operands are
+        /// read without a retain (an <see cref="Operand"/> read would take one that nothing releases); a read that transfers
+        /// a local's reference (its last use) releases it here, since its drop flag is cleared for it.
+        /// </summary>
+        private int HandleComparison(BinaryRvalue binary)
+        {
+            int Read(Operand operand) => operand switch
+            {
+                CopyOperand copy => Load(copy.Place),
+                MoveOperand move => Load(move.Place),
+                _ => Operand(operand),
+            };
+            int left = Read(binary.Left);
+            int right = Read(binary.Right);
+            int result = Temp();
+            a.Load(Reg.Rax, Frame(left), 8, false);
+            a.Load(Reg.Rcx, Frame(right), 8, false);
+            a.Cmp(Reg.Rax, Reg.Rcx);
+            a.SetCondition(binary.Op switch
+            {
+                BinaryOp.Eq => Cond.E,
+                BinaryOp.Ne => Cond.NE,
+                _ => throw new X64BackendException($"`{binary.Op}` on handles"),
+            }, Reg.Rax);
+            a.Store(Frame(result), Reg.Rax, 8);
+            foreach (var (operand, value) in new[] { (binary.Left, left), (binary.Right, right) })
+            {
+                if (Transfers(operand, current))
+                {
+                    a.Load(Reg.Rcx, Frame(value), 8, false);
+                    a.Call("larva_gc_release");
+                }
+            }
+            return result;
         }
 
         /// <summary>128-bit integers: the low half in rax / rcx, the high half in rdx / r8.</summary>

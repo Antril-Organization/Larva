@@ -1838,6 +1838,8 @@ namespace Larva.Llvm
             private LLVMValueRef Binary(BinaryRvalue binary)
             {
                 var type = function.TypeOf(binary.Left, module);
+                if (Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType)
+                    return HandleComparison(binary);
                 var left = Operand(binary.Left);
                 var right = Operand(binary.Right);
                 if (IsWideFloat(type))
@@ -1896,6 +1898,34 @@ namespace Larva.Llvm
                     BinaryOp.Ge => b.BuildICmp(signed ? LLVMIntPredicate.LLVMIntSGE : LLVMIntPredicate.LLVMIntUGE, left, right, ""),
                     _ => throw new LlvmBackendException($"`{binary.Op}`"),
                 };
+            }
+
+            /// <summary>
+            /// Reference counting: <c>==</c> / <c>!=</c> on handles compare addresses and keep no reference, so the operands are
+            /// read without a retain (an <see cref="Operand"/> read would take one that nothing releases); a read that transfers
+            /// a local's reference (its last use) releases it here, since its drop flag is cleared for it.
+            /// </summary>
+            private LLVMValueRef HandleComparison(BinaryRvalue binary)
+            {
+                LLVMValueRef Read(Operand operand) => operand switch
+                {
+                    CopyOperand copy => Load(copy.Place),
+                    MoveOperand move => Load(move.Place),
+                    _ => Operand(operand),
+                };
+                var left = Read(binary.Left);
+                var right = Read(binary.Right);
+                var result = binary.Op switch
+                {
+                    BinaryOp.Eq => b.BuildICmp(LLVMIntPredicate.LLVMIntEQ, left, right, ""),
+                    BinaryOp.Ne => b.BuildICmp(LLVMIntPredicate.LLVMIntNE, left, right, ""),
+                    _ => throw new LlvmBackendException($"`{binary.Op}` on handles"),
+                };
+                if (Transfers(binary.Left, current))
+                    cg.ReleaseHandle(fn, left);
+                if (Transfers(binary.Right, current))
+                    cg.ReleaseHandle(fn, right);
+                return result;
             }
 
             /// <summary>

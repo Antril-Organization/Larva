@@ -168,6 +168,40 @@ internal static class NativePrograms
     }
 
     /// <summary>
+    /// compare(n: i64) -> i64 { let a = gc Point{1,1}; k = 0; for i in 0..n { let c = gc Point{i,i}; if c == a { k += 1 } if c != a { k += 1 } } k }
+    /// — reference counting: a comparison keeps no reference, so every c dies at the end of its pass (→ n, nothing live after).
+    /// </summary>
+    public static IrModule ComparisonProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var f = new FunctionBuilder("compare", IrType.I64);
+        int n = f.Argument(IrType.I64, "n");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int k = f.Local(IrType.I64, "k", mutable: true);
+        int p = f.Local(Point, "p", mutable: true);
+        int a = f.Local(gcPoint, "a");
+        int c = f.Local(gcPoint, "c", mutable: true);
+        int same = f.Local(IrType.Bool, "same", mutable: true);
+        int differ = f.Local(IrType.Bool, "differ", mutable: true);
+        int go = f.Local(IrType.Bool, "go", mutable: true);
+        int head = f.NewBlock(), body = f.NewBlock(), equal = f.NewBlock(), second = f.NewBlock(), unequal = f.NewBlock(), next = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(new Place(p).Field(0), Int(1)).Assign(new Place(p).Field(1), Int(1))
+         .Assign(a, Rvalue.Gc(Move(p)))
+         .Assign(k, Int(0, IrType.I64)).Assign(i, Int(0, IrType.I64)).Goto(head);
+        f.At(head).Assign(go, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(go), body, exit);
+        f.At(body)
+         .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+         .Assign(c, Rvalue.Gc(Move(p)))
+         .Assign(same, Rvalue.Binary(BinaryOp.Eq, Copy(c), Copy(a))).If(Copy(same), equal, second);
+        f.At(equal).Assign(k, Rvalue.Binary(BinaryOp.Add, Copy(k), Int(1, IrType.I64))).Goto(second);
+        f.At(second).Assign(differ, Rvalue.Binary(BinaryOp.Ne, Copy(c), Copy(a))).If(Copy(differ), unequal, next);
+        f.At(unequal).Assign(k, Rvalue.Binary(BinaryOp.Add, Copy(k), Int(1, IrType.I64))).Goto(next);
+        f.At(next).Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        f.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(k)).Return();
+        return new IrModule(GcPrograms.StructDefs, [f.Build()]);
+    }
+
+    /// <summary>
     /// put(slot: &mut gc Point, v: gc Point) { *slot = v } — a store through a reference, whose owner put cannot name;
     /// unsafe keep_through_ref(n: i64) -> i32 { let h = gc Holder{gc Point{1,2}, 0}; churn(n); put(&mut (*h).0, gc Point{42,43}); churn(n); (*(*h).0).1 }
     /// — h is old by the time the young Point is stored into it through the reference (→ 43 only if the store was remembered).
