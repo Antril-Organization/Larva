@@ -5,8 +5,14 @@
   <ItemGroup>
     <!-- Built first; the tests run its larva.dll with dotnet. -->
     <ProjectReference Include="..\..\Larva.Cli\Larva.Cli.csproj" ReferenceOutputAssembly="false" />
-    <!-- The Windows setup's registry-free helpers (InstallerTests). -->
+  </ItemGroup>
+
+  <!-- The Windows setup's registry-free helpers (InstallerTests): the setup is a Windows-only program, so on Windows only. -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <ProjectReference Include="..\..\Larva.Setup\Larva.Setup.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!$([MSBuild]::IsOSPlatform('Windows'))">
+    <Compile Remove="InstallerTests.cs" />
   </ItemGroup>
 
 </Project>
