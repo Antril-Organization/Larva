@@ -3598,6 +3598,7 @@ static void *worker_promote(GcWorker *w, const LarvaType *type, int64_t payload)
     GcHeader *header = (GcHeader *)slot;
     memset(header, 0, GC_HEADER);
     header->type = type;
+    header->domain = (int8_t)(type->flags >> 8);
     header->age = AGE_OLD;
     w->live++;
     return slot + GC_HEADER;
@@ -3698,6 +3699,7 @@ static void evacuate(void **slot) {
     GcHeader *moved = header_of(copy);
     memcpy(copy, target, (size_t)(payload < 8 ? 8 : payload));
     moved->refcount = header->refcount;
+    moved->domain = header->domain;  /* its GC domain (and the uncounted bit) go with it: retain and release read them */
     moved->flags |= header->flags & FLAG_FINALIZER;
     int64_t before = cas_word(word, seen, (int64_t)copy | 1);
     if (before != seen) {

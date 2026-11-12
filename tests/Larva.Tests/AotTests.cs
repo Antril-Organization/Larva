@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using Larva.IR;
 using Larva.IR.Linking;
 using Larva.Llvm;
+using Larva.Driver;
 using Larva.Native;
 using Larva.X64;
 using LLVMSharp.Interop;
@@ -212,6 +213,37 @@ public sealed unsafe class AotTests : CheckedTest
                 exit == 0 && output.Trim() == "7" && frees.Success && long.Parse(frees.Groups[1].Value) >= 2000000 && errors.Contains("errors 0"),
                 $"exit {exit}: {output.Trim()} {errors.Trim()}");
         }
+    }
+
+    /// <summary>
+    /// Mixed GC domains: an object promoted out of the nursery keeps its header's domain byte (worker_promote and evacuate
+    /// rebuilt the header without it: retain and release then counted an uncounted object, or stopped counting a counted
+    /// one). The in-process runtime of the linker tests is not larva_rt.c: this runs the program as an executable.
+    /// </summary>
+    [Fact]
+    public void Llvm_promoted_objects_keep_their_domain_byte()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        var linked = Linker.Link([LinkerPrograms.Object(MixedDomainPrograms.GcLib()), LinkerPrograms.Object(MixedDomainPrograms.RcLib(), GcConfig.RefCount),
+            LinkerPrograms.Object(MixedDomainPrograms.DomainPromotionApp())], new LinkOptions { MixedDomains = true, Entry = "dpromo::main", LowerToIl = false });
+        Check("Default + RefCount + dpromo link with mixed domains", linked.Success, string.Join(" | ", linked.Errors));
+        if (!linked.Success)
+            return;
+        string exe = Path.Combine(Directory, "dpromo-llvm.exe");
+        var (built, message) = ExecutableBuilder.Build(linked, exe, new ExecutableOptions { Compilation = CompilationOptions.Default });
+        Check("llvm: dpromo.exe built", built, message);
+        if (!built)
+            return;
+        var (exit, output, errors) = Execute(exe);
+        Check("llvm: dpromo.exe = 11: rclib's object keeps domain 1 across the collections (gc.domain), collections happened",
+            exit == 0 && output.Trim() == "11", $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        // The copy itself, in the source: the runtime pins (in place) every young object a conservative word names, which
+        // in this program includes the cell, so the executable above exercises the domain byte across collections but
+        // not the promotion path.
+        string source = Toolchain.RuntimeSource();
+        Check("evacuate copies the header's domain byte to the promoted copy", source.Contains("moved->domain = header->domain;"));
+        Check("worker_promote writes the type's domain into the new header", Regex.IsMatch(source, @"worker_promote[\s\S]{0,800}header->domain = \(int8_t\)\(type->flags >> 8\);"));
     }
 
     // ── Helpers ────────────────────────────────────────────────
