@@ -75,4 +75,23 @@ public sealed class HiveCommandTests
         Assert.EndsWith("chunk DEPS:\r\n   package: Me/Raw@1.0", rewritten);
         Assert.DoesNotContain("\n", rewritten.Replace("\r\n", ""));
     }
+
+    [Fact]
+    public void Install_installs_the_packages_of_proj_dependencies()
+    {
+        var world = ProjectWorld.Shared;
+        string registry = Registry(world);
+        // lib needs Me/Raw; app needs lib (and no package itself); app's install must bring Me/Raw.
+        string library = world.Project("lib", "queen 1.0;\n\nchunk PROJ:\n   name: lib,\n   type: library\n\nchunk DEPS:\n   package: Me/Raw\n",
+            ("Lib.ant", "import Raw;\ninto namespace Lib { public Twice(i32 v) : i32 { return Peek(v) * 2; } }\n"));
+        string relative = Path.GetRelativePath(world.World.Root, Path.GetDirectoryName(library)!).Replace('\\', '/');
+        string app = world.Project("app", $"queen 1.0;\n\nchunk PROJ:\n   name: app,\n   type: exe\n\n{Hive(registry)}\nchunk DEPS:\n   proj: ../{relative}\n",
+            ("Program.ant", "import System;\nimport Lib;\ninto namespace App { Main() { Console.WriteLine(Twice(21)); } }\n"));
+        var larva = world.In(Path.GetDirectoryName(app)!);
+        string output = larva.Ok("hive", "install");
+        Assert.Contains("Me/Raw 1.0", output);
+        Assert.Contains("installed 1 package", output);
+        Assert.Contains("\"Me/Raw\"", File.ReadAllText(Path.Combine(Path.GetDirectoryName(app)!, "hive.lock")));
+        Assert.Contains("no errors", larva.Ok("build", "--check"));
+    }
 }

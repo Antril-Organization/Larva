@@ -226,6 +226,20 @@ internal static class HiveCommand
             packages.RemoveAll(p => p.Id == added.Id);
             packages.Add(added);
         }
+        // The packages of the projects it depends on (`proj:`, through any depth) are built with it: installed with it,
+        // and pinned in this project's lock, which is the one a build of this project reads.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { project.File };
+        void Collect(QueenProject dependency)
+        {
+            if (!seen.Add(dependency.File))
+                return;
+            foreach (var package in dependency.Packages.Where(p => !packages.Any(known => known.ToString() == p.ToString())))
+                packages.Add(package);
+            foreach (var below in dependency.Dependencies)
+                Collect(below);
+        }
+        foreach (var dependency in project.Dependencies)
+            Collect(dependency);
         var locked = Installer(project).Install(packages, previous);
         locked.Save(project.Folder);
         foreach (var entry in locked.Packages)
