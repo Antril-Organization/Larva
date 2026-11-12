@@ -86,6 +86,41 @@ public sealed class WasmTests : CheckedTest
         Check("atomic.add.i32, mem.copy, mem.cmp and gc.domain give 5 15 7 0 0", Lines(output).SequenceEqual(["5", "15", "7", "0", "0"]), string.Join(" ", Lines(output)));
     }
 
+    /// <summary>Float `%` is fmod (the dividend's sign), through the runtime's `larva_f64_rem`; singles go through doubles exactly.</summary>
+    [Fact]
+    public void Float_remainder_is_fmod()
+    {
+        var f = new FunctionBuilder("main", IrType.Unit);
+        int bits = f.Local(IrType.I64, "bits", mutable: true);
+        int a = f.Local(IrType.F64, "a", mutable: true), b = f.Local(IrType.F64, "b", mutable: true);
+        int sa = f.Local(IrType.F32, "sa", mutable: true), sb = f.Local(IrType.F32, "sb", mutable: true);
+        var pairs = new (double A, double B)[] { (7.5, 2.0), (-7.5, 2.0), (7.5, -2.0), (1e300, 3.0), (5.0, 0.0), (5.5, double.PositiveInfinity), (0.1, 0.03) };
+        foreach (var (x, y) in pairs)
+        {
+            f.Assign(bits, Int(BitConverter.DoubleToInt64Bits(x), IrType.I64)).Assign(a, new IntrinsicRvalue("f64.from_bits", [Copy(bits)]))
+             .Assign(bits, Int(BitConverter.DoubleToInt64Bits(y), IrType.I64)).Assign(b, new IntrinsicRvalue("f64.from_bits", [Copy(bits)]))
+             .Assign(sa, Rvalue.Cast(Copy(a), IrType.F32)).Assign(sb, Rvalue.Cast(Copy(b), IrType.F32));
+            Print(f, "print.f64", Rvalue.Binary(BinaryOp.Rem, Copy(a), Copy(b)));
+            Print(f, "print.f64", Rvalue.Cast(Rem32(f, sa, sb), IrType.F64));
+        }
+        f.Return();
+        var (exit, output, errors) = Node(new IrModule([], [f.Build()]) { Name = "rem" });
+        Check("the program runs", exit == 0, errors);
+        var expected = pairs.SelectMany(p => new[] { Shown(p.A % p.B), Shown((float)p.A % (float)p.B) }).ToArray();
+        Check("f64 and f32 remainders have the dividend's sign (7.5 % 2 = 1.5, -7.5 % 2 = -1.5, 7.5 % -2 = 1.5, 1e300 % 3 = 0, x % 0 = nan, 5.5 % inf = 5.5)",
+            Lines(output).SequenceEqual(expected), $"got {string.Join(" ", Lines(output))}\nwant {string.Join(" ", expected)}");
+    }
+
+    private static Operand Rem32(FunctionBuilder f, int left, int right)
+    {
+        int temp = f.Temp(IrType.F32);
+        f.Assign(temp, Rvalue.Binary(BinaryOp.Rem, Copy(left), Copy(right)));
+        return Move(temp);
+    }
+
+    /// <summary>How the runtime prints a double (15 significant digits, "nan").</summary>
+    private static string Shown(double value) => double.IsNaN(value) ? "nan" : value.ToString("G15", System.Globalization.CultureInfo.InvariantCulture).ToLowerInvariant();
+
     private static string Sat(double x, long min, long max) => double.IsNaN(x) ? "0" : x >= max ? max.ToString() : x <= min ? min.ToString() : ((long)Math.Truncate(x)).ToString();
     private static string SatU64(double x) => double.IsNaN(x) ? "0" : x >= ulong.MaxValue ? ulong.MaxValue.ToString() : x <= 0 ? "0" : ((ulong)Math.Truncate(x)).ToString();
 

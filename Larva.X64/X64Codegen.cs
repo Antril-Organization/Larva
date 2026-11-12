@@ -1759,6 +1759,26 @@ namespace Larva.X64
                 case BinaryOp.Sub: a.FloatSub(Xmm.X0, Xmm.X1, size); break;
                 case BinaryOp.Mul: a.FloatMul(Xmm.X0, Xmm.X1, size); break;
                 case BinaryOp.Div: a.FloatDiv(Xmm.X0, Xmm.X1, size); break;
+                case BinaryOp.Rem:
+                {
+                    // fmod (the remainder of the truncating division, with the dividend's sign) by the runtime's exact
+                    // soft float, larva_float_rem(left, right, result, limbs) with one limb (a double); a single (or a half,
+                    // already a single here) is widened and narrowed around it, which is exact: the remainder of two
+                    // singles is a single. a - trunc(a / b) * b would not be exact.
+                    int dividend = Temp(8), divisor = Temp(8);
+                    if (size == 4)
+                    {
+                        a.FloatResize(Xmm.X0, Xmm.X0, 4);
+                        a.FloatResize(Xmm.X1, Xmm.X1, 4);
+                    }
+                    a.StoreFloat(Frame(dividend), Xmm.X0, 8);
+                    a.StoreFloat(Frame(divisor), Xmm.X1, 8);
+                    int remainder = WideHelper("larva_float_rem", dividend, divisor, 1);
+                    a.LoadFloat(Xmm.X0, Frame(remainder), 8);
+                    if (size == 4)
+                        a.FloatResize(Xmm.X0, Xmm.X0, 8);
+                    break;
+                }
                 case BinaryOp.Eq or BinaryOp.Ne:
                     // Unordered (NaN) sets PF: == is false and != is true for NaN.
                     a.FloatCompare(Xmm.X0, Xmm.X1, size);

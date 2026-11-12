@@ -687,6 +687,7 @@ export async function run(options = {}) {
             larva_math_ceil: x => toBits(Math.ceil(fromBits(x))),
             larva_math_atan2: (x, y) => toBits(Math.atan2(fromBits(x), fromBits(y))),
             larva_math_pow: (x, y) => toBits(Math.pow(fromBits(x), fromBits(y))),
+            larva_f64_rem: (x, y) => toBits(fromBits(x) % fromBits(y)), // fmod: exact, the dividend's sign, NaN for a zero divisor
             larva_f64_bits: bits => bits,
             larva_f64_from_bits: bits => bits,
             // No C in WebAssembly: interop stops the program.

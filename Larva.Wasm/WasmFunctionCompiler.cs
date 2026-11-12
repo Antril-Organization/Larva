@@ -1241,6 +1241,21 @@ namespace Larva.Wasm
                     c.Raw((byte)((f32 ? 0x92 : 0xA0) + index));
                     if (f32) c.F32Store(left); else c.F64Store(left);
                     return left;
+                case BinaryOp.Rem:
+                    // fmod (the remainder of the truncating division, with the dividend's sign): the runtime's
+                    // `larva_f64_rem` (JavaScript's `%` on doubles, exact), on the bits of doubles; a single is promoted
+                    // and demoted around it, which is exact (the remainder of two singles is a single).
+                    c.LocalGet(Fp);
+                    LoadF(left);
+                    if (f32) c.Raw(0xBB);     // f64.promote_f32
+                    c.Raw(0xBD);              // i64.reinterpret_f64
+                    LoadF(right);
+                    if (f32) c.Raw(0xBB);
+                    c.Raw(0xBD);
+                    c.Call(cg.Runtime("larva_f64_rem"));
+                    c.Raw(0xBF);              // f64.reinterpret_i64
+                    if (f32) { c.Raw(0xB6); c.F32Store(left); } else c.F64Store(left); // f32.demote_f64
+                    return left;
                 case BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Gt or BinaryOp.Le or BinaryOp.Ge:
                     LoadF(left);
                     LoadF(right);

@@ -162,6 +162,8 @@ namespace Larva.Wasm
             ["larva_panic"] = new([ValType.I32, ValType.I64, ValType.I64], []),
             // The high 64 bits of an unsigned 64 × 64 product (128-bit multiplication).
             ["larva_mulhi_u64"] = new([ValType.I64, ValType.I64], [ValType.I64]),
+            // fmod on the bits of two doubles (float `%`).
+            ["larva_f64_rem"] = new([ValType.I64, ValType.I64], [ValType.I64]),
         };
 
         /// <summary>The signature of a runtime import (what every call site adapts its arguments and result to).</summary>

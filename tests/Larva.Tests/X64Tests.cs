@@ -206,6 +206,32 @@ public sealed unsafe class X64Tests : CheckedTest
         Check("f128 is compiled (soft-float routines in the runtime)", !soft.Skipped.ContainsKey("quad") && soft.Error is null, soft.Error);
     }
 
+    /// <summary>Float `%` is fmod (the dividend's sign) through the runtime's exact soft float; singles go through doubles exactly.</summary>
+    [Fact]
+    public void Float_remainder_is_fmod()
+    {
+        var f64 = new FunctionBuilder("rem_f64", IrType.F64);
+        int a = f64.Argument(IrType.F64, "a"), b = f64.Argument(IrType.F64, "b");
+        f64.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(a), Copy(b))).Return();
+        var f32 = new FunctionBuilder("rem_f32", IrType.F32);
+        int sa = f32.Argument(IrType.F32, "a"), sb = f32.Argument(IrType.F32, "b");
+        f32.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(sa), Copy(sb))).Return();
+        var module = new IrModule([], [f64.Build(), f32.Build()]);
+        using var image = Load(module);
+        var vm = Vm(module);
+        var remF64 = (delegate* unmanaged<double, double, double>)image.Address("rem_f64");
+        var remF32 = (delegate* unmanaged<float, float, float>)image.Address("rem_f32");
+        foreach (var (x, y) in new (double, double)[] { (7.5, 2.0), (-7.5, 2.0), (7.5, -2.0), (1e300, 3.0), (5.5, double.PositiveInfinity), (0.1, 0.03), (-1.0, 0.5) })
+        {
+            double expected = x % y; // C#'s % on doubles is fmod
+            Check($"x64: {x} % {y} = {expected}", remF64(x, y).Equals(expected), $"gave {remF64(x, y)}");
+            Check($"x64: (f32){x} % {y} = {(float)x % (float)y}", remF32((float)x, (float)y).Equals((float)x % (float)y), $"gave {remF32((float)x, (float)y)}");
+            Check($"VM: {x} % {y} = {expected}", Equals(vm.Run("rem_f64", x, y), expected), $"gave {vm.Run("rem_f64", x, y)}");
+        }
+        Check("x64: 5 % 0 = NaN", double.IsNaN(remF64(5.0, 0.0)));
+        Check("x64: -0.0 keeps its sign (-1 % 1 = -0)", double.IsNegative(remF64(-1.0, 1.0)) && remF64(-1.0, 1.0) == 0);
+    }
+
     /// <summary>
     /// Larva's rule for every back end: a float out of the integer's range gives the nearest limit and NaN gives 0 (LLVM's
     /// fptosi.sat), never cvttsd2si's 0x8000… or a wrapped value; the VM agrees.
