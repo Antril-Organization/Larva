@@ -271,6 +271,34 @@ public sealed class BindingsTests : CheckedTest
             && host.Read(header, "lib").Contains(OperatingSystem.IsWindows() ? "W(u16 w," : "W(u32 w,"));
     }
 
+    /// <summary>
+    /// A header under a path with non-ASCII characters: the preprocessor's line markers write them as octal escapes
+    /// (`\303\261` for `ñ`), which must still match the header's folder for its #defines to count.
+    /// </summary>
+    [Fact]
+    public void Headers_under_non_ASCII_paths_keep_their_defines()
+    {
+        string folder = Path.Combine(TestEnvironment.TempFolder("headers"), "año ñ");
+        Directory.CreateDirectory(folder);
+        string header = Path.Combine(folder, "api.h");
+        File.WriteAllText(header, "#define A_ONE 1\n#define A_TWO 2\nint F(int x);\n");
+        // Preprocessed text as clang writes it, without clang: the marker's path escaped.
+        string escaped = Path.GetFullPath(header).Replace("\\", "\\\\").Replace("ñ", "\\303\\261");
+        var reader = new HeaderReader(longIs64: false);
+        reader.DefineRoots.Add(folder);
+        string description = reader.Read($"# 1 \"{escaped}\"\n#define A_ONE 1\n# 1 \"<built-in>\" 1\n#define SYSTEM 9\n# 2 \"{escaped}\" 2\n#define A_TWO 2\nint F(int x);\n", "lib.dll");
+        Log(description);
+        Check("the defines after the escaped marker are the header's; a system one is not; the function knows its file",
+            description.Contains("const A_ONE = 1\n") && description.Contains("const A_TWO = 2\n") && !description.Contains("SYSTEM")
+            && reader.Origins.GetValueOrDefault("F") == Path.GetFullPath(header).Replace('\\', '/'), string.Join("; ", reader.Origins.Select(o => $"{o.Key}={o.Value}")));
+        if (HeaderReader.FindClang() is null)
+            return;
+        var real = new HeaderReader(longIs64: false);
+        string realDescription = real.ReadFile(header, "lib.dll");
+        Log(realDescription);
+        Check("through clang: both defines and the function", realDescription.Contains("const A_ONE = 1\n") && realDescription.Contains("const A_TWO = 2\n") && realDescription.Contains("F(i32 x) : i32\n"));
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()

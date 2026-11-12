@@ -110,6 +110,44 @@ namespace Larva.Bindings
 
         private static readonly System.Text.RegularExpressions.Regex LineMarker = new(@"^#\s*(?:line\s+)?\d+\s+\x22([^\x22]*)\x22", System.Text.RegularExpressions.RegexOptions.Compiled);
 
+        /// <summary>
+        /// The file a line marker names, as a path with `/`: the preprocessor writes it as a C string, `\\` for each
+        /// backslash and every byte outside ASCII as an octal escape (`\303\261` for `ñ`, UTF-8).
+        /// </summary>
+        private static string MarkerPath(string quoted)
+        {
+            if (!quoted.Contains('\\'))
+                return quoted;
+            var bytes = new List<byte>(quoted.Length);
+            for (int i = 0; i < quoted.Length; i++)
+            {
+                char c = quoted[i];
+                if (c == '\\' && i + 1 < quoted.Length)
+                {
+                    char next = quoted[i + 1];
+                    if (next is >= '0' and <= '7')
+                    {
+                        int value = 0, digits = 0;
+                        while (digits < 3 && i + 1 < quoted.Length && quoted[i + 1] is >= '0' and <= '7')
+                        {
+                            value = value * 8 + (quoted[++i] - '0');
+                            digits++;
+                        }
+                        bytes.Add((byte)value);
+                        continue;
+                    }
+                    if (next is '\\' or '"' or '\'')
+                    {
+                        bytes.Add((byte)next);
+                        i++;
+                        continue;
+                    }
+                }
+                bytes.AddRange(Encoding.UTF8.GetBytes([c]));
+            }
+            return Encoding.UTF8.GetString(bytes.ToArray()).Replace('\\', '/');
+        }
+
         public string Read(string header, string library, string? className = null)
         {
             string code = StripComments(header);
@@ -122,7 +160,7 @@ namespace Larva.Bindings
                     continue;
                 if (LineMarker.Match(trimmed) is { Success: true } marker)
                 {
-                    file = marker.Groups[1].Value.Replace("\\\\", "/").Replace('\\', '/');
+                    file = MarkerPath(marker.Groups[1].Value);
                     continue;
                 }
                 // Before any line marker (a header read as it is) every define counts; after one, only the user's files'.
@@ -184,7 +222,8 @@ namespace Larva.Bindings
             string? clang = FindClang();
             if (clang is null)
                 return null;
-            var start = new System.Diagnostics.ProcessStartInfo(clang) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            // clang writes UTF-8 (the console's code page would mangle non-ASCII text in string literals).
+            var start = new System.Diagnostics.ProcessStartInfo(clang) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, StandardOutputEncoding = Encoding.UTF8 };
             start.ArgumentList.Add("-E");
             start.ArgumentList.Add("-dD"); // the #defines too, each after a line marker naming its file
             start.ArgumentList.Add("-x");
@@ -362,7 +401,7 @@ namespace Larva.Bindings
                         if (System.Text.RegularExpressions.Regex.IsMatch(line, @"^#\s*pragma\s+pack\s*\("))
                             declarations.Add(PackMarker + line[(line.IndexOf('(') + 1)..line.LastIndexOf(')')]);
                         else if (LineMarker.Match(line) is { Success: true } marker)
-                            declarations.Add(FileMarker + marker.Groups[1].Value.Replace("\\\\", "/").Replace('\\', '/'));
+                            declarations.Add(FileMarker + MarkerPath(marker.Groups[1].Value));
                     }
                     continue;
                 }
