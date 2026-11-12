@@ -96,4 +96,74 @@ internal static class NativePrograms
          .Return();
         return new IrModule(GcPrograms.StructDefs, [f.Build()]);
     }
+
+    /// <summary>
+    /// Young objects the ambiguous roots pin (functions 0..3; globals 0 = finalized: i32, 1 = latest: gc Point):
+    /// pin_fin(dead: gc Point) { finalized += 1 } — the finalizer;
+    /// pinned_churn(n: i64) -> i32 { for i in 0..n { latest = gc Point{i, i} } latest.y }  — the global's cell (a root the
+    /// collector scans ambiguously) holds the newest object, so every minor collection pins one and retains its block (→ n - 1);
+    /// finalized_alive(n: i64) -> i32 { let keep = gc Point{7,8} finalized pin_fin; churn(n); finalized * 10 + keep.y }  — keep is
+    /// pinned by the first minor collection and must not be finalized while finalized_alive still holds it (→ 8);
+    /// churn(n: i64) -> i64 — garbage at every iteration.
+    /// </summary>
+    public static IrModule PinnedProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var fin = new FunctionBuilder("pin_fin", IrType.Unit);
+        fin.Argument(gcPoint, "dead");
+        int count = fin.Local(IrType.I32, "count", mutable: true);
+        fin.Assign(count, new GlobalRvalue(0)).Assign(count, Rvalue.Binary(BinaryOp.Add, Copy(count), Int(1))).StoreGlobal(0, Copy(count)).Return();
+
+        var pinned = new FunctionBuilder("pinned_churn", IrType.I32);
+        int n = pinned.Argument(IrType.I64, "n");
+        int i = pinned.Local(IrType.I64, "i", mutable: true);
+        int p = pinned.Local(Point, "p", mutable: true);
+        int g = pinned.Local(gcPoint, "g", mutable: true);
+        int c = pinned.Local(IrType.Bool, "c", mutable: true);
+        int head = pinned.NewBlock(), body = pinned.NewBlock(), exit = pinned.NewBlock();
+        pinned.Assign(i, Int(0, IrType.I64)).Goto(head);
+        pinned.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(c), body, exit);
+        pinned.At(body)
+              .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+              .Assign(g, Rvalue.Gc(Move(p)))
+              .StoreGlobal(1, Copy(g))
+              .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        pinned.At(exit).Assign(g, new GlobalRvalue(1)).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(g).Deref().Field(1))).Return();
+
+        var alive = new FunctionBuilder("finalized_alive", IrType.I32);
+        int an = alive.Argument(IrType.I64, "n");
+        int ap = alive.Local(Point, "p", mutable: true);
+        int finalizer = alive.Local(new FunctionType([gcPoint], IrType.Unit), "finalizer", mutable: true);
+        int keep = alive.Local(gcPoint, "keep");
+        int t = alive.Local(IrType.I64, "t");
+        int finalized = alive.Local(IrType.I32, "finalized", mutable: true);
+        int after = alive.NewBlock();
+        alive.Assign(new Place(ap).Field(0), Int(7)).Assign(new Place(ap).Field(1), Int(8))
+             .Assign(finalizer, Rvalue.FunctionRef(0))
+             .Assign(keep, Rvalue.Gc(Move(ap), Copy(finalizer)))
+             .Call(3, [Copy(an)], t, after);
+        alive.At(after)
+             .Assign(finalized, new GlobalRvalue(0))
+             .Assign(finalized, Rvalue.Binary(BinaryOp.Mul, Copy(finalized), Int(10)))
+             .Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Add, Copy(finalized), Copy(new Place(keep).Deref().Field(1))))
+             .Return();
+
+        var churn = new FunctionBuilder("churn", IrType.I64);
+        int cn = churn.Argument(IrType.I64, "n");
+        int ci = churn.Local(IrType.I64, "i", mutable: true);
+        int cp = churn.Local(Point, "p", mutable: true);
+        int cg = churn.Local(gcPoint, "g", mutable: true);
+        int cc = churn.Local(IrType.Bool, "c", mutable: true);
+        int chead = churn.NewBlock(), cbody = churn.NewBlock(), cexit = churn.NewBlock();
+        churn.Assign(ci, Int(0, IrType.I64)).Goto(chead);
+        churn.At(chead).Assign(cc, Rvalue.Binary(BinaryOp.Lt, Copy(ci), Copy(cn))).If(Copy(cc), cbody, cexit);
+        churn.At(cbody)
+             .Assign(new Place(cp).Field(0), Rvalue.Cast(Copy(ci), IrType.I32)).Assign(new Place(cp).Field(1), Rvalue.Cast(Copy(ci), IrType.I32))
+             .Assign(cg, Rvalue.Gc(Move(cp)))
+             .Assign(ci, Rvalue.Binary(BinaryOp.Add, Copy(ci), Int(1, IrType.I64))).Goto(chead);
+        churn.At(cexit).Assign(FunctionBuilder.ReturnPlace, Copy(cn)).Return();
+
+        return new IrModule(GcPrograms.StructDefs, [fin.Build(), pinned.Build(), alive.Build(), churn.Build()])
+            { Globals = [new GlobalDef("finalized", IrType.I32), new GlobalDef("latest", gcPoint)] };
+    }
 }
