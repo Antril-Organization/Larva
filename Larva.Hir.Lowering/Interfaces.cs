@@ -245,7 +245,7 @@ namespace Larva.Hir.Lowering
                 }
                 b.Assign(to, Operand.Copy(from));
             }
-            lock (Structs)
+            lock (Sync)
                 Copy(target, source, type);
         }
 
@@ -335,7 +335,7 @@ namespace Larva.Hir.Lowering
         /// <summary>The box of a value type (made the first time it is asked for).</summary>
         internal Box BoxOf(TypeInfo info)
         {
-            lock (boxes)
+            lock (Sync)
             {
                 if (boxes.TryGetValue(info.Index, out var existing))
                     return existing;
@@ -348,33 +348,24 @@ namespace Larva.Hir.Lowering
                 // The slots of `any` (ToString, Hash…): the value's method of that name, else any's own.
                 var slots = root?.Slots ?? [];
                 var slotTypes = (root?.SlotIntroducers ?? []).Select(SlotType).ToArray();
-                int boxStruct, vtableStruct, global, maker;
-                lock (Structs)
+                int maker;
+                int boxStruct = AddStruct(new StructDef(info.Name + "$box", IrType.I32, VtablePointer(IrType.Struct(ObjectVtable)), valueType)
                 {
-                    boxStruct = Structs.Count;
-                    Structs.Add(new StructDef(info.Name + "$box", IrType.I32, VtablePointer(IrType.Struct(ObjectVtable)), valueType)
-                    {
-                        FieldNames = ["$class", "$vt", "value"],
-                        Mutable = true,
-                        Base = root is not null ? (StructType)IrType.Struct(root.Struct) : (StructType)IrType.Struct(ObjectStruct),
-                        Linkage = Linkage.Internal,
-                        Generics = IrGenerics(info.Definition.Generics),
-                    });
-                    vtableStruct = Structs.Count;
-                    Structs.Add(new StructDef(info.Name + "$box$vt", [.. VtablePrefix, .. slotTypes])
-                    {
-                        FieldNames = [.. VtablePrefixNames, .. slots.Select(s => Types[s.Type].Definition.Methods[s.Method].Name)],
-                        Mutable = true,
-                        Base = root is not null ? (StructType)IrType.Struct(root.Vtable) : (StructType)IrType.Struct(ObjectVtable),
-                        Linkage = Linkage.Internal,
-                        Generics = IrGenerics(info.Definition.Generics),
-                    });
-                }
-                lock (Globals)
+                    FieldNames = ["$class", "$vt", "value"],
+                    Mutable = true,
+                    Base = root is not null ? (StructType)IrType.Struct(root.Struct) : (StructType)IrType.Struct(ObjectStruct),
+                    Linkage = Linkage.Internal,
+                    Generics = IrGenerics(info.Definition.Generics),
+                });
+                int vtableStruct = AddStruct(new StructDef(info.Name + "$box$vt", [.. VtablePrefix, .. slotTypes])
                 {
-                    global = Globals.Count;
-                    Globals.Add(new GlobalDef(info.Name + "$box$vtable", IrType.U64) { GenericCount = info.GenericCount });
-                }
+                    FieldNames = [.. VtablePrefixNames, .. slots.Select(s => Types[s.Type].Definition.Methods[s.Method].Name)],
+                    Mutable = true,
+                    Base = root is not null ? (StructType)IrType.Struct(root.Vtable) : (StructType)IrType.Struct(ObjectVtable),
+                    Linkage = Linkage.Internal,
+                    Generics = IrGenerics(info.Definition.Generics),
+                });
+                int global = AddGlobal(new GlobalDef(info.Name + "$box$vtable", IrType.U64) { GenericCount = info.GenericCount });
                 var box = new Box(boxStruct, vtableStruct, global, -1);
                 // Thunks: any's slots answered by the value's methods, and the value's interfaces.
                 var slotFunctions = new (int Function, bool Own)[slots.Count];
@@ -404,15 +395,6 @@ namespace Larva.Hir.Lowering
                 box = box with { Maker = maker };
                 boxes[info.Index] = box;
                 return box;
-            }
-        }
-
-        private int AddFunction(IrFunction function)
-        {
-            lock (Functions)
-            {
-                Functions.Add(function);
-                return Functions.Count - 1;
             }
         }
 

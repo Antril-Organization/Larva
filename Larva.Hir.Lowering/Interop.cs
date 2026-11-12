@@ -202,7 +202,7 @@ namespace Larva.Hir.Lowering
         /// <summary>A function of <c>System.Runtime.InteropServices.CStrings</c> (the library's C string helpers).</summary>
         internal int CStringFunction(string name)
         {
-            lock (cStringFunctions)
+            lock (Sync)
             {
                 if (cStringFunctions.TryGetValue(name, out int known))
                     return known;
@@ -223,12 +223,11 @@ namespace Larva.Hir.Lowering
         /// <summary>The global keeping the address of C function <paramref name="entry"/> of <paramref name="library"/> (0 until found).</summary>
         private int ImportGlobal(string library, string entry)
         {
-            lock (Globals)
+            lock (Sync)
             {
                 if (!importGlobals.TryGetValue((library, entry), out int global))
                 {
-                    global = Globals.Count;
-                    Globals.Add(new GlobalDef($"$import.{library}.{entry}", IrType.U64));
+                    global = AddGlobal(new GlobalDef($"$import.{library}.{entry}", IrType.U64));
                     importGlobals[(library, entry)] = global;
                 }
                 return global;
@@ -272,15 +271,13 @@ namespace Larva.Hir.Lowering
         /// <summary>An import's raw form (strings as pointers), made once.</summary>
         internal int RawImport(string name, string library, string entry, IrType[] parameters, IrType result)
         {
-            lock (Functions)
+            lock (Sync)
             {
                 if (rawImports.TryGetValue(name, out int known))
                     return known;
                 var b = new FunctionBuilder(name, result) { Linkage = Linkage.Internal };
                 var arguments = parameters.Select((p, i) => Operand.Copy(b.Argument(p, $"a{i}", mutable: true))).ToArray();
-                int function = Functions.Count;
-                Functions.Add(NativeImportBody(b, library, entry, arguments, parameters, result));
-                return rawImports[name] = function;
+                return rawImports[name] = AddFunction(NativeImportBody(b, library, entry, arguments, parameters, result));
             }
         }
 
@@ -289,20 +286,20 @@ namespace Larva.Hir.Lowering
         /// <summary><c>$NativeCall{n}(code, args…)</c>: calls the C function at <c>code</c> (attribute <c>Larva.NativeCall</c>).</summary>
         internal int NativeCallHelper(FunctionType signature)
         {
-            lock (Functions)
+            lock (Sync)
             {
                 if (nativeCalls.TryGetValue(signature, out int known))
                     return known;
-                var b = new FunctionBuilder($"$NativeCall{nativeCalls.Count}", signature.Result) { Linkage = Linkage.Internal };
+                // Numbered by its index once the additions are ordered (OrderParallelAdditions); ordered by its signature.
+                var b = new FunctionBuilder($"$NativeCall{Functions.Count}", signature.Result) { Linkage = Linkage.Internal };
                 int code = b.Argument(signature, "code", mutable: true);
                 var arguments = signature.Parameters.Select((p, i) => Operand.Copy(b.Argument(p, $"a{i}", mutable: true))).ToArray();
                 int done = b.NewBlock();
                 b.CallIndirect(Operand.Copy(code), arguments, FunctionBuilder.ReturnPlace, done);
                 b.At(done).Return();
                 var built = b.Build();
-                int function = Functions.Count;
-                Functions.Add(built with { Attributes = [.. built.Attributes, new IrAttribute("Larva.NativeCall", [])] });
-                return nativeCalls[signature] = function;
+                return nativeCalls[signature] = AddFunction(built with { Attributes = [.. built.Attributes, new IrAttribute("Larva.NativeCall", [])] },
+                    key: "$NativeCall\0" + IR.Text.IrPrinter.FormatType(signature), renamed: "$NativeCall");
             }
         }
     }

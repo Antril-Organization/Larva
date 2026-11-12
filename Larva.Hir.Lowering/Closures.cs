@@ -568,20 +568,15 @@ namespace Larva.Hir.Lowering
                         names.Add("this");
                     }
                 }
-                int id;
-                lock (lowerer.Structs)
+                int id = lowerer.AddStruct(new StructDef(s == 0 ? $"{plan.Name}$display" : $"{plan.Name}$display{s}", [.. fields])
                 {
-                    id = lowerer.Structs.Count;
-                    lowerer.Structs.Add(new StructDef(s == 0 ? $"{plan.Name}$display" : $"{plan.Name}$display{s}", [.. fields])
-                    {
-                        FieldNames = [.. names],
-                        Mutable = true,
-                        Base = (StructType)IrType.Struct(lowerer.ObjectStruct),
-                        Linkage = Linkage.Internal,
-                        // The method's type parameters with their constraints (a field may be a type that requires them).
-                        Generics = [.. plan.Generics.Select(g => new GenericParam(g.Name, g.Constraint))],
-                    });
-                }
+                    FieldNames = [.. names],
+                    Mutable = true,
+                    Base = (StructType)IrType.Struct(lowerer.ObjectStruct),
+                    Linkage = Linkage.Internal,
+                    // The method's type parameters with their constraints (a field may be a type that requires them).
+                    Generics = [.. plan.Generics.Select(g => new GenericParam(g.Name, g.Constraint))],
+                });
                 moduleView = null;
                 c.DisplayHandle[s] = lowerer.Handle(IrType.Struct(id, OwnTypeArguments));
             }
@@ -793,12 +788,7 @@ namespace Larva.Hir.Lowering
             int k = c.Scan.Index[l];
             if (c.LambdaFunction[k] < 0)
             {
-                var function = new BodyLowerer(this, k).LowerLambda();
-                lock (lowerer.Functions)
-                {
-                    c.LambdaFunction[k] = lowerer.Functions.Count;
-                    lowerer.Functions.Add(function);
-                }
+                c.LambdaFunction[k] = lowerer.AddFunction(new BodyLowerer(this, k).LowerLambda());
             }
             var structType = type switch
             {

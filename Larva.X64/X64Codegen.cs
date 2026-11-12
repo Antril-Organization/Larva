@@ -128,8 +128,11 @@ namespace Larva.X64
                     bytes.AddRange(BitConverter.GetBytes((ushort)cells.Length));
                     foreach (int offset in handles.Concat(cells))
                         bytes.AddRange(BitConverter.GetBytes(offset));
-                    symbol = $"larva.type.{typeSymbols.Count}";
-                    Data.Add(new X64Data(symbol, [.. bytes]));
+                    // Named by its content, not by the order the threads asked (same program, same object): two types
+                    // with the same descriptor share one.
+                    symbol = "larva.type." + Convert.ToHexStringLower([.. bytes]);
+                    if (!typeSymbols.ContainsValue(symbol))
+                        Data.Add(new X64Data(symbol, [.. bytes]));
                 }
                 return typeSymbols[(type, domain, array)] = symbol;
             }
