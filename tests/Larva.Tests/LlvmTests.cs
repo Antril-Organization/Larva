@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 using Larva.IR;
 using Larva.IR.Analysis;
 using Larva.Llvm;
@@ -118,6 +118,40 @@ public sealed unsafe class LlvmTests : CheckedTest
         var unsignedLess = (delegate* unmanaged<uint, uint, int>)jit.Address("less_u32");
         var signedLess = (delegate* unmanaged<int, int, int>)jit.Address("less_i32");
         Check("comparisons honor signedness", unsignedLess(4_000_000_000, 1) == 0 && signedLess(-5, 1) == 1);
+    }
+
+    /// <summary>
+    /// LLVM's <c>sdiv</c> / <c>srem</c> leave <c>MIN / -1</c> undefined (a crash at -O0), and its <c>i128</c> division calls
+    /// compiler-rt's <c>__divti3</c>, which no executable links: both must compute as the VM does, at every level.
+    /// </summary>
+    [Fact]
+    public void Signed_division_wraps_at_min_and_wide_integers_divide()
+    {
+        var module = DivisionProgram();
+        var compiled = Compiler.Compile(module);
+        Check("the division program compiles", compiled.Il is not null, string.Join("; ", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
+        var vm = Vm(module);
+        foreach (int level in new[] { 0, 2 })
+        {
+            using var program = Compile(module, optimize: level);
+            using var jit = program.Jit();
+            var div32 = (delegate* unmanaged<int, int, int>)jit.Address("div_i32");
+            var rem32 = (delegate* unmanaged<int, int, int>)jit.Address("rem_i32");
+            var div64 = (delegate* unmanaged<long, long, long>)jit.Address("div_i64");
+            var rem64 = (delegate* unmanaged<long, long, long>)jit.Address("rem_i64");
+            Check($"O{level}: i32 MIN / -1 wraps to MIN and MIN % -1 is 0, like the VM", div32(int.MinValue, -1) == int.MinValue && rem32(int.MinValue, -1) == 0
+                && Equals(vm.Run("div_i32", int.MinValue, -1), (long)int.MinValue) && Equals(vm.Run("rem_i32", int.MinValue, -1), 0L));
+            Check($"O{level}: i64 MIN / -1 wraps to MIN and MIN % -1 is 0", div64(long.MinValue, -1) == long.MinValue && rem64(long.MinValue, -1) == 0);
+            Check($"O{level}: ordinary signed division is untouched", div32(-7, 2) == -3 && rem32(-7, 2) == -1 && div64(100, -7) == -14 && rem64(100, -7) == 2
+                && Equals(vm.Run("div_i64", 100L, -7L), -14L) && Equals(vm.Run("rem_i64", 100L, -7L), 2L));
+            var wideDiv = (delegate* unmanaged<long, long>)jit.Address("wide_div");
+            var wideRem = (delegate* unmanaged<long, long>)jit.Address("wide_rem");
+            var wideMin = (delegate* unmanaged<long, long>)jit.Address("wide_min_div_high");
+            Check($"O{level}: i128 (2^100 + 5) / 2^40 = 2^60 and % 2^40 = 5 (the runtime's limb division, no __divti3)",
+                wideDiv(1L << 40) == 1L << 60 && wideRem(1L << 40) == 5,
+                $"{wideDiv(1L << 40)} {wideRem(1L << 40)}");
+            Check($"O{level}: i128 MIN / -1 wraps to MIN (high word), MIN / 1 too", wideMin(-1) == long.MinValue && wideMin(1) == long.MinValue, $"{wideMin(-1)}");
+        }
     }
 
     [Fact]
@@ -437,6 +471,36 @@ public sealed unsafe class LlvmTests : CheckedTest
             .Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(sq), IrType.F64)).Return();
 
         return new IrModule([], [high.Build(), wrap.Build(), halves.Build(), quad.Build(), Less("less_u32", IrType.U32), Less("less_i32", IrType.I32)]);
+    }
+
+    /// <summary>div_i32, rem_i32, div_i64, rem_i64 (a / b), and i128 divisions of (2^100 + 5) and MIN by an i64 argument.</summary>
+    private static IrModule DivisionProgram()
+    {
+        static IrFunction Divide(string name, IrType type, BinaryOp op)
+        {
+            var f = new FunctionBuilder(name, type);
+            int a = f.Argument(type, "a"), b = f.Argument(type, "b");
+            f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Copy(a), Copy(b))).Return();
+            return f.Build();
+        }
+        static IrFunction Wide(string name, BigInteger dividend, BinaryOp op, int shift)
+        {
+            var f = new FunctionBuilder(name, IrType.I64);
+            int n = f.Argument(IrType.I64, "n");
+            int d = f.Local(IrType.I128, "d");
+            int r = f.Local(IrType.I128, "r", mutable: true);
+            f.Assign(d, Rvalue.Cast(Copy(n), IrType.I128))
+             .Assign(r, Rvalue.Binary(op, Int(dividend, IrType.I128), Copy(d)));
+            if (shift > 0)
+                f.Assign(r, Rvalue.Binary(BinaryOp.Shr, Copy(r), Int(shift, IrType.I128)));
+            f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(r), IrType.I64)).Return();
+            return f.Build();
+        }
+        var big = BigInteger.Pow(2, 100) + 5;
+        var min = -BigInteger.Pow(2, 127);
+        return new IrModule([], [Divide("div_i32", IrType.I32, BinaryOp.Div), Divide("rem_i32", IrType.I32, BinaryOp.Rem),
+            Divide("div_i64", IrType.I64, BinaryOp.Div), Divide("rem_i64", IrType.I64, BinaryOp.Rem),
+            Wide("wide_div", big, BinaryOp.Div, 0), Wide("wide_rem", big, BinaryOp.Rem, 0), Wide("wide_min_div_high", min, BinaryOp.Div, 64)]);
     }
 
     private static IrFunction Less(string name, IrType type)

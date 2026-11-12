@@ -445,6 +445,11 @@ namespace Larva.Llvm
             Runtime("larva_float_mul", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_div", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_rem", v, ptr, ptr, ptr, i32);
+            // Wide integers (i128, i256): division by limbs, as the direct x86-64 back end calls it.
+            Runtime("larva_wide_udiv", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_urem", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_sdiv", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_srem", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_cmp", i32, ptr, ptr, i32, i32);
             Runtime("larva_float_conv", v, ptr, ptr, i32, i32);
             Runtime("larva_region_depth", i32);
@@ -1857,9 +1862,11 @@ namespace Larva.Llvm
                 {
                     case BinaryOp.Div or BinaryOp.Rem:
                         CheckNotZero(right);
-                        return binary.Op == BinaryOp.Div
-                            ? signed ? b.BuildSDiv(left, right, "") : b.BuildUDiv(left, right, "")
-                            : signed ? b.BuildSRem(left, right, "") : b.BuildURem(left, right, "");
+                        if (type.BitWidth > 64)
+                            return WideIntDivide(binary.Op, left, right, type);
+                        if (!signed)
+                            return binary.Op == BinaryOp.Div ? b.BuildUDiv(left, right, "") : b.BuildURem(left, right, "");
+                        return SignedDivide(binary.Op, left, right);
                     case BinaryOp.Shl or BinaryOp.Shr:
                         // Shift amounts wrap at the width, as in the VM (an oversized LLVM shift would be poison).
                         var amount = b.BuildAnd(right, LLVMValueRef.CreateConstInt(right.TypeOf, (ulong)(type.BitWidth!.Value - 1)), "");
@@ -1882,6 +1889,47 @@ namespace Larva.Llvm
                     BinaryOp.Ge => b.BuildICmp(signed ? LLVMIntPredicate.LLVMIntSGE : LLVMIntPredicate.LLVMIntUGE, left, right, ""),
                     _ => throw new LlvmBackendException($"`{binary.Op}`"),
                 };
+            }
+
+            /// <summary>
+            /// Signed <c>/</c> and <c>%</c> as the VM and the x86-64 back end define them: <c>MIN / -1</c> wraps to <c>MIN</c> and
+            /// <c>MIN % -1</c> is 0. LLVM's <c>sdiv</c> / <c>srem</c> leave that overflow undefined (a #DE crash at -O0, anything
+            /// at -O3), so a divisor that may be -1 is tested first and takes the negation (or 0) instead of the instruction.
+            /// </summary>
+            private LLVMValueRef SignedDivide(BinaryOp op, LLVMValueRef left, LLVMValueRef right)
+            {
+                var minusOne = LLVMValueRef.CreateConstInt(right.TypeOf, ulong.MaxValue, true);
+                LLVMValueRef Regular() => op == BinaryOp.Div ? b.BuildSDiv(left, right, "") : b.BuildSRem(left, right, "");
+                LLVMValueRef Negated() => op == BinaryOp.Div ? b.BuildNeg(left, "") : LLVMValueRef.CreateConstInt(left.TypeOf, 0);
+                if (right.IsAConstantInt.Handle != IntPtr.Zero)
+                    return right.ConstIntSExt == -1 ? Negated() : Regular();
+                var special = fn.AppendBasicBlock("div.neg");
+                var regular = fn.AppendBasicBlock("div");
+                var join = fn.AppendBasicBlock("divided");
+                cg.Unlikely(b.BuildCondBr(b.BuildICmp(LLVMIntPredicate.LLVMIntEQ, right, minusOne, ""), special, regular));
+                b.PositionAtEnd(special);
+                var negated = Negated();
+                b.BuildBr(join);
+                b.PositionAtEnd(regular);
+                var divided = Regular();
+                b.BuildBr(join);
+                b.PositionAtEnd(join);
+                var result = b.BuildPhi(left.TypeOf, "");
+                result.AddIncoming([negated, divided], [special, regular], 2);
+                return result;
+            }
+
+            /// <summary>
+            /// <c>/</c> and <c>%</c> on integers wider than 64 bits: the runtime's limb routines (as the x86-64 back end calls them),
+            /// since LLVM would call compiler-rt's <c>__divti3</c>, which no Larva executable links.
+            /// </summary>
+            private LLVMValueRef WideIntDivide(BinaryOp op, LLVMValueRef left, LLVMValueRef right, IrType type)
+            {
+                int limbs = type.BitWidth!.Value / 64;
+                string name = op == BinaryOp.Div ? (type.IsSigned ? "larva_wide_sdiv" : "larva_wide_udiv") : (type.IsSigned ? "larva_wide_srem" : "larva_wide_urem");
+                var result = EntryAlloca(cg.ValueType(type), "wi.r");
+                cg.CallRuntime(name, Spilled(left, "wi.a"), Spilled(right, "wi.b"), result, I32(limbs));
+                return b.BuildLoad2(cg.ValueType(type), result, "");
             }
 
             /// <summary>Numeric conversion with Larva semantics (sign follows the source type).</summary>

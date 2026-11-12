@@ -469,7 +469,14 @@ export async function run(options = {}) {
     const halfView = new DataView(new ArrayBuffer(8));
     const toHalf = (bits, from) => Number(repack(unpack(bits, fmt(from)), fmt(16)));
     const fromHalf = (half, to) => repack(unpack(BigInt(half & 0xFFFF), fmt(16)), fmt(to));
+    // Wide integers (i128, i256) by limbs, as larva_rt.c divides them: the LLVM back end calls these instead of compiler-rt.
+    const wideDivide = (signed, remainder) => (a, b, result, limbs) => {
+        const x = limbsRead(a, limbs, signed), y = limbsRead(b, limbs, signed);
+        limbsWrite(result, limbs, remainder ? x % y : x / y);
+    };
     const softFloat = {
+        larva_wide_udiv: wideDivide(false, false), larva_wide_urem: wideDivide(false, true),
+        larva_wide_sdiv: wideDivide(true, false), larva_wide_srem: wideDivide(true, true),
         larva_float_add: wideBinary(fadd), larva_float_sub: wideBinary(fsub), larva_float_mul: wideBinary(fmul),
         larva_float_div: wideBinary(fdiv), larva_float_rem: wideBinary(frem),
         // 1 when the condition (0 ==, 1 !=, 2 <, 3 <=, 4 >, 5 >=) holds; NaN makes every one false but !=.
