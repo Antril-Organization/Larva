@@ -698,8 +698,10 @@ namespace Larva.Hir.Lowering
         {
             if (s.Collection is not H.RangeExpr { Low: { } low, High: { } high } range)
                 throw Unsupported("`foreach` over anything but a range");
-            // A captured variable is counted in a local and copied to the display object each iteration.
-            int variable = locals[s.Local] >= 0 ? locals[s.Local] : Temp(Lower(hirLocals[s.Local].Type));
+            // A captured variable is counted in a local, copied to the display object each pass and read back after it
+            // (the body may assign it, through a lambda or not: that changes the passes left, as for any variable).
+            bool captured = locals[s.Local] < 0;
+            int variable = captured ? Temp(Lower(hirLocals[s.Local].Type)) : locals[s.Local];
             var type = b.TypeOf(new Place(variable), Module);
             int end = Temp(type);
             Into(new Place(variable), low);
@@ -713,11 +715,13 @@ namespace Larva.Hir.Lowering
             open = false;
             At(body);
             EnterIteration(s.Body);
-            if (locals[s.Local] < 0)
+            if (captured)
                 b.Assign(LocalPlace(s.Local), Operand.Copy(variable));
             Loop(s.Label, after, step, s.Body, entered: true);
             Goto(step);
             At(step);
+            if (captured)
+                b.Assign(variable, Operand.Copy(LocalPlace(s.Local)));
             b.Assign(variable, Rvalue.Binary(BinaryOp.Add, Operand.Copy(variable), One(type)));
             Goto(head);
             At(after);
