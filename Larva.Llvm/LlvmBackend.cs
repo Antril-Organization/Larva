@@ -283,10 +283,11 @@ namespace Larva.Llvm
             {
                 RunPasses($"default<O{Math.Clamp(optimization, 1, 3)}>");
             }
+            // Module, not module: Polly replaced (and disposed) the one the constructor was given.
             if (!LlvmBackend.UsesSeh(triple))
-                StackMaps.KeepInMemory(module);
+                StackMaps.KeepInMemory(Module);
             else
-                StackMaps.Lower(module);
+                StackMaps.Lower(Module);
             Verify(optimization > 0 ? "after optimization" : "after stack maps");
         }
 

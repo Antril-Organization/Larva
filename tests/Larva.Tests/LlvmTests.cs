@@ -433,6 +433,23 @@ public sealed unsafe class LlvmTests : CheckedTest
         using var program = result.Program!;
         using var jit = program.Jit();
         Check("and still runs: squares(10) = 285", ((delegate* unmanaged<long, long>)jit.Address("squares"))(10) == 285);
+
+        // The stack maps are made on the module that came back from opt, not on the one it replaced (and disposed).
+        NativeRuntime.Reset();
+        var traced = LlvmBackend.Compile(TracingProgram(), new LlvmOptions
+        {
+            Compilation = CompilationOptions.Default with { Gc = GcConfig.Default },
+            Polly = new PollyOptions(standIn, Plugin: "LLVMPolly.dll", Arguments: ["-polly-vectorizer=stripmine"]),
+        });
+        Check("a tracing program goes through opt", traced.Success && traced.Program!.Polly, traced.ToString());
+        if (!traced.Success)
+            return;
+        using var tracedProgram = traced.Program!;
+        string ir = tracedProgram.IrText;
+        Check("its root markers were lowered to stack maps in the module that came back", !ir.Contains("@larva.gc.root(") && ir.Contains("llvm.experimental.stackmap"),
+            Extract(ir, "define", "keep"));
+        using var tracedJit = tracedProgram.Jit();
+        Check("and keep(50) = 8 with its roots found", ((delegate* unmanaged<long, int>)tracedJit.Address("keep"))(50) == 8 && NativeRuntime.Errors == 0);
     }
 
     [Fact]
