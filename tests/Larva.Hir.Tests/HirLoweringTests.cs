@@ -45,6 +45,8 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         ("OrderElement", null, 157, "arr[k] = k++ stores at the old k; arr[j] + j++ reads the old j"),
         ("OrderCompound", null, 62, "x += x++ and c.N += c.Bump() read the target first"),
         ("OrderNew", null, 11, "constructor arguments left to right"),
+        ("ContinueFinally", null, 3202, "continue inside a switch runs the finally between the switch and the loop"),
+        ("InclusiveMax", null, 630, "an inclusive range up to the type's maximum ends (u8 ..=255, i8 ..=127); an empty one runs no pass"),
     ];
 
     /// <summary>The benchmark program lowered once, for the facts that run it and build executables of it.</summary>

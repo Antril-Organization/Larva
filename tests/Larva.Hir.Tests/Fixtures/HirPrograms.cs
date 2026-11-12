@@ -324,6 +324,40 @@ internal static class HirPrograms
             var e = m.Local("e", E_);
             m.Do(Let(i, Int(1)), Let(e, New(E_, errorNew, Add(i, Mul(Inc(i), Int(10))))), Ret(F(e, code, I))).Done();
         }
+        // ContinueFinally(): s = 0; for (k = 0; k < 3; k++) { try { switch (k) { case 1: continue; default: s += 1; } s += 100; } finally { s += 1000; } } return s;
+        //   (3 finally runs + 2 full passes: 3000 + 202 = 3202)
+        {
+            var m = M("ContinueFinally");
+            var s = m.Local("s", I);
+            var k = m.Local("k", I);
+            m.Do(Let(s, Int(0)),
+                new ForStmt([Let(k, Int(0))], Lt(k, Int(3)), [Inc(k)], Blk(
+                    Try(Blk(
+                            new SwitchStmt(k, [
+                                new SwitchSection([new ConstantPattern(HirConstant.Int(1))], null, new ContinueStmt()),
+                                new SwitchSection([new DiscardPattern()], null, S(AddTo(s, Int(1)))),
+                            ]),
+                            S(AddTo(s, Int(100)))),
+                        [], Blk(S(AddTo(s, Int(1000))))))),
+                Ret(s)).Done();
+        }
+        // InclusiveMax(): n = 0; foreach (u8 b in 250..=255) n++; foreach (i8 c in 125..=127) m++; foreach (i in 5..=3) e++; return n * 100 + m * 10 + e;  (630)
+        {
+            var m = M("InclusiveMax");
+            var U8 = HirType.U8;
+            var I8 = HirType.Of(Primitive.I8);
+            var cnt = m.Local("cnt", I);
+            var mm = m.Local("m", I);
+            var e = m.Local("e", I);
+            var b = m.Local("b", U8);
+            var c = m.Local("c", I8);
+            var i = m.Local("i", I);
+            m.Do(Let(cnt, Int(0)), Let(mm, Int(0)), Let(e, Int(0)),
+                new ForeachStmt(b.Local, new RangeExpr(Int(250, U8), Int(255, U8), true, U8), S(AddTo(cnt, Int(1)))),
+                new ForeachStmt(c.Local, new RangeExpr(Int(125, I8), Int(127, I8), true, I8), S(AddTo(mm, Int(1)))),
+                new ForeachStmt(i.Local, new RangeExpr(Int(5), Int(3), true, I), S(AddTo(e, Int(1)))),
+                Ret(Add(Add(Mul(cnt, Int(100)), Mul(mm, Int(10))), e))).Done();
+        }
         return p;
     }
 

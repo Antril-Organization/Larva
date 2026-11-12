@@ -19,6 +19,7 @@ public sealed unsafe class ClosureTests : CheckedTest
         ("Passes", 31323, "lambdas made in passes of a loop inside a lambda keep that pass's variable"),
         ("Bump", 312, "an inner lambda changes the parameter of the call that made it"),
         ("Yields", 4207, "a lambda in an iterator step reads a field through the user's `this`"),
+        ("LoopWrite", 5, "assigning a captured range-loop variable changes the passes left"),
     ];
 
     [Fact]
@@ -160,6 +161,22 @@ public sealed unsafe class ClosureTests : CheckedTest
                     S(Invoke(inc, HirType.Void)),
                     Ret(n))),
                 Ret(Add(Mul(Invoke(bump, I, Int(1)), Int(100)), Invoke(bump, I, Int(10))))).Done();
+        }
+
+        // LoopWrite(): passes = 0; foreach (i in 0..10) { f = d => i + d; passes += 1; if (f(0) == 2) i = 7; } return passes;   (0, 1, 2 -> 7, 8, 9: 5)
+        {
+            var m = M("LoopWrite");
+            var passes = m.Local("passes", I);
+            var i = m.Local("i", I);
+            var d = m.Local("d", I);
+            var f = m.Local("f", fII);
+            m.Do(
+                Let(passes, Int(0)),
+                new ForeachStmt(i.Local, new RangeExpr(Int(0), Int(10), false, I), Blk(
+                    Let(f, Lambda([d.Local], fII, Ret(Add(i, d)))),
+                    S(AddTo(passes, Int(1))),
+                    If(Eq(Invoke(f, I, Int(0)), Int(2)), S(Set(i, Int(7)))))),
+                Ret(passes)).Done();
         }
 
         // Yields(): b = new Box { Value = 42 }; it = b.Numbers(); it.Next(); x = it.current; it.Next(); return x * 100 + it.current;   (4207)

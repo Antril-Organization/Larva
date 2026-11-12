@@ -119,7 +119,11 @@ namespace Larva.Hir.Lowering
 
         private int regionCount;
 
-        private sealed record LoopFrame(int Label, int Break, int Continue, int TryDepth);
+        /// <summary>
+        /// A loop or a switch: where <c>break</c> and <c>continue</c> go, and the try frames above which each runs the
+        /// finally blocks (a switch's <c>continue</c> is its loop's: it leaves the tries between the switch and the loop too).
+        /// </summary>
+        private sealed record LoopFrame(int Label, int Break, int Continue, int TryDepth, int ContinueTryDepth);
 
         private readonly List<TryFrame> tries = [];
 
@@ -210,6 +214,8 @@ namespace Larva.Hir.Lowering
                 // The program's entry runs every static constructor first.
                 Emit(lowerer.StaticInitFunction, [], new Place(Temp(IrType.Unit)));
             }
+            if (IsIterator)
+                EndIfDisposing();
             Block(body.Block);
             if (open && IsIterator)
                 EndIterator();
@@ -580,7 +586,7 @@ namespace Larva.Hir.Lowering
                     var loop = FindLoop(s.Label);
                     if (loop.Continue < 0)
                         throw new LoweringException("`continue` inside a switch that is not in a loop");
-                    RunFinally(loop.TryDepth);
+                    RunFinally(loop.ContinueTryDepth);
                     Goto(loop.Continue);
                     break;
                 }
@@ -658,7 +664,7 @@ namespace Larva.Hir.Lowering
         {
             if (!entered)
                 EnterIteration(body);
-            loops.Add(new LoopFrame(label, breakTarget, continueTarget, tries.Count));
+            loops.Add(new LoopFrame(label, breakTarget, continueTarget, tries.Count, tries.Count));
             Statement(body);
             loops.RemoveAt(loops.Count - 1);
         }
@@ -700,8 +706,10 @@ namespace Larva.Hir.Lowering
         {
             if (s.Collection is not H.RangeExpr { Low: { } low, High: { } high } range)
                 throw Unsupported("`foreach` over anything but a range");
-            // A captured variable is counted in a local and copied to the display object each iteration.
-            int variable = locals[s.Local] >= 0 ? locals[s.Local] : Temp(Lower(hirLocals[s.Local].Type));
+            // A captured variable is counted in a local, copied to the display object each pass and read back after it
+            // (the body may assign it, through a lambda or not: that changes the passes left, as for any variable).
+            bool captured = locals[s.Local] < 0;
+            int variable = captured ? Temp(Lower(hirLocals[s.Local].Type)) : locals[s.Local];
             var type = b.TypeOf(new Place(variable), Module);
             int end = Temp(type);
             Into(new Place(variable), low);
@@ -715,11 +723,22 @@ namespace Larva.Hir.Lowering
             open = false;
             At(body);
             EnterIteration(s.Body);
-            if (locals[s.Local] < 0)
+            if (captured)
                 b.Assign(LocalPlace(s.Local), Operand.Copy(variable));
             Loop(s.Label, after, step, s.Body, entered: true);
             Goto(step);
             At(step);
+            if (captured)
+                b.Assign(variable, Operand.Copy(LocalPlace(s.Local)));
+            if (range.Inclusive)
+            {
+                // The last pass (variable == end) ends the loop before the increment, which could wrap past the type's
+                // maximum (0..=255 over u8) and never fail the test above.
+                int more = Temp(IrType.Bool), increment = NewBlock();
+                b.Assign(more, Rvalue.Binary(BinaryOp.Lt, Operand.Copy(variable), Operand.Copy(end)));
+                b.If(Operand.Copy(more), increment, after);
+                At(increment);
+            }
             b.Assign(variable, Rvalue.Binary(BinaryOp.Add, Operand.Copy(variable), One(type)));
             Goto(head);
             At(after);
@@ -865,7 +884,7 @@ namespace Larva.Hir.Lowering
             int value = Temp(type);
             Into(new Place(value), s.Value);
             int after = NewBlock();
-            loops.Add(new LoopFrame(s.Label, after, loops.Count > 0 ? loops[^1].Continue : -1, tries.Count));
+            loops.Add(new LoopFrame(s.Label, after, loops.Count > 0 ? loops[^1].Continue : -1, tries.Count, loops.Count > 0 ? loops[^1].ContinueTryDepth : -1));
             foreach (var section in s.Sections)
             {
                 int body = NewBlock(), next = NewBlock();
