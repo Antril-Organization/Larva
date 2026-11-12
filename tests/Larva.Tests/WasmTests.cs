@@ -50,6 +50,42 @@ public sealed class WasmTests : CheckedTest
             $"got {string.Join(" ", Lines(output))}\nwant {string.Join(" ", expected)}");
     }
 
+    /// <summary>
+    /// Intrinsic arguments are adapted to each import's signature: addresses (pointers, gc handles cast to pointers,
+    /// function values) travel as i32 and an i32 result is widened; a pointer passed as an i64 made the module invalid.
+    /// </summary>
+    [Fact]
+    public void Intrinsic_calls_match_the_runtime_imports()
+    {
+        var f = new FunctionBuilder("main", IrType.Unit) { Unsafe = true };
+        int p = f.Local(IrType.PtrMut(IrType.I32), "p");
+        int q = f.Local(IrType.PtrMut(IrType.I64), "q");
+        int r = f.Local(IrType.PtrMut(IrType.I64), "r");
+        int g = f.Local(IrType.Gc(IrType.I64), "g");
+        int old = f.Temp(IrType.I32);
+        int unit = f.Temp(IrType.Unit);
+        f.Assign(p, Rvalue.Alloc(Int(5)))
+         .Assign(old, new IntrinsicRvalue("atomic.add.i32", [Copy(p), Int(10)]));
+        Print(f, "print.i64", Rvalue.Cast(Move(old), IrType.I64));                                 // 5: an i32 result widened
+        Print(f, "print.i64", Rvalue.Cast(Copy(new Place(p).Deref()), IrType.I64));                // 15
+        var bytes = IrType.PtrMut(IrType.U8);
+        int qBytes = f.Temp(bytes), rBytes = f.Temp(bytes), gBytes = f.Temp(bytes);
+        f.Assign(q, Rvalue.Alloc(Int(7, IrType.I64)))
+         .Assign(r, Rvalue.Alloc(Int(0, IrType.I64)))
+         .Assign(qBytes, Rvalue.Cast(Copy(q), bytes))
+         .Assign(rBytes, Rvalue.Cast(Copy(r), bytes))
+         .Assign(unit, new IntrinsicRvalue("mem.copy", [Copy(rBytes), Copy(qBytes), Int(8, IrType.I64)]));
+        Print(f, "print.i64", Copy(new Place(r).Deref()));                                                   // 7: pointers passed as i32
+        Print(f, "print.i64", new IntrinsicRvalue("mem.cmp", [Copy(rBytes), Copy(qBytes), Int(8, IrType.I64)])); // 0
+        f.Assign(g, Rvalue.Gc(Int(9, IrType.I64)))
+         .Assign(gBytes, Rvalue.Cast(Copy(g), bytes));
+        Print(f, "print.i64", new IntrinsicRvalue("gc.domain", [Copy(gBytes)]));                              // 0: a handle cast to a pointer
+        f.Free(p).Free(q).Free(r).Return();
+        var (exit, output, errors) = Node(new IrModule([], [f.Build()]) { Name = "imports" });
+        Check("the module is valid and runs (node instantiates it)", exit == 0, errors);
+        Check("atomic.add.i32, mem.copy, mem.cmp and gc.domain give 5 15 7 0 0", Lines(output).SequenceEqual(["5", "15", "7", "0", "0"]), string.Join(" ", Lines(output)));
+    }
+
     private static string Sat(double x, long min, long max) => double.IsNaN(x) ? "0" : x >= max ? max.ToString() : x <= min ? min.ToString() : ((long)Math.Truncate(x)).ToString();
     private static string SatU64(double x) => double.IsNaN(x) ? "0" : x >= ulong.MaxValue ? ulong.MaxValue.ToString() : x <= 0 ? "0" : ((ulong)Math.Truncate(x)).ToString();
 

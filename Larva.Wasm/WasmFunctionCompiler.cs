@@ -395,25 +395,67 @@ namespace Larva.Wasm
             UpdateFlags(moved, target);
         }
 
-        /// <summary>An intrinsic: its arguments on the wasm stack, then the runtime's import (input leaves an i64 there).</summary>
+        /// <summary>
+        /// An intrinsic: its arguments on the wasm stack, each adapted to the import's signature, then the runtime's import,
+        /// whose result (if any) is left as an i64 (bits for a float) when the intrinsic has one.
+        /// </summary>
+        /// <remarks>
+        /// Every slot holds an i64 (a bool a byte; an address, a function value or a float's bits widened), while the
+        /// imports take an i32 for an address of any kind (references, pointers, function values, byte arrays) and may
+        /// return one: the adaptation goes by the import's declared types, never by the IR type's shape, so no argument is
+        /// passed at the wrong width (an i64 where an i32 is expected made the module invalid).
+        /// </remarks>
         private void Intrinsic(IntrinsicRvalue intrinsic)
         {
             var info = Intrinsics.Find(intrinsic.Name)!;
+            var signature = WasmCodegen.RuntimeType(info.Symbol);
             var slots = intrinsic.Arguments.Select(Operand).ToArray();
+            if (signature.Parameters.Length != slots.Length)
+                throw new WasmBackendException($"`{intrinsic.Name}` takes {slots.Length} argument(s); the runtime's `{info.Symbol}` takes {signature.Parameters.Length}");
             for (int i = 0; i < slots.Length; i++)
             {
-                var type = info.Parameters[i];
                 c.LocalGet(Fp);
-                if (type == IrType.Bool)
+                if (info.Parameters[i] == IrType.Bool)
+                {
                     c.I32Load8U(slots[i]);
+                    if (signature.Parameters[i] == ValType.I64)
+                        c.I64ExtendI32U();
+                }
                 else
                 {
                     c.I64Load(slots[i]);
-                    if (type is ReferenceType)
-                        c.I32WrapI64();
+                    switch (signature.Parameters[i])
+                    {
+                        case ValType.I32: c.I32WrapI64(); break;
+                        case ValType.F64: c.Raw(0xBF); break;                      // f64.reinterpret_i64
+                        case ValType.F32: c.I32WrapI64(); c.Raw(0xBE); break;     // f32.reinterpret_i32
+                    }
                 }
             }
             c.Call(cg.Runtime(info.Symbol));
+            bool wanted = !info.Result.IsUnit;
+            if (signature.Results.Length == 0)
+            {
+                if (wanted)
+                    c.I64(0);
+                return;
+            }
+            if (!wanted)
+            {
+                c.Drop();
+                return;
+            }
+            switch (signature.Results[0])
+            {
+                case ValType.I32:
+                    if (cg.Shape(info.Result) is (Kind.Scalar, < 8, true))
+                        c.I64ExtendI32S();
+                    else
+                        c.I64ExtendI32U();                                        // an address or an unsigned value
+                    break;
+                case ValType.F64: c.Raw(0xBD); break;                             // i64.reinterpret_f64
+                case ValType.F32: c.Raw(0xBC); c.I64ExtendI32U(); break;          // i32.reinterpret_f32
+            }
         }
 
         private void FrameAddress(int offset)

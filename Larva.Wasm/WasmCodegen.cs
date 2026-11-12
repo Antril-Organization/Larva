@@ -164,6 +164,10 @@ namespace Larva.Wasm
             ["larva_mulhi_u64"] = new([ValType.I64, ValType.I64], [ValType.I64]),
         };
 
+        /// <summary>The signature of a runtime import (what every call site adapts its arguments and result to).</summary>
+        internal static FuncType RuntimeType(string name) =>
+            RuntimeTypes.TryGetValue(name, out var type) ? type : throw new WasmBackendException($"the runtime has no `{name}`");
+
         private readonly Dictionary<string, int> runtime = [];
         private readonly HashSet<string>? used;
 
