@@ -24,13 +24,19 @@ into namespace System
 			Hash() : u64 => (u64)(u32)this;
 			Equals(i32 other) : bool => this == other;
 			CompareTo(i32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
-			static Parse(str text) : i32 => (i32)Number.Parse(text);
+			static Parse(str text) : i32
+			{
+				i32? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not an i32: " + text);
+				return value.Value;
+			}
 
 			/// The number `text` writes, or null when it writes none.
 			static TryParse(str text) : i32?
 			{
 				i64? value = Number.TryParse(text);
-				if (value == null)
+				if (value == null || value.Value < Int32.MinValue || value.Value > Int32.MaxValue)
 					return null;
 				return (i32)value.Value;
 			}
@@ -492,15 +498,21 @@ into namespace System
 				i32 start = negative ? 1 : 0;
 				if (start == length)
 					return null;
+				// Counted downwards so that MinValue, which has no positive twin, parses too.
 				i128 value = 0;
 				loop (i32 i = start..length)
 				{
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (i128)(unit - 48);
+					i128 digit = (i128)(unit - 48);
+					if (value < (Int128.MinValue + digit) / 10)
+						return null;
+					value = value * 10 - digit;
 				}
-				return negative ? -value : value;
+				if (!negative && value == Int128.MinValue)
+					return null;
+				return negative ? value : -value;
 			}
 	}
 
@@ -552,7 +564,10 @@ into namespace System
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (u128)(unit - 48);
+					u128 digit = (u128)(unit - 48);
+					if (value > (UInt128.MaxValue - digit) / 10)
+						return null;
+					value = value * 10 + digit;
 				}
 				return value;
 			}
@@ -607,15 +622,21 @@ into namespace System
 				i32 start = negative ? 1 : 0;
 				if (start == length)
 					return null;
+				// Counted downwards so that MinValue, which has no positive twin, parses too.
 				i256 value = 0;
 				loop (i32 i = start..length)
 				{
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (i256)(unit - 48);
+					i256 digit = (i256)(unit - 48);
+					if (value < (Int256.MinValue + digit) / 10)
+						return null;
+					value = value * 10 - digit;
 				}
-				return negative ? -value : value;
+				if (!negative && value == Int256.MinValue)
+					return null;
+				return negative ? value : -value;
 			}
 	}
 
@@ -667,7 +688,10 @@ into namespace System
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (u256)(unit - 48);
+					u256 digit = (u256)(unit - 48);
+					if (value > (UInt256.MaxValue - digit) / 10)
+						return null;
+					value = value * 10 + digit;
 				}
 				return value;
 			}
@@ -1114,15 +1138,21 @@ into namespace System
 				i32 start = negative ? 1 : 0;
 				if (start == length)
 					return null;
+				// Counted downwards so that MinValue, which has no positive twin, parses too.
 				i64 value = 0;
 				loop (i32 i = start..length)
 				{
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (i64)(unit - 48);
+					i64 digit = (i64)(unit - 48);
+					if (value < (Int64.MinValue + digit) / 10)
+						return null;
+					value = value * 10 - digit;
 				}
-				return negative ? -value : value;
+				if (!negative && value == Int64.MinValue)
+					return null;
+				return negative ? value : -value;
 			}
 
 	}
