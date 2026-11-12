@@ -722,6 +722,15 @@ namespace Larva.Hir.Lowering
             At(step);
             if (captured)
                 b.Assign(variable, Operand.Copy(LocalPlace(s.Local)));
+            if (range.Inclusive)
+            {
+                // The last pass (variable == end) ends the loop before the increment, which could wrap past the type's
+                // maximum (0..=255 over u8) and never fail the test above.
+                int more = Temp(IrType.Bool), increment = NewBlock();
+                b.Assign(more, Rvalue.Binary(BinaryOp.Lt, Operand.Copy(variable), Operand.Copy(end)));
+                b.If(Operand.Copy(more), increment, after);
+                At(increment);
+            }
             b.Assign(variable, Rvalue.Binary(BinaryOp.Add, Operand.Copy(variable), One(type)));
             Goto(head);
             At(after);
