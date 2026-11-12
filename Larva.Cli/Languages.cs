@@ -110,11 +110,11 @@ internal sealed unsafe class LanguagePack
             if (!string.Equals(Hash(path), hash?.GetValue<string>(), StringComparison.OrdinalIgnoreCase))
                 return $"{file} is not the file its manifest lists (changed since the pack was made)";
         }
-        // Code the manifest does not list is never there by accident.
+        // Nothing is in a pack by accident: every file (whatever it is called) is listed and hashed, or the pack is not loaded.
         foreach (string path in Directory.EnumerateFiles(Folder, "*", SearchOption.AllDirectories))
         {
             string relative = Path.GetRelativePath(Folder, path).Replace('\\', '/');
-            if (IsCode(path) && !files.ContainsKey(relative))
+            if (relative != ManifestName && !files.ContainsKey(relative))
                 return $"{relative} is not among its `files`";
         }
         if (Signed)
@@ -131,9 +131,6 @@ internal sealed unsafe class LanguagePack
             return untrusted;
         return null;
     }
-
-    private static bool IsCode(string path) =>
-        Path.GetExtension(path).ToLowerInvariant() is ".dll" or ".so" or ".dylib" or ".exe";
 
     /// <summary>A file's SHA-256, as the manifest writes it (hex).</summary>
     public static string Hash(string path)

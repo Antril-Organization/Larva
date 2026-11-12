@@ -243,6 +243,23 @@ public sealed class LanguagesRegistryTests
         Assert.Contains("NOT USABLE", world.Larva.Fails("languages"));
     }
 
+    [Fact]
+    public void Packs_with_files_their_manifest_does_not_list_are_refused()
+    {
+        var world = new LanguageWorld("languages-unlisted");
+        string pack = world.LocalPack("Antril");
+        Assert.Contains("ok (files verified)", world.Larva.Ok("languages"));
+
+        // Not code, so the old check let it through: a pack carries only what its manifest hashes.
+        File.WriteAllText(Path.Combine(pack, "notes.txt"), "not listed");
+        Assert.Contains("notes.txt is not among its `files`", world.Larva.Fails("languages"));
+        File.WriteAllText(Path.Combine(world.Root, "Main.ant"), "Main() : i32 => 0;\n");
+        Assert.Contains("notes.txt is not among its `files`", world.Larva.Fails("build", "--check", "Main.ant"));
+        Directory.CreateDirectory(Path.Combine(pack, "sub"));
+        File.Move(Path.Combine(pack, "notes.txt"), Path.Combine(pack, "sub", "notes.txt"));
+        Assert.Contains("sub/notes.txt is not among its `files`", world.Larva.Fails("languages"));
+    }
+
     private static int FreePort()
     {
         var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);

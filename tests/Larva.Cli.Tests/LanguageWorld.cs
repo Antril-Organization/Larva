@@ -61,6 +61,22 @@ internal sealed class LanguageWorld
         Larva = new LarvaProcess { WorkingDirectory = Root, Config = config, UserLanguages = User };
     }
 
+    /// <summary>
+    /// A copy of the dev pack in a pack folder of the world (<c>packs/&lt;name&gt;</c>), signed by the author key, that larva
+    /// reads through <c>LARVA_LANGUAGES</c> (not from a registry: no registry signature or pinned key is needed); its folder.
+    /// </summary>
+    public string LocalPack(string name)
+    {
+        string packs = Path.Combine(Root, "packs");
+        string pack = Path.Combine(packs, name);
+        Directory.CreateDirectory(pack);
+        foreach (string file in Directory.EnumerateFiles(SourcePack))
+            File.Copy(file, Path.Combine(pack, Path.GetFileName(file)));
+        Sign(pack, AuthorKey);
+        Larva.Languages = packs;
+        return pack;
+    }
+
     /// <summary>A new ECDSA P-256 key in a PEM file of the world; its path (and its public key).</summary>
     public string NewKey(string file, out string publicKey)
     {
