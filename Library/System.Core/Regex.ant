@@ -295,6 +295,9 @@ into namespace System.Text
 			}
 			else
 				return atom;
+			// A sequence of one node (`(?:a)`) repeats as that node.
+			loop (atom.Kind == 4 && atom.Children.Count == 1)
+				atom = atom.Children[0];
 			RegexNode repeat = new RegexNode(8);
 			repeat.Child = atom;
 			repeat.Min = min;
@@ -468,9 +471,63 @@ into namespace System.Text
 			return -1;
 		}
 
+		/// Whether a single-unit atom (a literal, a class or `.`) takes the unit at `at`.
+		Takes(RegexNode atom, i32 at) : bool
+		{
+			u8 c = s[at];
+			if (atom.Kind == 1)
+				return c == atom.Literal;
+			if (atom.Kind == 2)
+				return atom.Table[c] != 0;
+			return c != 10;
+		}
+
+		/// A repeat of a single-unit atom, as a loop over the run of units it takes rather than a call per unit (a
+		/// long text would exhaust the stack): greedy takes the longest run and backs off one unit at a time while
+		/// the rest fails; lazy starts from the minimum and takes one more unit at a time.
+		RunUnits(RegexNode node, i32 pos, RegexCont? rest) : i32
+		{
+			RegexNode atom = node.Child;
+			i32 limit = s.Length - pos;
+			if (node.Max >= 0 && node.Max < limit)
+				limit = node.Max;
+			i32 n = 0;
+			if (!node.Lazy)
+			{
+				loop (n < limit && Takes(atom, pos + n))
+					n++;
+				loop (n >= node.Min)
+				{
+					i32 r = Rest(pos + n, rest);
+					if (r >= 0)
+						return r;
+					n--;
+				}
+				return -1;
+			}
+			loop (n < node.Min)
+			{
+				if (n >= limit || !Takes(atom, pos + n))
+					return -1;
+				n++;
+			}
+			loop (true)
+			{
+				i32 r = Rest(pos + n, rest);
+				if (r >= 0)
+					return r;
+				if (n >= limit || !Takes(atom, pos + n))
+					return -1;
+				n++;
+			}
+		}
+
 		/// `count` iterations of a repeat are done; `lastPos` is where the last one started (-1 at first).
 		RunRepeat(RegexNode node, i32 pos, i32 count, i32 lastPos, RegexCont? rest) : i32
 		{
+			i32 atom = node.Child.Kind;
+			if (atom == 1 || atom == 2 || atom == 3)
+				return RunUnits(node, pos, rest);
 			// Another iteration is allowed under the maximum, and only if the last one made progress (an empty match
 			// could repeat forever).
 			bool more = (node.Max < 0 || count < node.Max) && !(count > node.Min && lastPos == pos);
