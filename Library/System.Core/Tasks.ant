@@ -396,6 +396,11 @@ into namespace System.Threading.Tasks
 			/// Runs ready tasks and timers until `task` has finished (or nothing is left that could finish it).
 			RunUntil(Task task)
 			{
+				// Fairness: a timer whose time has come is made ready (behind the tasks ready now) at the end of every pass over
+				// the ready list, and at least every 32 ready tasks within a pass. A task that keeps yielding (`await
+				// Task.Yield()` in a loop) makes itself ready again each time, so the list never empties: without this, a
+				// Task.Delay would never finish while it runs.
+				i32 ran = 0;
 				loop (!task.IsCompleted)
 				{
 					if (threaded && inbox.Count > 0)
@@ -404,14 +409,22 @@ into namespace System.Threading.Tasks
 					{
 						Task next = ready[first];
 						first++;
-						if (first == ready.Count)
+						bool passEnded = first == ready.Count;
+						if (passEnded)
 						{
 							ready.Clear();
 							first = 0;
 						}
 						next.Run();
+						ran++;
+						if (timers.Count > 0 && (passEnded || ran >= 32))
+						{
+							ran = 0;
+							Due(Environment.TickCount64);
+						}
 						continue;
 					}
+					ran = 0;
 					if (threaded && timers.Count == 0)
 					{
 						// Nothing to run here: wait for another thread to finish something (a little actively first).
@@ -434,22 +447,46 @@ into namespace System.Threading.Tasks
 				}
 			}
 
-		/// Completes the timers that are due; when none is, sleeps until the first one.
-		Timers()
+		/// The timer that is due first.
+		Soonest() : i32
 		{
-			i64 now = Environment.TickCount64;
 			i32 soonest = 0;
 			loop (i32 t = 1..timers.Count)
 			{
 				if (due[t] < due[soonest])
 					soonest = t;
 			}
-			if (due[soonest] > now)
-				Thread.Sleep((i32)(due[soonest] - now));
-			Task timer = timers[soonest];
-			timers.RemoveAt(soonest);
-			due.RemoveAt(soonest);
-			timer.Complete();
+			return soonest;
+		}
+
+		/// Completes the timers whose time has come (the first due first): whether there was one.
+		Due(i64 now) : bool
+		{
+			bool any = false;
+			loop (timers.Count > 0)
+			{
+				i32 soonest = Soonest();
+				if (due[soonest] > now)
+					break;
+				Task timer = timers[soonest];
+				timers.RemoveAt(soonest);
+				due.RemoveAt(soonest);
+				timer.Complete();
+				any = true;
+			}
+			return any;
+		}
+
+		/// Completes the timers that are due; when none is, sleeps until the first one.
+		Timers()
+		{
+			i64 now = Environment.TickCount64;
+			if (Due(now))
+				return;
+			i64 soon = due[Soonest()];
+			if (soon > now)
+				Thread.Sleep((i32)(soon - now));
+			Due(soon);
 		}
 	}
 
