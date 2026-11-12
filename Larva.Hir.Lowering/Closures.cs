@@ -18,11 +18,15 @@ namespace Larva.Hir.Lowering
         public bool This;
 
         /// <summary>
-        /// Scopes: 0 is the method's; each loop of the method's own body (not of a lambda's) has one for its body, made
-        /// anew each time round, so a lambda made in a pass captures that pass's variables. <c>Parent[s]</c> is the scope
-        /// around scope s (-1 for the method's).
+        /// Scopes: 0 is the method's; each lambda has one for its body (made anew each call, so each call of the lambda
+        /// keeps its own variables for the lambdas it makes), and each loop (of the method's or of a lambda's body) has one
+        /// for its body, made anew each time round, so a lambda made in a pass captures that pass's variables.
+        /// <c>Parent[s]</c> is the scope around scope s (-1 for the method's).
         /// </summary>
         public readonly List<int> Parent = [-1];
+
+        /// <summary>The context (0: the method, k + 1: lambda k) whose function makes each scope.</summary>
+        public readonly List<int> Context = [0];
 
         /// <summary>The scope of each loop body.</summary>
         public readonly Dictionary<H.Stmt, int> BodyScope = new(ReferenceEqualityComparer.Instance);
@@ -32,6 +36,9 @@ namespace Larva.Hir.Lowering
 
         /// <summary>The scope each lambda is made in.</summary>
         public readonly List<int> LambdaScope = [];
+
+        /// <summary>The scope of each lambda's body (its parameters and what the body declares outside loops).</summary>
+        public readonly List<int> LambdaBodyScope = [];
 
         /// <summary>The scope being scanned.</summary>
         private int scope;
@@ -58,25 +65,28 @@ namespace Larva.Hir.Lowering
             return false;
         }
 
+        /// <summary>A local belongs to the scope that first names it.</summary>
         private void Declare(int local, int context)
         {
-            if (local >= 0 && context == 0)
+            if (local >= 0 && Owner[local] < 0)
                 Scope[local] = scope;
             Use(local, context);
         }
 
-        /// <summary>A loop body of the method's own code gets a scope of its own.</summary>
-        private void LoopBody(H.Stmt body, int c, int declared = -1)
+        /// <summary>A new scope inside the current one, made by context c; gives the scope around it.</summary>
+        private int EnterScope(int c)
         {
-            if (c != 0)
-            {
-                Use(declared, c);
-                Statement(body, c);
-                return;
-            }
             int outer = scope;
             scope = Parent.Count;
             Parent.Add(outer);
+            Context.Add(c);
+            return outer;
+        }
+
+        /// <summary>A loop body gets a scope of its own.</summary>
+        private void LoopBody(H.Stmt body, int c, int declared = -1)
+        {
+            int outer = EnterScope(c);
             BodyScope[body] = scope;
             Declare(declared, c);
             Statement(body, c);
@@ -172,7 +182,7 @@ namespace Larva.Hir.Lowering
                     Statement(t.Finally, c);
                     return;
                 case H.UsingStmt u:
-                    Use(u.Local, c);
+                    Declare(u.Local, c);
                     Expression(u.Resource, c);
                     Statement(u.Body, c);
                     return;
@@ -223,9 +233,13 @@ namespace Larva.Hir.Lowering
                     Lambdas.Add(lambda);
                     LambdaScope.Add(scope);
                     Index[lambda] = k;
+                    // The lambda's body is a scope of its own, made by the lambda's function at each call.
+                    int outer = EnterScope(k + 1);
+                    LambdaBodyScope.Add(scope);
                     foreach (int parameter in lambda.Parameters)
-                        Use(parameter, k + 1);
+                        Declare(parameter, k + 1);
                     Statement(lambda.Body, k + 1);
+                    scope = outer;
                     return;
                 }
                 case H.FieldExpr f:
@@ -481,9 +495,12 @@ namespace Larva.Hir.Lowering
     /// Lambdas. Each becomes a function of its own, <c>{method}$lambda{k}(env, parameters…)</c>, with the method's type
     /// parameters (and their requirements); a lambda value is a <c>Larva.Func{n}</c> object holding that function and the
     /// environment. What lambdas capture (locals, parameters, <c>this</c>) lives in display objects the method and its
-    /// lambdas share: one per method call (made at the method's entry) for what is declared outside loops, and one per
-    /// pass of a loop for what its body declares (made at the start of each pass, pointing to the display around it), so
-    /// a lambda made in a pass keeps that pass's variables. The environment of a lambda is the innermost display.
+    /// lambdas share, one per scope: the method's (made at its entry) for what is declared outside loops, each lambda's
+    /// (made at each call of the lambda's function) for its parameters and what its body declares, and each loop body's
+    /// (made at the start of each pass) for what the body declares; each points to the display around it, so a lambda
+    /// made in a call or a pass keeps that call's or pass's variables. The environment of a lambda is the innermost
+    /// display around where it is made. In a resumable body (an iterator or async step, whose own <c>this</c> is the
+    /// frame object) a lambda's <c>this</c> is the user's, read from the frame.
     /// </summary>
     internal sealed partial class BodyLowerer
     {
@@ -492,11 +509,11 @@ namespace Larva.Hir.Lowering
         /// <summary>The lambda whose function this lowerer makes (-1: the method itself).</summary>
         private readonly int lambda = -1;
 
-        /// <summary>The local holding the display object (-1: none): in a lambda, its environment.</summary>
+        /// <summary>In a lambda: the local holding its environment display (-1: none) and that display's scope.</summary>
         private int display = -1;
-
-        /// <summary>In a lambda: the scope of its environment display. In the method: the local holding each scope's display.</summary>
         private int displayScope = -1;
+
+        /// <summary>The local holding each scope's display: those this function makes and, in a lambda, its environment.</summary>
         private int[] displays = [];
 
         /// <summary>The function's result type.</summary>
@@ -546,10 +563,8 @@ namespace Larva.Hir.Lowering
                     }
                     if (scan.This)
                     {
-                        if (self < 0 || !owner.IsClass)
-                            throw new LoweringException("a lambda cannot use `this` of a struct (copy what it needs into a local first)");
                         c.ThisField = fields.Count;
-                        fields.Add(OwnHandle);
+                        fields.Add(CapturedThisType());
                         names.Add("this");
                     }
                 }
@@ -570,13 +585,7 @@ namespace Larva.Hir.Lowering
                 moduleView = null;
                 c.DisplayHandle[s] = lowerer.Handle(IrType.Struct(id, OwnTypeArguments));
             }
-            displays = new int[scan.Parent.Count];
-            Array.Fill(displays, -1);
-            for (int s = 0; s < displays.Length; s++)
-            {
-                if (c.DisplayHandle[s] is { } handle)
-                    displays[s] = b.Local(handle, s == 0 ? "$display" : $"$display{s}", mutable: true);
-            }
+            DeclareDisplays(0);
             if (displays[0] < 0)
                 return;
             NewDisplay(0);
@@ -586,10 +595,47 @@ namespace Larva.Hir.Lowering
                     b.Assign(DisplayPlace(0, c.ParameterField[p]), Copied(new Place(parameters[p]), method.Parameters[p].Type));
             }
             if (c.ThisField >= 0)
-                b.Assign(DisplayPlace(0, c.ThisField), Operand.Copy(self));
+                b.Assign(DisplayPlace(0, c.ThisField), Operand.Copy(CapturedThisPlace()));
         }
 
-        /// <summary>A new display object for scope s (in the method), pointing to the display around it.</summary>
+        /// <summary>
+        /// The type a lambda's <c>this</c> is kept as: the class's handle, or, in a resumable body (whose own <c>this</c>
+        /// is the frame object), the type of the user's <c>this</c> the frame keeps in its <c>$this</c> field.
+        /// </summary>
+        private IrType CapturedThisType()
+        {
+            if (IsCoroutine)
+            {
+                int f = owner.Definition.Fields.FindIndex(x => x.Name == "$this");
+                if (iteratorThis < 0 || f < 0)
+                    throw new LoweringException("a lambda uses `this` in a resumable body of a static function");
+                return Lower(owner.Definition.Fields[f].Type);
+            }
+            if (self < 0 || !owner.IsClass)
+                throw new LoweringException("a lambda cannot use `this` of a struct (copy what it needs into a local first)");
+            return OwnHandle;
+        }
+
+        /// <summary>Where the method's <c>this</c> is, to copy it into the display (see <see cref="CapturedThisType"/>).</summary>
+        private Place CapturedThisPlace() => IsCoroutine ? IteratorField(iteratorThis) : new Place(self);
+
+        /// <summary>
+        /// The locals holding the displays this function makes: those of the scopes of context <paramref name="context"/>
+        /// (0: the method, k + 1: lambda k).
+        /// </summary>
+        private void DeclareDisplays(int context)
+        {
+            var c = closures!;
+            displays = new int[c.Scan.Parent.Count];
+            Array.Fill(displays, -1);
+            for (int s = 0; s < displays.Length; s++)
+            {
+                if (c.Scan.Context[s] == context && c.DisplayHandle[s] is { } handle)
+                    displays[s] = b.Local(handle, s == 0 ? "$display" : $"$display{s}", mutable: true);
+            }
+        }
+
+        /// <summary>A new display object for scope s (in the function that makes it), pointing to the display around it.</summary>
         private void NewDisplay(int s)
         {
             var c = closures!;
@@ -604,23 +650,27 @@ namespace Larva.Hir.Lowering
             b.Assign(value, Rvalue.ZeroFiller(structType));
             b.Assign(new Place(value).Field(0), Rvalue.ClassId(structType));
             if (c.ParentField[s] >= 0)
-                b.Assign(new Place(value).Field(c.ParentField[s]), Operand.Copy(displays[c.ParentDisplay[s]]));
+                b.Assign(new Place(value).Field(c.ParentField[s]), Operand.Copy(DisplayLocal(c.ParentDisplay[s])));
             b.Assign(displays[s], new AllocRvalue(lowerer.ObjectAlloc, Operand.Move(value)));
         }
 
         /// <summary>At the start of each pass of a loop: its body's display, when it keeps captured variables.</summary>
         private void EnterIteration(H.Stmt body)
         {
-            if (lambda < 0 && closures is { } c && c.Scan.BodyScope.TryGetValue(body, out int s) && c.DisplayHandle[s] is not null)
+            if (closures is { } c && c.Scan.BodyScope.TryGetValue(body, out int s) && c.DisplayHandle[s] is not null)
                 NewDisplay(s);
         }
 
-        /// <summary>Field <paramref name="field"/> of scope <paramref name="s"/>'s display, as seen from here.</summary>
-        private Place DisplayPlace(int s, int field)
+        /// <summary>
+        /// A local holding scope <paramref name="s"/>'s display, as seen from here: the one this function made, or (in a
+        /// lambda) its environment, or a copy reached from the environment out through the parents.
+        /// </summary>
+        private int DisplayLocal(int s)
         {
+            if (displays[s] >= 0)
+                return displays[s];
             if (lambda < 0)
-                return new Place(displays[s]).Deref().Field(field);
-            // In a lambda: from its environment out through the parents.
+                throw new LoweringException("a display of a scope this function does not make");
             var c = closures!;
             int at = display, scope = displayScope;
             while (scope != s)
@@ -632,8 +682,11 @@ namespace Larva.Hir.Lowering
                 at = parent;
                 scope = c.ParentDisplay[scope];
             }
-            return new Place(at).Deref().Field(field);
+            return at;
         }
+
+        /// <summary>Field <paramref name="field"/> of scope <paramref name="s"/>'s display, as seen from here.</summary>
+        private Place DisplayPlace(int s, int field) => new Place(DisplayLocal(s)).Deref().Field(field);
 
         private Place LocalPlace(int local)
         {
@@ -698,19 +751,25 @@ namespace Larva.Hir.Lowering
                 if (scan.Owner[l] == index + 1 && !scan.Captured[l] && locals[l] < 0)
                     locals[l] = b.Local(Lower(hirLocals[l].Type), hirLocals[l].Name, mutable: true);
             }
+            DeclareDisplays(index + 1);
             displayScope = closures.DisplayScope(scan.LambdaScope[index]);
             if (displayScope >= 0)
             {
                 var handle = closures.DisplayHandle[displayScope]!;
-                display = b.Local(handle, "$display", mutable: true);
+                display = b.Local(handle, "$env", mutable: true);
                 b.Unsafe = true;
                 b.Assign(display, Rvalue.HandleCast(Operand.Copy(environment), handle));
-                for (int p = 0; p < arguments.Length; p++)
-                {
-                    int local = hir.Parameters[p];
-                    if (scan.Captured[local])
-                        b.Assign(LocalPlace(local), Copied(new Place(arguments[p]), hirLocals[local].Type));
-                }
+                displays[displayScope] = display;
+            }
+            // The body's own display (what this call declares and its inner lambdas capture): new at each call.
+            int body = scan.LambdaBodyScope[index];
+            if (closures.DisplayHandle[body] is not null)
+                NewDisplay(body);
+            for (int p = 0; p < arguments.Length; p++)
+            {
+                int local = hir.Parameters[p];
+                if (scan.Captured[local])
+                    b.Assign(LocalPlace(local), Copied(new Place(arguments[p]), hirLocals[local].Type));
             }
         }
 
@@ -751,10 +810,10 @@ namespace Larva.Hir.Lowering
             b.Assign(value, Rvalue.ZeroFiller(structType));
             b.Assign(new Place(value).Field(0), Rvalue.ClassId(structType));
             b.Assign(new Place(value).Field(2), Rvalue.FunctionRef(c.LambdaFunction[k], OwnTypeArguments));
-            // The environment: the innermost display around the lambda (in a lambda: its own environment).
-            int environment = lambda >= 0 ? display : c.DisplayScope(c.Scan.LambdaScope[k]) is var around && around >= 0 ? displays[around] : -1;
-            if (environment >= 0)
-                b.Assign(new Place(value).Field(3), Rvalue.HandleCast(Operand.Copy(environment), lowerer.RootHandle));
+            // The environment: the innermost display around the lambda (this function's own, or its environment).
+            int around = c.DisplayScope(c.Scan.LambdaScope[k]);
+            if (around >= 0)
+                b.Assign(new Place(value).Field(3), Rvalue.HandleCast(Operand.Copy(DisplayLocal(around)), lowerer.RootHandle));
             int made = Temp(type);
             b.Assign(made, new AllocRvalue(lowerer.ObjectAlloc, Operand.Move(value)));
             b.Assign(target, Operand.Copy(made));
