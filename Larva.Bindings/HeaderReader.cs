@@ -391,10 +391,11 @@ namespace Larva.Bindings
         {
             if (t.StartsWith(PackMarker, StringComparison.Ordinal))
                 return true;
-            if (t.StartsWith("typedef ") || t.StartsWith("enum ") || t.StartsWith("enum{"))
+            if (t.StartsWith("typedef ") || t.StartsWith("enum{"))
                 return true;
             if (!StartsWithAggregate(t))
                 return false;
+            // `enum Tag F(enum Tag t);` and `struct S* F(void);` are prototypes; `enum Tag { … }`, `enum Tag;` are declarations.
             int brace = t.IndexOf('{'), paren = t.IndexOf('(');
             return paren < 0 || brace >= 0 && brace < paren;
         }
@@ -475,11 +476,11 @@ namespace Larva.Bindings
                 Typedef(t[8..].Trim());
                 return;
             }
-            if (t.StartsWith("enum ") || t.StartsWith("enum{"))
+            if ((t.StartsWith("enum ") || t.StartsWith("enum{")) && IsTypeDeclaration(t))
             {
                 int brace = t.IndexOf('{');
                 string tag = brace < 0 ? "" : t[4..brace].Trim();
-                Enum(t, IsIdentifier(tag) ? [tag] : []);
+                Enum(t, IsIdentifier(tag) ? [tag] : []); // `enum Tag;` alone: nothing to read
                 return;
             }
             if (IsTypeDeclaration(t))
@@ -939,6 +940,8 @@ namespace Larva.Bindings
                 words = targetWords.Where(w => w is not ("const" or "volatile" or "*")).ToList();
                 baseText = string.Join(' ', words);
             }
+            if (words[0] == "enum")
+                return Pointers("i32", stars); // `enum Tag`: its number (the language may give it the enum type by its name)
             string tagOrName = words[0] is "struct" or "union" ? words[^1] : words[0];
             if (StructName(tagOrName) is { } structName)
             {
@@ -958,7 +961,7 @@ namespace Larva.Bindings
                 }
                 return Pointers("void", stars); // opaque: pointers to it are void*
             }
-            string? primitive = Primitive(baseText);
+            string? primitive = Primitive(Canonical(words));
             if (primitive is null)
             {
                 why = $"unknown type `{baseText}`";
@@ -1033,6 +1036,28 @@ namespace Larva.Bindings
         }
 
         private static string Pointers(string type, int stars) => type + new string('*', stars);
+
+        private static readonly HashSet<string> BasicTypeWords = new(StringComparer.Ordinal) { "unsigned", "short", "long", "int", "char", "double", "float" };
+
+        /// <summary>
+        /// C's basic type words in one spelling, whatever their order (`long unsigned int` is clang's `size_t`,
+        /// `unsigned long long int`, `int long`): the spelling <see cref="Primitive"/> knows. Other words stay as written.
+        /// </summary>
+        private static string Canonical(List<string> words)
+        {
+            if (words.Count < 2 || !words.All(BasicTypeWords.Contains))
+                return string.Join(' ', words);
+            bool unsigned = words.Contains("unsigned");
+            int longs = words.Count(w => w == "long");
+            if (words.Contains("double"))
+                return longs > 0 ? "long double" : "double";
+            if (words.Contains("float"))
+                return "float";
+            if (words.Contains("char"))
+                return unsigned ? "unsigned char" : "char";
+            string width = words.Contains("short") ? "short" : longs >= 2 ? "long long" : longs == 1 ? "long" : "int";
+            return unsigned ? "unsigned " + width : width;
+        }
 
         /// <summary>C's own type names to the description's; char and wchar_t stay as such for the caller to decide.</summary>
         private string? Primitive(string c) => c switch

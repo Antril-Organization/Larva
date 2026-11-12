@@ -205,6 +205,43 @@ public sealed class BindingsTests : CheckedTest
             string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
     }
 
+    /// <summary>
+    /// C's type words in any order (`long unsigned int` is how clang spells size_t), `enum Tag` as a type, and `struct Tag`
+    /// as a type when the struct is defined later or only declared.
+    /// </summary>
+    [Fact]
+    public void Reordered_type_words_enum_tags_and_struct_tags_are_types()
+    {
+        var reader = new HeaderReader(longIs64: true);
+        string description = reader.Read("""
+            enum Tag { TAG_A, TAG_B };
+            typedef enum Tag TagT;
+            struct Later;
+            struct Never;
+            long unsigned int Size(void);
+            unsigned long long int Big(int long a, short unsigned b, long signed int c, char unsigned d, long double e);
+            enum Tag GetTag(enum Tag t, enum Tag* out, TagT u);
+            struct Later* MakeLater(const struct Later* from);
+            struct Never* MakeNever(const struct Never* n, struct Unknown* u);
+            struct Holder { enum Tag t; struct Later* later; };
+            void Hold(struct Holder* h);
+            struct Later { int x; };
+            """, "lib.dll");
+        Log(description);
+        Check("`long unsigned int` is u64 (LP64), the other orders of the words likewise",
+            description.Contains("Size() : u64\n") && description.Contains("Big(i64 a, u16 b, i64 c, u8 d, f64 e) : u64\n"));
+        Check("`enum Tag` is i32 by value, i32* by pointer, through a typedef too; the prototype that starts with `enum` is read",
+            description.Contains("GetTag(i32 t, i32* out, i32 u) : i32\n")
+            && reader.TypedefUses.GetValueOrDefault("GetTag#0") == "Tag" && reader.TypedefUses.GetValueOrDefault("GetTag#result") == "Tag"
+            && reader.TypedefUses.GetValueOrDefault("GetTag#2") == "TagT" && reader.Enums.Single().Names.SequenceEqual(["TagT", "Tag"]),
+            string.Join("; ", reader.TypedefUses.Select(u => $"{u.Key}={u.Value}")));
+        Check("`struct Later*` is Later* (its body comes later), `struct Never*` and `struct Unknown*` are void* (opaque), in fields too",
+            description.Contains("MakeLater(Later* from) : Later*\n") && description.Contains("MakeNever(void* n, void* u) : void*\n")
+            && description.Contains("struct Holder { i32 t; Later* later }\n") && description.Contains("Hold(Holder* h)\n")
+            && reader.TypedefUses.GetValueOrDefault("Holder.t") == "Tag" && reader.Skipped.Count == 0,
+            string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
