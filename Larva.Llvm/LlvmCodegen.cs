@@ -2344,12 +2344,15 @@ namespace Larva.Llvm
                     if (place.Projections[j] is DerefProjection && function.TypeOf(handle, module).Unoptional() is GcType)
                     {
                         var value = Load(handle);
-                        cg.CallRuntime("larva_pin", value);
                         var here = b.InsertBlock;
                         b.PositionBefore(entry.FirstInstruction);
                         var slot = b.BuildAlloca(cg.ptr, "pin");
                         b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), slot);
                         b.PositionAtEnd(here);
+                        // One pin per site per activation: in a loop, the previous pass's pin is given back first (the slot is
+                        // null before the first), else the runtime's pin stack grows with every pass until the return.
+                        cg.CallRuntime("larva_unpin", b.BuildLoad2(cg.ptr, slot, ""));
+                        cg.CallRuntime("larva_pin", value);
                         b.BuildStore(value, slot);
                         pinSlots.Add(slot);
                         return;

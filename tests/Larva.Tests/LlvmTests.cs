@@ -166,6 +166,18 @@ public sealed unsafe class LlvmTests : CheckedTest
             $"k {k}, live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
     }
 
+    /// <summary>A borrow site inside a loop pins the object once per activation: the previous pass's pin is given back first.</summary>
+    [Fact]
+    public void Borrow_sites_pin_once_per_activation()
+    {
+        NativeRuntime.Reset();
+        using var program = Compile(PinLoopProgram());
+        using var jit = program.Jit();
+        int y = ((delegate* unmanaged<long, int>)jit.Address("pin_loop"))(5000);
+        Check("pin_loop(5000) = 5000 with at most one pin held at a time, none after the return", y == 5000 && NativeRuntime.MaxPinned == 1 && NativeRuntime.Pinned == 0,
+            $"y {y}, pins {NativeRuntime.Pins}, most at once {NativeRuntime.MaxPinned}, held {NativeRuntime.Pinned}");
+    }
+
     [Fact]
     public void A_linked_program_runs_across_modules()
     {

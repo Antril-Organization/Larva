@@ -2232,6 +2232,10 @@ namespace Larva.X64
             if (!pins.TryGetValue(current, out int slot) || PinnedHandle(place) is not { } handle)
                 return;
             int value = Load(handle);
+            // One pin per site per activation: in a loop, the previous pass's pin is given back first (the slot is zero
+            // before the first), else the runtime's pin stack grows with every pass until the return.
+            a.Load(Reg.Rcx, Frame(slot), 8, false);
+            a.Call("larva_unpin");
             a.Load(Reg.Rcx, Frame(value), 8, false);
             a.Store(Frame(slot), Reg.Rcx, 8);
             a.Call("larva_pin");

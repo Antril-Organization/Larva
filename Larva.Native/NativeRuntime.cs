@@ -37,6 +37,21 @@ namespace Larva.Native
         public static int Releases { get; private set; }
         public static int Barriers { get; private set; }
         public static int Pins { get; private set; }
+
+        /// <summary>The most handles pinned at once since the last <see cref="Reset"/> (a borrow site in a loop pins once per activation, not per pass).</summary>
+        public static int MaxPinned { get; private set; }
+
+        /// <summary>How many pins are held now.</summary>
+        public static int Pinned
+        {
+            get
+            {
+                int depth = 0;
+                foreach (int count in pinned.Values)
+                    depth += count;
+                return depth;
+            }
+        }
         public static int Polls { get; private set; }
         public static int Finalized { get; private set; }
         public static string? LastPanic { get; private set; }
@@ -65,7 +80,7 @@ namespace Larva.Native
             finalizers.Clear();
             finalizing = 0;
             Finalized = 0;
-            Allocations = Frees = Errors = Retains = Releases = Barriers = Pins = Polls = 0;
+            Allocations = Frees = Errors = Retains = Releases = Barriers = Pins = Polls = MaxPinned = 0;
             Collections = Collected = 0;
             sinceCollection = 0;
             StressGc = false;
@@ -883,6 +898,11 @@ namespace Larva.Native
         {
             Pins++;
             pinned[(nint)handle] = pinned.GetValueOrDefault((nint)handle) + 1;
+            int depth = 0;
+            foreach (int count in pinned.Values)
+                depth += count;
+            if (depth > MaxPinned)
+                MaxPinned = depth;
         }
 
         [UnmanagedCallersOnly]

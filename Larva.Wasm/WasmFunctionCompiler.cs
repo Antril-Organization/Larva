@@ -1609,6 +1609,12 @@ namespace Larva.Wasm
             if (!pins.TryGetValue(current, out int slot) || PinnedHandle(place) is not { } handle)
                 return;
             int value = Load(handle);
+            // One pin per site per activation: in a loop, the previous pass's pin is given back first (the slot is zero
+            // before the first), else the runtime's pin stack grows with every pass until the return.
+            c.LocalGet(Fp);
+            c.I64Load(slot);
+            c.I32WrapI64();
+            c.Call(cg.Runtime("larva_unpin"));
             c.LocalGet(Fp);
             LoadTemp(value);
             c.I64Store(slot);

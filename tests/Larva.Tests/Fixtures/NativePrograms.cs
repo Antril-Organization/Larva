@@ -202,6 +202,38 @@ internal static class NativePrograms
     }
 
     /// <summary>
+    /// bump(c: &mut Point) { c.y = c.y + 1 } and unsafe pin_loop(n: i64) -> i32 { let h = gc Holder{gc Point{0,0}, 0}; for i in 0..n { bump(&mut *(*h).0) } (*(*h).0).1 }
+    /// — a borrow inside a gc object pins it: once per activation of the site, not once per pass (→ n).
+    /// </summary>
+    public static IrModule PinLoopProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var bump = new FunctionBuilder("bump", IrType.Unit);
+        int c = bump.Argument(IrType.RefMut(Point), "c");
+        bump.Assign(new Place(c).Deref().Field(1), Rvalue.Binary(BinaryOp.Add, Copy(new Place(c).Deref().Field(1)), Int(1))).Return();
+
+        var f = new FunctionBuilder("pin_loop", IrType.I32) { Unsafe = true };
+        int n = f.Argument(IrType.I64, "n");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int p = f.Local(Point, "p", mutable: true);
+        int holder = f.Local(GcPrograms.HolderType, "holder", mutable: true);
+        int h = f.Local(IrType.Gc(GcPrograms.HolderType), "h");
+        int r = f.Local(IrType.RefMut(Point), "r", mutable: true);
+        int go = f.Local(IrType.Bool, "go", mutable: true);
+        int unit = f.Temp(IrType.Unit);
+        int head = f.NewBlock(), body = f.NewBlock(), next = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(new Place(p).Field(0), Int(0)).Assign(new Place(p).Field(1), Int(0))
+         .Assign(new Place(holder).Field(0), Rvalue.Gc(Move(p))).Assign(new Place(holder).Field(1), Int(0))
+         .Assign(h, Rvalue.Gc(Move(holder)))
+         .Assign(i, Int(0, IrType.I64)).Goto(head);
+        f.At(head).Assign(go, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(go), body, exit);
+        f.At(body).Assign(r, Rvalue.RefMut(new Place(h).Deref().Field(0).Deref())).Call(0, [Move(r)], unit, next);
+        f.At(next).Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        f.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(h).Deref().Field(0).Deref().Field(1))).Return();
+        return new IrModule(GcPrograms.StructDefs, [bump.Build(), f.Build()]);
+    }
+
+    /// <summary>
     /// put(slot: &mut gc Point, v: gc Point) { *slot = v } — a store through a reference, whose owner put cannot name;
     /// unsafe keep_through_ref(n: i64) -> i32 { let h = gc Holder{gc Point{1,2}, 0}; churn(n); put(&mut (*h).0, gc Point{42,43}); churn(n); (*(*h).0).1 }
     /// — h is old by the time the young Point is stored into it through the reference (→ 43 only if the store was remembered).
