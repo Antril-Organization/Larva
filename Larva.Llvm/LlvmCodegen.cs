@@ -51,7 +51,9 @@ namespace Larva.Llvm
         public const uint ExceptionCode = 0xE04C5641;
 
         private readonly Dictionary<IrType, int> typeIds = [];
-        private readonly Dictionary<int, LLVMValueRef> filters = [];
+        private readonly Dictionary<(LLVMValueRef Parent, int Id), LLVMValueRef> filters = [];
+        private LLVMValueRef recoverFp, localRecover;
+        private LLVMTypeRef recoverFpType, localRecoverType;
         private LLVMValueRef personality;
         private LLVMValueRef payloadGlobal;
         private LLVMValueRef typeGlobal;
@@ -69,6 +71,13 @@ namespace Larva.Llvm
         /// frame cleans up and returns with it.
         /// </summary>
         private readonly bool flagExceptions;
+
+        /// <summary>
+        /// Flag exceptions on a target with threads (POSIX): the exception in flight lives in thread-local globals, so two
+        /// threads throwing at once do not see each other's. WebAssembly (single-threaded) keeps plain globals, which the host
+        /// reads as exports.
+        /// </summary>
+        private readonly bool threadLocalExceptions;
 
         /// <summary>
         /// Safepoints read the runtime's flag (through <c>__imp_larva_poll_pending</c>, as an import from the runtime DLL)
@@ -150,8 +159,9 @@ namespace Larva.Llvm
 
         public LlvmCodegen(IrModule module, GcConfig gc, bool noalias, string name, bool eliminateBoundsChecks = true, string? symbolPrefix = null,
             bool flagExceptions = false, LLVMContextRef? context = null, Func<int, bool>? defines = null, bool[]? compilable = null,
-            bool inlinePolls = true, bool stackRoots = true)
+            bool inlinePolls = true, bool stackRoots = true, bool threadLocalExceptions = false)
         {
+            this.threadLocalExceptions = threadLocalExceptions;
             this.inlinePolls = inlinePolls;
             this.stackRoots = stackRoots;
             this.compilable = compilable;
@@ -459,6 +469,12 @@ namespace Larva.Llvm
                 typeGlobal = Module.AddGlobal(i64, "larva_exception_type");
                 typeGlobal.Initializer = LLVMValueRef.CreateConstInt(i64, 0);
                 typeGlobal.Linkage = LLVMLinkage.LLVMWeakAnyLinkage;
+                if (threadLocalExceptions)
+                {
+                    // One exception in flight per thread (the runtime declares its copies thread-local too).
+                    LLVM.SetThreadLocal(payloadGlobal, 1);
+                    LLVM.SetThreadLocal(typeGlobal, 1);
+                }
                 return;
             }
             personality = Module.AddFunction("__C_specific_handler", LLVMTypeRef.CreateFunction(i32, [ptr, ptr, ptr, ptr]));
@@ -467,12 +483,12 @@ namespace Larva.Llvm
             var raise = Module.AddFunction("larva_raise", raiseType);
             none = LLVM.ConstNull(LLVM.TokenTypeInContext(Module.Context));
 
-            payloadGlobal = Module.AddGlobal(ptr, "larva.eh.payload");
-            payloadGlobal.Initializer = LLVMValueRef.CreateConstNull(ptr);
-            payloadGlobal.Linkage = LLVMLinkage.LLVMInternalLinkage;
-            typeGlobal = Module.AddGlobal(i64, "larva.eh.type");
-            typeGlobal.Initializer = LLVMValueRef.CreateConstInt(i64, 0);
-            typeGlobal.Linkage = LLVMLinkage.LLVMInternalLinkage;
+            // A filter hands the exception to the handling frame's own slots (llvm.localescape in the frame, llvm.localrecover
+            // in the filter), never through a global: threads throw at the same time, each in its own frames.
+            recoverFpType = LLVMTypeRef.CreateFunction(ptr, [ptr, ptr]);
+            recoverFp = Module.AddFunction("llvm.eh.recoverfp", recoverFpType);
+            localRecoverType = LLVMTypeRef.CreateFunction(ptr, [ptr, ptr, i32]);
+            localRecover = Module.AddFunction("llvm.localrecover", localRecoverType);
             filterType = LLVMTypeRef.CreateFunction(i32, [ptr, ptr]);
 
             // larva_throw(payload, type): larva_raise(code, NONCONTINUABLE, 2, [payload, type])
@@ -499,18 +515,20 @@ namespace Larva.Llvm
         }
 
         /// <summary>
-        /// SEH filter for a catch clause: <c>EXCEPTION_EXECUTE_HANDLER</c> when the exception is Larva's and its type id matches
-        /// (any id for 0); it records the payload and type for the handler to pick up.
+        /// SEH filter for a catch clause of <paramref name="parent"/>: <c>EXCEPTION_EXECUTE_HANDLER</c> when the exception is
+        /// Larva's and its type id matches (any id for 0); it stores the payload and type into the frame's incoming slots
+        /// (escaped as 0 and 1, see <see cref="FunctionEmitter.EscapeOwned"/>) for the handler to pick up: the frame's own,
+        /// so threads that throw at the same time never see each other's exception.
         /// </summary>
-        private LLVMValueRef Filter(int id)
+        private LLVMValueRef Filter(LLVMValueRef parent, int id)
         {
-            if (filters.TryGetValue(id, out var known))
+            if (filters.TryGetValue((parent, id), out var known))
                 return known;
             var i32 = Ctx.Int32Type;
             var i64 = Ctx.Int64Type;
-            var filter = Module.AddFunction($"larva.filter.{id}", filterType);
+            var filter = Module.AddFunction($"larva.filter.{parent.Name}.{id}", filterType);
             filter.Linkage = LLVMLinkage.LLVMInternalLinkage;
-            filters[id] = filter;
+            filters[(parent, id)] = filter;
 
             var here = builder.InsertBlock;
             var start = filter.AppendBasicBlock("entry");
@@ -529,8 +547,10 @@ namespace Larva.Llvm
                 builder.BuildCondBr(builder.BuildICmp(LLVMIntPredicate.LLVMIntEQ, type, LLVMValueRef.CreateConstInt(i64, (ulong)id), ""), yes, no);
             builder.PositionAtEnd(yes);
             var payload = builder.BuildLoad2(ptr, builder.BuildGEP2(Ctx.Int8Type, record, new[] { LLVMValueRef.CreateConstInt(i64, 32) }, ""), "payload");
-            builder.BuildStore(payload, payloadGlobal);
-            builder.BuildStore(type, typeGlobal);
+            // The establisher frame the dispatcher passes → the parent's frame pointer → its escaped slots.
+            var frame = builder.BuildCall2(recoverFpType, recoverFp, new[] { parent, filter.GetParam(1) }, "frame");
+            builder.BuildStore(payload, builder.BuildCall2(localRecoverType, localRecover, new[] { parent, frame, LLVMValueRef.CreateConstInt(i32, 0) }, "incoming.payload"));
+            builder.BuildStore(type, builder.BuildCall2(localRecoverType, localRecover, new[] { parent, frame, LLVMValueRef.CreateConstInt(i32, 1) }, "incoming.type"));
             builder.BuildRet(LLVMValueRef.CreateConstInt(i32, 1));
             builder.PositionAtEnd(no);
             builder.BuildRet(LLVMValueRef.CreateConstInt(i32, 0));
@@ -1079,6 +1099,9 @@ namespace Larva.Llvm
             // Exceptions: where the exception being handled lives, the shared cleanup pad, the region depth at entry.
             private LLVMValueRef caughtPayload;
             private LLVMValueRef caughtType;
+            /// <summary>SEH: where this frame's filters put the exception they take (escaped slots 0 and 1).</summary>
+            private LLVMValueRef incomingPayload;
+            private LLVMValueRef incomingType;
             private LLVMValueRef regionDepth;
             private LLVMBasicBlockRef cleanup;
             private bool needsCleanup;
@@ -1184,6 +1207,13 @@ namespace Larva.Llvm
                     caughtPayload = b.BuildAlloca(cg.ptr, "caught.payload");
                     b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), caughtPayload);
                     caughtType = b.BuildAlloca(Ctx.Int64Type, "caught.type");
+                    if (!cg.flagExceptions)
+                    {
+                        incomingPayload = b.BuildAlloca(cg.ptr, "incoming.payload");
+                        b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), incomingPayload);
+                        incomingType = b.BuildAlloca(Ctx.Int64Type, "incoming.type");
+                        b.BuildStore(LLVMValueRef.CreateConstInt(Ctx.Int64Type, 0), incomingType);
+                    }
                 }
                 if (function.Blocks.SelectMany(x => x.Statements).Any(x => x is RegionEnterStatement))
                     regionDepth = cg.CallRuntime("larva_region_depth");
@@ -1210,7 +1240,7 @@ namespace Larva.Llvm
                 }
 
                 b.PositionAtEnd(entry);
-                if (cleanup.Handle != IntPtr.Zero && !cg.flagExceptions)
+                if ((cleanup.Handle != IntPtr.Zero || incomingPayload.Handle != IntPtr.Zero) && !cg.flagExceptions)
                     EscapeOwned();
                 b.BuildBr(blocks[0]);
 
@@ -1510,15 +1540,17 @@ namespace Larva.Llvm
                     var handler = fn.AppendBasicBlock("catch");
                     LLVM.AddHandler(catchSwitch, handler);
                     b.PositionAtEnd(handler);
-                    LLVMOpaqueValue* filter = cg.Filter(clause.Type is null ? 0 : cg.TypeId(clause.Type));
+                    LLVMOpaqueValue* filter = cg.Filter(fn, clause.Type is null ? 0 : cg.TypeId(clause.Type));
                     var pad = LLVM.BuildCatchPad(b, catchSwitch, &filter, 1, Text("catch.pad"));
                     var landing = fn.AppendBasicBlock("caught");
                     LLVM.BuildCatchRet(b, pad, landing);
                     b.PositionAtEnd(landing);
-                    // The previous exception of this frame (if any) is finished; keep the new one for `caught` / `resume`.
+                    // The previous exception of this frame (if any) is finished; keep the new one (which the filter stored in
+                    // this frame's incoming slots) for `caught` / `resume`.
                     cg.CallRuntime("larva_free", b.BuildLoad2(cg.ptr, caughtPayload, ""));
-                    b.BuildStore(b.BuildLoad2(cg.ptr, cg.payloadGlobal, ""), caughtPayload);
-                    b.BuildStore(b.BuildLoad2(Ctx.Int64Type, cg.typeGlobal, ""), caughtType);
+                    b.BuildStore(b.BuildLoad2(cg.ptr, incomingPayload, ""), caughtPayload);
+                    b.BuildStore(b.BuildLoad2(Ctx.Int64Type, incomingType, ""), caughtType);
+                    b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), incomingPayload);
                     b.BuildBr(blocks[clause.Block]);
                     unwindTo = dispatch;
                 }
@@ -2179,20 +2211,31 @@ namespace Larva.Llvm
             private const int EscapeThreshold = 24;
 
             /// <summary>
-            /// With a cleanup funclet, what it releases (owning locals and their drop flags) stays in the frame
-            /// (<c>llvm.localescape</c>): promoted to registers, every call that may throw would first copy all of them out for
-            /// the funclet, hundreds of stores a turn in a large function's loop. A small frame stays in registers: its few
-            /// copies cost less than keeping every flag and handle in memory.
+            /// What the frame's filters and funclets reach through <c>llvm.localescape</c>: first the incoming exception slots
+            /// (0: payload, 1: type) the catch filters fill in (see <see cref="Filter"/>), then, with a cleanup funclet, what
+            /// it releases (owning locals and their drop flags) when there are many: promoted to registers, every call that
+            /// may throw would first copy all of them out for the funclet, hundreds of stores a turn in a large function's
+            /// loop. A small frame stays in registers: its few copies cost less than keeping every flag and handle in memory.
             /// </summary>
             private void EscapeOwned()
             {
                 var slots = new List<LLVMValueRef>();
+                if (incomingPayload.Handle != IntPtr.Zero)
+                {
+                    slots.Add(incomingPayload);
+                    slots.Add(incomingType);
+                }
+                var owned = new List<LLVMValueRef>();
                 for (int l = 0; l < function.Locals.Length; l++)
                     if (Owned(function.Locals[l].Type, []).Any())
-                        slots.Add(locals[l]);
-                if (slots.Count < EscapeThreshold)
+                        owned.Add(locals[l]);
+                if (owned.Count >= EscapeThreshold)
+                {
+                    slots.AddRange(owned);
+                    slots.AddRange(flags.Values);
+                }
+                if (slots.Count == 0)
                     return;
-                slots.AddRange(flags.Values);
                 var type = LLVMTypeRef.CreateFunction(Ctx.VoidType, [], IsVarArg: true);
                 var escape = cg.Module.GetNamedFunction("llvm.localescape");
                 if (escape.Handle == IntPtr.Zero)
