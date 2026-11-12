@@ -2677,6 +2677,18 @@ static int counted_handle(void *payload) {
     return in_nursery(payload) || is_gc(payload);
 }
 
+/* A reference count moved by `n`: the new value. Plain while one thread runs, atomic once threads exist (compiled code
+   counts inline the same way: an atomic add in a program that starts threads). */
+#ifdef _WIN32
+static int32_t rc_add(int32_t *count, int32_t n) {
+    return threading ? _InterlockedExchangeAdd((volatile long *)count, n) + n : (*count += n);
+}
+#else
+static int32_t rc_add(int32_t *count, int32_t n) {
+    return threading ? __atomic_add_fetch(count, n, __ATOMIC_ACQ_REL) : (*count += n);
+}
+#endif
+
 LARVA_API void larva_gc_retain(void *handle) {
     if (!handle)
         return;
@@ -2686,7 +2698,7 @@ LARVA_API void larva_gc_retain(void *handle) {
     }
     if (header_of(handle)->domain & DOMAIN_UNCOUNTED)
         return;
-    header_of(handle)->refcount++;
+    rc_add(&header_of(handle)->refcount, 1);
 }
 
 static void push_pointer(void ***list, size_t *count, size_t *capacity, void *item) {
@@ -2748,15 +2760,19 @@ static void rc_drop_slot(void **slot) {
     GcHeader *header = header_of(child);
     if (header->domain & DOMAIN_UNCOUNTED)  /* also a free slot (SLOT_FREE) */
         return;
-    if (--header->refcount == 0)
+    if (rc_add(&header->refcount, -1) == 0)
         push_pointer(&rc_dying, &rc_dying_count, &rc_dying_capacity, child);
 }
 
-/* An object's count reached 0: it dies, and the handles it holds lose an owner. */
+/* An object's count reached 0: it dies, and the handles it holds lose an owner. The dying list, the draining flag and the
+   allocator it frees into are shared: under the runtime's lock once threads exist (the count itself was moved atomically). */
 LARVA_API void larva_rc_dead(void *handle) {
+    int locked = rt_enter();
     push_pointer(&rc_dying, &rc_dying_count, &rc_dying_capacity, handle);
-    if (rc_draining)
+    if (rc_draining) {
+        rt_leave(locked);
         return;
+    }
     rc_draining = 1;
     while (rc_dying_count > 0) {
         void *object = rc_dying[--rc_dying_count];
@@ -2768,7 +2784,7 @@ LARVA_API void larva_rc_dead(void *handle) {
                after it; the object dies then unless the finalizer kept it. */
             header->refcount = 1;
             finalize(object);
-            if (--header->refcount == 0)
+            if (rc_add(&header->refcount, -1) == 0)
                 push_pointer(&rc_dying, &rc_dying_count, &rc_dying_capacity, object);
             continue;
         }
@@ -2776,6 +2792,7 @@ LARVA_API void larva_rc_dead(void *handle) {
         gc_free(object);
     }
     rc_draining = 0;
+    rt_leave(locked);
 }
 
 LARVA_API void larva_gc_release(void *handle) {
@@ -2788,7 +2805,7 @@ LARVA_API void larva_gc_release(void *handle) {
     GcHeader *header = header_of(handle);
     if (header->domain & DOMAIN_UNCOUNTED)
         return;
-    if (--header->refcount == 0)
+    if (rc_add(&header->refcount, -1) == 0)
         larva_rc_dead(handle);
 }
 

@@ -833,11 +833,20 @@ namespace Larva.Llvm
             }
             var after = CountedBlock(function, handle, "retain");
             var slot = At(handle, -8);
-            var count = builder.BuildLoad2(Ctx.Int32Type, slot, "count");
-            builder.BuildStore(builder.BuildAdd(count, LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1), ""), slot);
+            var one = LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1);
+            if (CountsAtomically)
+                builder.BuildAtomicRMW(LLVMAtomicRMWBinOp.LLVMAtomicRMWBinOpAdd, slot, one, LLVMAtomicOrdering.LLVMAtomicOrderingMonotonic, false);
+            else
+                builder.BuildStore(builder.BuildAdd(builder.BuildLoad2(Ctx.Int32Type, slot, "count"), one, ""), slot);
             builder.BuildBr(after);
             builder.PositionAtEnd(after);
         }
+
+        /// <summary>
+        /// Whether the inline counts are atomic: in a program that starts threads, two threads may share an object (a
+        /// plain load-add-store loses counts, and frees live objects). A program without threads keeps the plain update.
+        /// </summary>
+        private bool CountsAtomically => Larva.IR.Analysis.Safepoints.Threaded(module);
 
         /// <summary>
         /// Reference counting: <paramref name="handle"/> loses an owner; at 0 the runtime frees it (and releases what it holds).
@@ -851,8 +860,19 @@ namespace Larva.Llvm
             }
             var after = CountedBlock(function, handle, "release");
             var slot = At(handle, -8);
-            var count = builder.BuildSub(builder.BuildLoad2(Ctx.Int32Type, slot, "count"), LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1), "");
-            builder.BuildStore(count, slot);
+            var one = LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1);
+            LLVMValueRef count;
+            if (CountsAtomically)
+            {
+                // Acquire-release: the thread that frees the object sees every write the other owners made to it.
+                var before = builder.BuildAtomicRMW(LLVMAtomicRMWBinOp.LLVMAtomicRMWBinOpSub, slot, one, LLVMAtomicOrdering.LLVMAtomicOrderingAcquireRelease, false);
+                count = builder.BuildSub(before, one, "");
+            }
+            else
+            {
+                count = builder.BuildSub(builder.BuildLoad2(Ctx.Int32Type, slot, "count"), one, "");
+                builder.BuildStore(count, slot);
+            }
             var dead = function.AppendBasicBlock("dead");
             Unlikely(builder.BuildCondBr(builder.BuildICmp(LLVMIntPredicate.LLVMIntEQ, count, LLVMValueRef.CreateConstInt(Ctx.Int32Type, 0), ""), dead, after));
             builder.PositionAtEnd(dead);

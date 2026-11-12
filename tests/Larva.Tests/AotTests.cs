@@ -188,6 +188,32 @@ public sealed unsafe class AotTests : CheckedTest
         }
     }
 
+    /// <summary>
+    /// Reference counting with threads: the inline counts are atomic in a program that starts threads, and the runtime's
+    /// dead list (and the allocator it frees into) is locked. Two threads making and dropping a million objects each must
+    /// free them all without a crash (unlocked frees corrupted the allocator's chunks; plain counts lost updates).
+    /// </summary>
+    [Fact]
+    public void Llvm_reference_counts_are_atomic_and_the_dead_list_is_locked_with_threads()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.RcThreadsProgram() with { Name = "rcthreads" }, "rcthreads.lvo", GcConfig.RefCount);
+        string exe = Path.Combine(Directory, "rcthreads-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "rc_threads", "-o", exe, program);
+        Check("llvm: larva native --exe --entry rc_threads (gc: refcount)", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        for (int run = 0; run < 3; run++)
+        {
+            var (exit, output, errors) = Execute(exe, ["7"], stats: true);
+            var frees = Regex.Match(errors, @"frees (\d+)");
+            Check($"llvm: rcthreads.exe 7 = 7 (run {run}): two threads freed their 2000000 objects, no errors",
+                exit == 0 && output.Trim() == "7" && frees.Success && long.Parse(frees.Groups[1].Value) >= 2000000 && errors.Contains("errors 0"),
+                $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)
