@@ -35,6 +35,12 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         ("Rethrow", -4, -12, "rethrow from a catch, caught again"),
         ("Nulls", null, 12, "null, ?? and == null"),
         ("Statics", null, 8, "static fields"),
+        ("OrderField", null, 6, "a field read before a call that changes it"),
+        ("OrderThis", null, 6525, "this.Field before this.Call() as operand and arguments"),
+        ("OrderArgs", null, 112, "arguments left to right around i++"),
+        ("OrderElement", null, 157, "arr[k] = k++ stores at the old k; arr[j] + j++ reads the old j"),
+        ("OrderCompound", null, 62, "x += x++ and c.N += c.Bump() read the target first"),
+        ("OrderNew", null, 11, "constructor arguments left to right"),
     ];
 
     /// <summary>The benchmark program lowered once, for the facts that run it and build executables of it.</summary>

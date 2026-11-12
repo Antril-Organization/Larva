@@ -131,9 +131,7 @@ namespace Larva.Hir.Lowering
         private void NativeInvoke(H.InvokeExpr invoke, Place target)
         {
             var signature = (FunctionType)Lower(invoke.Function.Type);
-            var arguments = new List<Operand> { Value(invoke.Function) };
-            foreach (var argument in invoke.Arguments)
-                arguments.Add(Value(argument));
+            var arguments = Operands([invoke.Function, .. invoke.Arguments]);
             Emit(lowerer.NativeCallHelper(signature), arguments, target);
         }
 
@@ -144,8 +142,9 @@ namespace Larva.Hir.Lowering
         /// <summary>Two pointers compared or subtracted, or a pointer moved by a number of elements.</summary>
         private void PointerBinary(H.BinaryExpr bin, Place target)
         {
-            var left = Value(bin.Left);
-            var right = Value(bin.Right);
+            var operands = Operands([bin.Left, bin.Right]);
+            var left = operands[0];
+            var right = operands[1];
             b.Unsafe = true;
             if (bin.Left.Type is H.PointerType && bin.Right.Type is H.PointerType)
             {

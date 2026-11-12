@@ -1326,18 +1326,146 @@ namespace Larva.Hir.Lowering
             Into(new Place(sink), e);
         }
 
-        /// <summary>The value of an expression as an operand (a constant, a place read, or a temporary).</summary>
-        private Operand Value(H.Expr e)
+        /// <summary>
+        /// The value of an expression as an operand (a constant, a place read, or a temporary). A place is read when the
+        /// instruction using the operand runs, so when a later operand of the same expression may change it (see
+        /// <see cref="Effects"/>), <paramref name="settle"/> reads it now, into a temporary, as left-to-right evaluation
+        /// requires. A plain local is settled only against an outright write of a local (a call cannot reach it).
+        /// </summary>
+        private Operand Value(H.Expr e, int settle = 0)
         {
             if (e is H.LiteralExpr literal && literal.Value is not (H.NullConstant or H.StringConstant))
                 return Constant(literal.Value, Lower(e.Type));
-            if (AsPlace(e) is { } place)
+            if (AsPlace(e) is { } place && (settle == 0 || settle == 1 && place.Projections.Length == 0))
                 return Copied(place, e.Type);
             var type = Lower(e.Type);
             int temp = Temp(type);
             Into(new Place(temp), e);
             // A value made for the call moves in; a reference (a borrow for a `&mut` parameter) is not Copy.
             return FieldCopied(type) || type is ReferenceType ? Operand.Move(temp) : Operand.Copy(temp);
+        }
+
+        /// <summary>
+        /// The operands of one expression, evaluated left to right: an operand that names a place is read into a
+        /// temporary when an operand after it may write (<c>c.Count + c.Bump()</c>, <c>Add(i, i++, i)</c>); otherwise it
+        /// stays a place read, which costs nothing.
+        /// </summary>
+        private List<Operand> Operands(IReadOnlyList<H.Expr> operands)
+        {
+            var result = new List<Operand>(operands.Count);
+            if (operands.Count == 0)
+                return result;
+            // after[i]: the strongest effect of the operands after i.
+            var after = new int[operands.Count];
+            for (int i = operands.Count - 2; i >= 0; i--)
+                after[i] = Math.Max(after[i + 1], Effects(operands[i + 1]));
+            for (int i = 0; i < operands.Count; i++)
+                result.Add(Value(operands[i], after[i]));
+            return result;
+        }
+
+        /// <summary>
+        /// Whether evaluating <paramref name="e"/> can change what an operand evaluated before it reads: 0 not at all
+        /// (reads, arithmetic, conversions, allocations), 1 through a call (fields, elements, statics, anything reached
+        /// by reference), 2 a local or parameter of this function written outright (<c>i++</c>, <c>i = …</c>, a block).
+        /// </summary>
+        private static int Effects(H.Expr e)
+        {
+            switch (e)
+            {
+                case H.LiteralExpr or H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.TypeOfExpr or H.SizeOfExpr
+                    or H.DefaultExpr or H.ResourceExpr or H.MethodRefExpr or PendingExpr or HeldExpr:
+                    return 0;
+                case H.LambdaExpr:
+                    return 1;
+                case H.FieldExpr f:
+                    return f.Instance is null ? 0 : Effects(f.Instance);
+                case H.ElementExpr x:
+                    return Math.Max(Effects(x.Array), Effects(x.Indices));
+                case H.ArrayLengthExpr l:
+                    return Math.Max(Effects(l.Array), l.Dimension is null ? 0 : Effects(l.Dimension));
+                case H.UnaryExpr { Op: H.UnaryOp.PreIncrement or H.UnaryOp.PostIncrement or H.UnaryOp.PreDecrement or H.UnaryOp.PostDecrement } u:
+                    return WritesLocal(u.Operand) ? 2 : Math.Max(1, Effects(u.Operand));
+                case H.UnaryExpr u:
+                    return Effects(u.Operand);
+                case H.BinaryExpr bin:
+                    return Math.Max(Effects(bin.Left), Effects(bin.Right));
+                case H.AssignExpr a:
+                    return WritesLocal(a.Target) ? 2 : Math.Max(1, Math.Max(Effects(a.Target), Effects(a.Value)));
+                case H.ConvertExpr { Kind: H.ConversionKind.User } c:
+                    return Math.Max(1, Effects(c.Value));
+                case H.ConvertExpr c:
+                    return Effects(c.Value);
+                case H.AsExpr a:
+                    return Effects(a.Value);
+                case H.CheckedExpr c:
+                    return Effects(c.Value);
+                case H.IsExpr i:
+                    return Math.Max(Effects(i.Value), Effects(i.Pattern));
+                case H.ConditionalExpr c:
+                    return Math.Max(Effects(c.Condition), Math.Max(Effects(c.Then), Effects(c.Else)));
+                case H.CoalesceExpr c:
+                    return Math.Max(Effects(c.Left), Effects(c.Right));
+                case H.ConditionalAccessExpr c:
+                    return Math.Max(Effects(c.Receiver), Effects(c.Access));
+                case H.RangeExpr r:
+                    return Math.Max(r.Low is null ? 0 : Effects(r.Low), r.High is null ? 0 : Effects(r.High));
+                case H.NewArrayExpr n:
+                    return Effects(n.Lengths);
+                case H.ArrayLiteralExpr a:
+                    return Effects(a.Items);
+                case H.BorrowExpr b:
+                    return Effects(b.Place);
+                case H.AddressOfExpr a:
+                    return Effects(a.Place);
+                case H.DerefExpr d:
+                    return Effects(d.Pointer);
+                case H.CallExpr call:
+                    return Math.Max(1, Math.Max(call.Receiver is null ? 0 : Effects(call.Receiver), Effects(call.Arguments)));
+                case H.InvokeExpr invoke:
+                    return Math.Max(1, Math.Max(Effects(invoke.Function), Effects(invoke.Arguments)));
+                case H.NewExpr n:
+                    return Math.Max(1, Math.Max(Effects(n.Arguments), Effects(n.Initializers.Select(i => i.Value))));
+                case H.WithExpr w:
+                    return Math.Max(1, Math.Max(Effects(w.Value), Effects(w.Changes.Select(c => c.Value))));
+                case H.PropertyExpr p:
+                    return Math.Max(1, Math.Max(p.Instance is null ? 0 : Effects(p.Instance), Effects(p.Indices)));
+                case H.InterpolatedExpr i:
+                    return Math.Max(1, Effects(i.Parts.Select(p => p.Value)));
+                default:
+                    // Blocks, switches, awaits and anything new: assume the worst.
+                    return 2;
+            }
+        }
+
+        /// <summary>Whether a store to <paramref name="target"/> changes a local or parameter itself (it, or a field of a value in it).</summary>
+        private static bool WritesLocal(H.Expr target)
+        {
+            while (target is H.FieldExpr { Instance: { } instance })
+                target = instance;
+            return target is H.LocalExpr or H.ParamExpr;
+        }
+
+        /// <summary>A pattern's effects: a binding writes a local; a property or positional pattern may call.</summary>
+        private static int Effects(H.Pattern pattern) => pattern switch
+        {
+            H.TypePattern or H.ConstantPattern or H.DiscardPattern or H.RelationalPattern or H.RangePattern => 0,
+            H.AndPattern and => Math.Max(Effects(and.Left), Effects(and.Right)),
+            H.OrPattern or => Math.Max(Effects(or.Left), Effects(or.Right)),
+            H.NotPattern not => Effects(not.Operand),
+            _ => 2,
+        };
+
+        private static int Effects(IEnumerable<H.Expr> operands)
+        {
+            int result = 0;
+            foreach (var operand in operands)
+            {
+                result = Math.Max(result, Effects(operand));
+                if (result == 2)
+                    break;
+            }
+            return result;
         }
 
         /// <summary>
@@ -1469,7 +1597,7 @@ namespace Larva.Hir.Lowering
         /// <summary>A handle (object, array, pointer, reference) in a local, to project through.</summary>
         private Place HandleLocal(H.Expr e)
         {
-            if (AsPlace(e) is { IsLocal: true } local)
+            if (!pinLocals && AsPlace(e) is { IsLocal: true } local)
                 return local;
             int temp = Temp(Lower(e.Type));
             Into(new Place(temp), e);
@@ -1478,11 +1606,35 @@ namespace Larva.Hir.Lowering
 
         private int IndexLocal(H.Expr e)
         {
-            if (AsPlace(e) is { IsLocal: true } local)
+            if (!pinLocals && AsPlace(e) is { IsLocal: true } local)
                 return local.Local;
             int temp = Temp(Lower(e.Type));
             Into(new Place(temp), e);
             return temp;
+        }
+
+        /// <summary>
+        /// While set, the locals a place projects through (an array's handle, an index) are copied into temporaries:
+        /// the place of an assignment's target is taken before its value runs, and that value writes a local
+        /// (<c>arr[k] = k++</c> stores at the old k).
+        /// </summary>
+        private bool pinLocals;
+
+        /// <summary>The place <paramref name="target"/> names, with its locals pinned when <paramref name="value"/> writes locals.</summary>
+        private Place? TargetPlace(H.Expr target, H.Expr value)
+        {
+            if (Effects(value) < 2)
+                return AsPlace(target);
+            bool saved = pinLocals;
+            pinLocals = true;
+            try
+            {
+                return AsPlace(target);
+            }
+            finally
+            {
+                pinLocals = saved;
+            }
         }
 
         /// <summary>Whether <paramref name="e"/> is an object's array kept in place (<see cref="H.FieldFlags.InPlace"/>).</summary>
@@ -1978,9 +2130,8 @@ namespace Larva.Hir.Lowering
             if ((bin.Left.Type is H.GenericParamType || bin.Right.Type is H.GenericParamType)
                 && RequiredOperator(HirLowerer.OperatorRequirementName(OperatorSymbol(bin.Op), false), [bin.Left, bin.Right], bin.Type, target))
                 return;
-            var left = Value(bin.Left);
-            var right = Value(bin.Right);
-            b.Assign(target, Arithmetic(Op(bin.Op), left, right, Lower(bin.Left.Type)));
+            var operands = Operands([bin.Left, bin.Right]);
+            b.Assign(target, Arithmetic(Op(bin.Op), operands[0], operands[1], Lower(bin.Left.Type)));
         }
 
         /// <summary>
@@ -2055,10 +2206,22 @@ namespace Larva.Hir.Lowering
                     return new Place(value);
                 }
             }
-            var place = AsPlace(a.Target) ?? throw new LoweringException("assigns a value that is not a place");
+            var place = TargetPlace(a.Target, a.Value) ?? throw new LoweringException("assigns a value that is not a place");
             WritesElement(a.Target);
             if (a.Compound is { } compound)
-                b.Assign(place, Arithmetic(Op(compound), Operand.Copy(place), Value(a.Value), Lower(a.Target.Type)));
+            {
+                // `x op= v`: x is read before v runs when v may change it (`x += x++`, `c.N += c.Bump()`).
+                var type = Lower(a.Target.Type);
+                int effects = Effects(a.Value);
+                var old = Operand.Copy(place);
+                if (effects == 2 || effects == 1 && !place.IsLocal)
+                {
+                    int before = Temp(type);
+                    b.Assign(before, old);
+                    old = Operand.Copy(before);
+                }
+                b.Assign(place, Arithmetic(Op(compound), old, Value(a.Value), type));
+            }
             else
                 Into(place, a.Value);
             return place;
@@ -2250,7 +2413,7 @@ namespace Larva.Hir.Lowering
                 }
                 else if (info.IsPrimitive)
                 {
-                    arguments.Add(Value(call.Receiver));
+                    arguments.Add(Value(call.Receiver, Effects(call.Arguments)));
                 }
                 else
                 {
@@ -2267,21 +2430,18 @@ namespace Larva.Hir.Lowering
                             int converted = Temp(direct.This);
                             b.Assign(converted, Convert(Operand.Copy(handle), thisType, direct.This));
                             var directArguments = new List<Operand> { Operand.Copy(converted) };
-                            foreach (var argument in call.Arguments)
-                                directArguments.Add(Value(argument));
+                            directArguments.AddRange(Operands(call.Arguments));
                             Emit(direct.Function, direct.TypeArguments, directArguments, target);
                             return;
                         }
-                        foreach (var argument in call.Arguments)
-                            arguments.Add(Value(argument));
+                        arguments.AddRange(Operands(call.Arguments));
                         VirtualCall(info, m, classArguments, handle, arguments, target);
                         return;
                     }
                     arguments.Add(Operand.Copy(handle));
                 }
             }
-            foreach (var argument in call.Arguments)
-                arguments.Add(Value(argument));
+            arguments.AddRange(Operands(call.Arguments));
             Emit(lowerer.MethodFunctions[call.Method], typeArguments, arguments, target);
             if (writeBack is { } back)
                 b.Assign(back.Back, Copied(back.Temp, call.Receiver!.Type));
@@ -2355,11 +2515,7 @@ namespace Larva.Hir.Lowering
                 int which = Array.FindIndex(plan.Generics[index].Requirements, r => r.SameAs(requirement));
                 if (which < 0)
                     continue;
-                var arguments = new List<Operand>();
-                if (call.Receiver is { } receiver)
-                    arguments.Add(Value(receiver));
-                foreach (var argument in call.Arguments)
-                    arguments.Add(Value(argument));
+                var arguments = Operands(call.Receiver is { } receiver ? [receiver, .. call.Arguments] : call.Arguments);
                 int next = NewBlock();
                 b.CallRequired(index, which, [.. arguments], target, next, Handlers());
                 At(next);
@@ -2387,7 +2543,7 @@ namespace Larva.Hir.Lowering
                 int which = Array.FindIndex(plan.Generics[index].Requirements, r => r.Name == name && r.Result == resultType && r.Parameters.SequenceEqual(types));
                 if (which < 0)
                     continue;
-                var arguments = operands.Select(Value).ToArray();
+                var arguments = Operands(operands).ToArray();
                 int next = NewBlock();
                 b.CallRequired(index, which, arguments, target, next, Handlers());
                 At(next);
@@ -2400,7 +2556,7 @@ namespace Larva.Hir.Lowering
                 int which = index < plan.Generics.Length ? Array.FindIndex(plan.Generics[index].Requirements, r => r.Name == name && r.Result == resultType && r.Parameters.SequenceEqual(types)) : -1;
                 if (which >= 0)
                 {
-                    var arguments = operands.Select(Value).ToArray();
+                    var arguments = Operands(operands).ToArray();
                     int next = NewBlock();
                     b.CallRequired(index, which, arguments, target, next, Handlers());
                     At(next);
@@ -2600,7 +2756,7 @@ namespace Larva.Hir.Lowering
                 int which = index < plan.Generics.Length ? Array.FindIndex(plan.Generics[index].Requirements, r => r.Name == Requirement.Constructor && r.Result == type && r.Parameters.SequenceEqual(types)) : -1;
                 if (which < 0)
                     throw new LoweringException($"no constructor requirement new({string.Join(", ", types.Select(t => t.ToString()))}) on {n.Type}");
-                var arguments = n.Arguments.Select(Value).ToArray();
+                var arguments = Operands(n.Arguments).ToArray();
                 int next = NewBlock();
                 b.CallRequired(index, which, arguments, target, next, Handlers());
                 At(next);
@@ -2641,8 +2797,7 @@ namespace Larva.Hir.Lowering
                 if (n.Constructor is { } constructor)
                 {
                     var arguments = new List<Operand> { Operand.Copy(handle) };
-                    foreach (var argument in n.Arguments)
-                        arguments.Add(Value(argument));
+                    arguments.AddRange(Operands(n.Arguments));
                     Emit(lowerer.MethodFunctions[constructor], typeArguments, arguments, new Place(Temp(IrType.Unit)));
                 }
                 foreach (var init in n.Initializers)
@@ -2660,8 +2815,7 @@ namespace Larva.Hir.Lowering
                     int reference = Temp(IrType.RefMut(structType));
                     b.Assign(reference, Rvalue.RefMut(value));
                     var arguments = new List<Operand> { Operand.Move(reference) };
-                    foreach (var argument in n.Arguments)
-                        arguments.Add(Value(argument));
+                    arguments.AddRange(Operands(n.Arguments));
                     Emit(lowerer.MethodFunctions[constructor], typeArguments, arguments, new Place(Temp(IrType.Unit)));
                 }
                 foreach (var init in n.Initializers)
