@@ -293,6 +293,30 @@ public sealed unsafe class AotTests : CheckedTest
             $"exit {exit}: {output.Trim()} {errors.Trim()}");
     }
 
+    /// <summary>
+    /// Listing a folder from two threads at once: the listing's entries and their count were per thread, but the
+    /// capacity that grows the buffer was shared, so the second thread took the first one's capacity for its own empty
+    /// buffer and wrote through null (a crash in next_entry). Every piece of the listing is per thread now.
+    /// </summary>
+    [Fact]
+    public void Llvm_folder_listings_from_two_threads_do_not_crash()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.DirectoryThreadsProgram() with { Name = "lister" }, "lister.lvo");
+        string exe = Path.Combine(Directory, "lister-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "list_threads", "-o", exe, program);
+        Check("llvm: larva native --exe --entry list_threads", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        for (int run = 0; run < 3; run++)
+        {
+            var (exit, output, errors) = Execute(exe, ["5"], stats: true, timeout: 60_000);
+            Check($"llvm: lister.exe 5 = 5 (run {run}): two threads listed the folder 200 times each without a crash",
+                exit == 0 && output.Trim() == "5" && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
+        }
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)

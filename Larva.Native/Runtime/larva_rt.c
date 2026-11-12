@@ -4717,8 +4717,8 @@ LARVA_API int64_t larva_read_line(void) {
         return result;
     }
 #endif
-    static unsigned char *bytes;
-    static size_t capacity;
+    static THREAD_LOCAL unsigned char *bytes;
+    static THREAD_LOCAL size_t capacity;
     size_t count = 0;
     int c, any = 0;
     BLOCKING_ENTER();
@@ -5042,7 +5042,7 @@ static int compare_entries(const void *a, const void *b) {
 }
 
 static Units *next_entry(void) {
-    static int64_t capacity;
+    static THREAD_LOCAL int64_t capacity;  /* with folder_entries: each thread lists on its own */
     if (folder_count == capacity) {
         capacity = capacity ? capacity * 2 : 32;
         folder_entries = (Units *)realloc(folder_entries, (size_t)capacity * sizeof(Units));
