@@ -12,6 +12,8 @@ namespace Larva.IR.Analysis
     /// <item>Borrows: a loan is alive while any live local holds it (<see cref="LoanAnalysis"/> + <see cref="Liveness"/>);
     /// alive <c>&amp;mut</c> loans forbid any other access to the place, alive <c>&amp;</c> loans forbid writes.</item>
     /// <item>No returning references to the function's own locals.</item>
+    /// <item>Escapes: a reference to a local is not stored in memory the caller owns (behind <c>&amp;mut</c> / <c>*mut</c>,
+    /// by assignment or by lending the place to a call as <c>&amp;mut</c>); <c>gc</c> objects and globals hold no references at all.</item>
     /// </list>
     /// </summary>
     public static class BorrowChecker
@@ -105,6 +107,10 @@ namespace Larva.IR.Analysis
                         else
                             CheckOperands(MoveAnalysis.Operands(assign.Value), location, moveState, active);
                         CheckAccess(assign.Target, Access.Write, location, moveState, active);
+                        if (assign.Value is AllocRvalue { Kind: AllocKind.Gc })
+                            CheckEscape(loans.Incoming(loanState, assign, location), Lifetime.Forever, "a `gc` object", location);
+                        else
+                            CheckEscape(loans.Incoming(loanState, assign, location), LifetimeOf(assign.Target), Describe(assign.Target), location);
                         break;
 
                     case StorageDeadStatement dead:
@@ -117,6 +123,7 @@ namespace Larva.IR.Analysis
 
                     case StoreGlobalStatement store:
                         CheckOperands([store.Value], location, moveState, active);
+                        CheckEscape(loans.LoansFlowingFrom(loanState, store.Value), Lifetime.Forever, $"global `{module.Globals[store.Global].Name}`", location);
                         break;
                 }
             }
@@ -135,6 +142,9 @@ namespace Larva.IR.Analysis
                     case CallTerminator call:
                         CheckOperands([.. call.Operands], location, moveState, active);
                         CheckAccess(call.Destination, Access.Write, location, moveState, active);
+                        // What the callee may keep, by its signature: in its result, and behind the `&mut` arguments.
+                        foreach (var (into, ids, _) in loans.CallStores(loanState, call))
+                            CheckEscape(ids, LifetimeOf(into), Describe(into), location);
                         break;
                     case DropTerminator drop:
                         CheckAccess(drop.Place, Access.Drop, location, moveState, active);
@@ -332,6 +342,59 @@ namespace Larva.IR.Analysis
                     _ => (BorrowErrorKind.DroppedWhileBorrowed, $"{Describe(place)} dropped while still borrowed ({borrow})"),
                 };
                 Report(location, kind, message);
+            }
+
+            /// <summary>How long the memory of a place lives: with this frame, at least with the caller's, or forever.</summary>
+            private enum Lifetime : byte
+            {
+                /// <summary>The function's own storage: a local, or data behind a <c>box</c> it owns.</summary>
+                Frame,
+                /// <summary>Behind a <c>&amp;</c>, <c>&amp;mut</c> or raw pointer: memory somebody up the stack owns.</summary>
+                Caller,
+                /// <summary>Behind a <c>gc</c> handle, or a global: memory no frame owns, which outlives every borrow.</summary>
+                Forever,
+            }
+
+            private Lifetime LifetimeOf(Place place)
+            {
+                var lifetime = Lifetime.Frame;
+                for (int j = 0; j < place.Projections.Length; j++)
+                {
+                    if (place.Projections[j] is not DerefProjection)
+                        continue;
+                    switch (function.TypeOf(new Place(place.Local, place.Projections[..j]), module).Unoptional())
+                    {
+                        case BoxType:
+                            break;
+                        case GcType:
+                            return Lifetime.Forever;
+                        default:
+                            lifetime = Lifetime.Caller;
+                            break;
+                    }
+                }
+                return lifetime;
+            }
+
+            /// <summary>
+            /// A value carrying <paramref name="ids"/> is stored in <paramref name="where"/>, which lives <paramref name="lifetime"/>:
+            /// the caller's memory may not receive a reference to this frame's storage (the frame ends before the memory),
+            /// and a <c>gc</c> object or a global may not receive any reference (nothing it could borrow lives as long).
+            /// </summary>
+            private void CheckEscape(IEnumerable<int> ids, Lifetime lifetime, string where, Location location)
+            {
+                if (lifetime == Lifetime.Frame)
+                    return;
+                foreach (int id in ids.Distinct().Order())
+                {
+                    var loan = loans.Loans[id];
+                    if (lifetime == Lifetime.Forever)
+                        Report(location, BorrowErrorKind.EscapingReference,
+                            $"a reference to {Describe(loan.Place)} (borrowed at {loan.At}) may be stored in {where}, which outlives every borrow: `gc` objects and globals hold no references");
+                    else if (LifetimeOf(loan.Place) == Lifetime.Frame)
+                        Report(location, BorrowErrorKind.EscapingReference,
+                            $"a reference to local {Describe(loan.Place)} (borrowed at {loan.At}) may be stored in {where}, which the caller owns and outlives this function's frame");
+                }
             }
 
             // ── Helpers ────────────────────────────────────────────
