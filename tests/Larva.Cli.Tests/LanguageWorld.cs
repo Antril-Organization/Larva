@@ -13,7 +13,21 @@ namespace Larva.Cli.Tests;
 /// </summary>
 internal sealed class LanguageWorld
 {
-    public static string SourcePack { get; } = Path.GetFullPath(Path.Combine(LarvaProcess.Repository, "..", "Antril", "artifacts", "pack", "Antril"));
+    public static string SourcePack { get; } = FindSourcePack();
+
+    /// <summary>The Antril repository beside this one (or beside the repository a worktree of it is under): its dev pack.</summary>
+    private static string FindSourcePack()
+    {
+        string? fallback = null;
+        for (var folder = new DirectoryInfo(LarvaProcess.Repository); folder is not null; folder = folder.Parent)
+        {
+            string pack = Path.Combine(folder.FullName, "..", "Antril", "artifacts", "pack", "Antril");
+            fallback ??= Path.GetFullPath(pack);
+            if (File.Exists(Path.Combine(pack, "language.json")))
+                return Path.GetFullPath(pack);
+        }
+        return fallback!;
+    }
 
     public static string Platform
     {

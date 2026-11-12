@@ -1,0 +1,231 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.Json.Nodes;
+
+namespace Larva.Cli.Tests;
+
+/// <summary>
+/// <c>larva lsp</c> as a process over its standard streams, with an installed language: the background borrow check of a
+/// project that enforces it reaches the editor.
+/// </summary>
+public sealed class LspTests
+{
+    [Fact]
+    public void BorrowCheck_PublishesTheProjectsBorrowErrors()
+    {
+        var world = new LanguageWorld("lsp-borrows");
+        world.Approve("0.8.0");
+        world.Larva.Ok("languages", "install", "antril", "--provider", world.Registry);
+
+        // A project that enforces the borrow checker, and a source whose only error is a borrow error: the analysis
+        // finds nothing, the borrow check (compiled, linked with System.Core and System.Bindings, lowered) finds it.
+        string app = Path.Combine(world.Root, "app");
+        Directory.CreateDirectory(app);
+        File.WriteAllText(Path.Combine(app, "App.queen"), "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   backend: llvm,\n   borrowcheck: enforce,\n   output: out/App.exe\n");
+        string source = Path.Combine(app, "Program.ant");
+        const string program = "import System;\nvalue Counter { public: i32 n; }\nBoth(&mut Counter a, &mut Counter b) { a.n = 1; b.n = 2; }\nMain()\n{\n    Counter x = new Counter();\n    Both(&mut x, &mut x);\n    Console.WriteLine(x.n);\n}\n";
+        File.WriteAllText(source, program);
+
+        using var server = new Server(world.Larva);
+        server.Request("initialize", new JsonObject { ["processId"] = null, ["rootUri"] = Uri(app), ["capabilities"] = new JsonObject() });
+        server.Notify("initialized", new JsonObject());
+        server.Notify("textDocument/didOpen", new JsonObject
+        {
+            ["textDocument"] = new JsonObject { ["uri"] = Uri(source), ["languageId"] = "antril", ["version"] = 1, ["text"] = program },
+        });
+        // The analysis publishes first (no error), the borrow check a moment later.
+        var analysis = server.Diagnostics(Uri(source));
+        Assert.True(analysis is { Count: 0 }, "the analysis finds no error: " + analysis?.ToJsonString());
+        var borrows = server.Diagnostics(Uri(source));
+        Assert.True(borrows is { Count: 1 }, "the borrow check publishes its error: " + borrows?.ToJsonString() + "\n" + server.Log);
+        var error = borrows![0]!;
+        Assert.Equal("ConflictingBorrow", (string?)error["code"]);
+        Assert.Equal("borrow checker", (string?)error["source"]);
+        Assert.Equal(1, (int?)error["severity"]);
+        Assert.Equal(6, (int?)error["range"]!["start"]!["line"]);
+        Assert.DoesNotContain("borrow check:", server.Log);
+        server.Request("shutdown", null);
+        server.Notify("exit", null);
+    }
+
+    private static string Uri(string path) => "file:///" + path.Replace('\\', '/').Replace(":", "%3A");
+
+    /// <summary>The language server of this working copy, in the world of a <see cref="LarvaProcess"/>, driven over its standard streams.</summary>
+    private sealed class Server : IDisposable
+    {
+        private readonly Process process;
+        private readonly Stream input, output;
+        private readonly StringBuilder log = new();
+        private readonly System.Collections.Concurrent.BlockingCollection<JsonObject> inbox = [];
+        private readonly List<JsonObject> pending = [];
+        private int nextId = 1;
+
+        public Server(LarvaProcess larva)
+        {
+            Assert.True(File.Exists(LarvaProcess.Dll), $"the larva command line is built: {LarvaProcess.Dll}");
+            var start = new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = larva.WorkingDirectory,
+            };
+            start.ArgumentList.Add(LarvaProcess.Dll);
+            start.ArgumentList.Add("lsp");
+            start.Environment["LARVA_CONFIG"] = larva.Config;
+            start.Environment["LARVA_USER_LANGUAGES"] = larva.UserLanguages;
+            start.Environment.Remove("LARVA_LANGUAGES");
+            process = Process.Start(start)!;
+            process.ErrorDataReceived += (_, e) =>
+            {
+                lock (log)
+                    log.AppendLine(e.Data);
+            };
+            process.BeginErrorReadLine();
+            input = process.StandardInput.BaseStream;
+            output = process.StandardOutput.BaseStream;
+            new Thread(() =>
+            {
+                try
+                {
+                    while (Read() is { } message)
+                        inbox.Add(message);
+                }
+                catch (Exception e) when (e is IOException or ObjectDisposedException or InvalidOperationException)
+                {
+                }
+                inbox.CompleteAdding();
+            }) { IsBackground = true }.Start();
+        }
+
+        /// <summary>What the server wrote to its standard error.</summary>
+        public string Log
+        {
+            get
+            {
+                lock (log)
+                    return log.ToString();
+            }
+        }
+
+        public JsonNode? Request(string method, JsonNode? parameters)
+        {
+            int id = nextId++;
+            Send(new JsonObject { ["id"] = id, ["method"] = method, ["params"] = parameters?.DeepClone() });
+            while (Receive() is { } message)
+            {
+                if (message["id"] is { } got && got.GetValue<int>() == id && message["method"] is null)
+                    return message["result"];
+                pending.Add(message);
+            }
+            return null;
+        }
+
+        public void Notify(string method, JsonNode? parameters) =>
+            Send(new JsonObject { ["method"] = method, ["params"] = parameters?.DeepClone() });
+
+        /// <summary>The next diagnostics published for <paramref name="uri"/> (waiting for them; null when none come).</summary>
+        public JsonArray? Diagnostics(string uri)
+        {
+            for (int i = 0; i < pending.Count; i++)
+            {
+                if (IsDiagnostics(pending[i], uri))
+                {
+                    var found = pending[i]["params"]!["diagnostics"] as JsonArray;
+                    pending.RemoveAt(i);
+                    return found;
+                }
+            }
+            while (Receive() is { } message)
+            {
+                if (IsDiagnostics(message, uri))
+                    return message["params"]!["diagnostics"] as JsonArray;
+                pending.Add(message);
+            }
+            return null;
+        }
+
+        private static bool IsDiagnostics(JsonObject message, string uri) =>
+            message["method"]?.GetValue<string>() == "textDocument/publishDiagnostics"
+            && string.Equals(message["params"]?["uri"]?.GetValue<string>(), uri, StringComparison.OrdinalIgnoreCase);
+
+        private JsonObject? Receive()
+        {
+            try
+            {
+                return inbox.TryTake(out var message, TimeSpan.FromSeconds(60)) ? message : null;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+
+        private void Send(JsonObject message)
+        {
+            message["jsonrpc"] = "2.0";
+            byte[] body = Encoding.UTF8.GetBytes(message.ToJsonString());
+            byte[] header = Encoding.ASCII.GetBytes($"Content-Length: {body.Length}\r\n\r\n");
+            try
+            {
+                input.Write(header);
+                input.Write(body);
+                input.Flush();
+            }
+            catch (IOException)
+            {
+                // The server has ended: what was asked gets no answer, and its check fails.
+            }
+        }
+
+        private JsonObject? Read()
+        {
+            var header = new StringBuilder();
+            int length = -1;
+            while (true)
+            {
+                int b = output.ReadByte();
+                if (b < 0)
+                    return null;
+                header.Append((char)b);
+                if (header.ToString().EndsWith("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    foreach (string line in header.ToString().Split("\r\n"))
+                    {
+                        if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                            length = int.Parse(line["Content-Length:".Length..].Trim());
+                    }
+                    break;
+                }
+            }
+            if (length < 0)
+                return null;
+            var body = new byte[length];
+            for (int read = 0; read < length;)
+            {
+                int n = output.Read(body, read, length - read);
+                if (n <= 0)
+                    return null;
+                read += n;
+            }
+            return JsonNode.Parse(body) as JsonObject;
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                input.Close();
+            }
+            catch (IOException)
+            {
+            }
+            if (!process.WaitForExit(10_000))
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(10_000);
+            }
+            process.Dispose();
+        }
+    }
+}
