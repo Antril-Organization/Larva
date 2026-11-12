@@ -395,25 +395,67 @@ namespace Larva.Wasm
             UpdateFlags(moved, target);
         }
 
-        /// <summary>An intrinsic: its arguments on the wasm stack, then the runtime's import (input leaves an i64 there).</summary>
+        /// <summary>
+        /// An intrinsic: its arguments on the wasm stack, each adapted to the import's signature, then the runtime's import,
+        /// whose result (if any) is left as an i64 (bits for a float) when the intrinsic has one.
+        /// </summary>
+        /// <remarks>
+        /// Every slot holds an i64 (a bool a byte; an address, a function value or a float's bits widened), while the
+        /// imports take an i32 for an address of any kind (references, pointers, function values, byte arrays) and may
+        /// return one: the adaptation goes by the import's declared types, never by the IR type's shape, so no argument is
+        /// passed at the wrong width (an i64 where an i32 is expected made the module invalid).
+        /// </remarks>
         private void Intrinsic(IntrinsicRvalue intrinsic)
         {
             var info = Intrinsics.Find(intrinsic.Name)!;
+            var signature = WasmCodegen.RuntimeType(info.Symbol);
             var slots = intrinsic.Arguments.Select(Operand).ToArray();
+            if (signature.Parameters.Length != slots.Length)
+                throw new WasmBackendException($"`{intrinsic.Name}` takes {slots.Length} argument(s); the runtime's `{info.Symbol}` takes {signature.Parameters.Length}");
             for (int i = 0; i < slots.Length; i++)
             {
-                var type = info.Parameters[i];
                 c.LocalGet(Fp);
-                if (type == IrType.Bool)
+                if (info.Parameters[i] == IrType.Bool)
+                {
                     c.I32Load8U(slots[i]);
+                    if (signature.Parameters[i] == ValType.I64)
+                        c.I64ExtendI32U();
+                }
                 else
                 {
                     c.I64Load(slots[i]);
-                    if (type is ReferenceType)
-                        c.I32WrapI64();
+                    switch (signature.Parameters[i])
+                    {
+                        case ValType.I32: c.I32WrapI64(); break;
+                        case ValType.F64: c.Raw(0xBF); break;                      // f64.reinterpret_i64
+                        case ValType.F32: c.I32WrapI64(); c.Raw(0xBE); break;     // f32.reinterpret_i32
+                    }
                 }
             }
             c.Call(cg.Runtime(info.Symbol));
+            bool wanted = !info.Result.IsUnit;
+            if (signature.Results.Length == 0)
+            {
+                if (wanted)
+                    c.I64(0);
+                return;
+            }
+            if (!wanted)
+            {
+                c.Drop();
+                return;
+            }
+            switch (signature.Results[0])
+            {
+                case ValType.I32:
+                    if (cg.Shape(info.Result) is (Kind.Scalar, < 8, true))
+                        c.I64ExtendI32S();
+                    else
+                        c.I64ExtendI32U();                                        // an address or an unsigned value
+                    break;
+                case ValType.F64: c.Raw(0xBD); break;                             // i64.reinterpret_f64
+                case ValType.F32: c.Raw(0xBC); c.I64ExtendI32U(); break;          // i32.reinterpret_f32
+            }
         }
 
         private void FrameAddress(int offset)
@@ -1199,6 +1241,21 @@ namespace Larva.Wasm
                     c.Raw((byte)((f32 ? 0x92 : 0xA0) + index));
                     if (f32) c.F32Store(left); else c.F64Store(left);
                     return left;
+                case BinaryOp.Rem:
+                    // fmod (the remainder of the truncating division, with the dividend's sign): the runtime's
+                    // `larva_f64_rem` (JavaScript's `%` on doubles, exact), on the bits of doubles; a single is promoted
+                    // and demoted around it, which is exact (the remainder of two singles is a single).
+                    c.LocalGet(Fp);
+                    LoadF(left);
+                    if (f32) c.Raw(0xBB);     // f64.promote_f32
+                    c.Raw(0xBD);              // i64.reinterpret_f64
+                    LoadF(right);
+                    if (f32) c.Raw(0xBB);
+                    c.Raw(0xBD);
+                    c.Call(cg.Runtime("larva_f64_rem"));
+                    c.Raw(0xBF);              // f64.reinterpret_i64
+                    if (f32) { c.Raw(0xB6); c.F32Store(left); } else c.F64Store(left); // f32.demote_f64
+                    return left;
                 case BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Gt or BinaryOp.Le or BinaryOp.Ge:
                     LoadF(left);
                     LoadF(right);
@@ -1265,9 +1322,17 @@ namespace Larva.Wasm
             {
                 c.LocalGet(Fp);
                 if (fromSize == 4) c.F32Load(value); else c.F64Load(value);
-                // Saturating truncation (no trap on NaN or overflow).
+                // Larva's rule for every back end: a value out of the target's range gives the nearest limit and NaN
+                // gives 0 (LLVM's fptosi.sat): i64.trunc_sat_f*_s/u saturates to 64 bits (0xFC 4..7), and a narrower
+                // target is clamped to its own range before the canonical wrap (which alone would turn i32 max into -1).
                 c.Prefixed(to == IrType.U64 ? (fromSize == 4 ? 5u : 7u) : (fromSize == 4 ? 4u : 6u));
                 c.LocalSet(A);
+                if (toSize < 8)
+                {
+                    long max = to.IsSigned ? (1L << (8 * toSize - 1)) - 1 : (1L << (8 * toSize)) - 1;
+                    long min = to.IsSigned ? -max - 1 : 0;
+                    ClampA(min, max);
+                }
                 Canonicalize(to);
                 StoreA(value);
                 return value;
@@ -1289,6 +1354,25 @@ namespace Larva.Wasm
         }
 
         /// <summary>Makes local <see cref="A"/> the canonical form of <paramref name="type"/> (truncated, then extended).</summary>
+        /// <summary>Clamps the signed i64 in <c>A</c> into [<paramref name="min"/>, <paramref name="max"/>] (with <c>select</c>).</summary>
+        private void ClampA(long min, long max)
+        {
+            c.LocalGet(A);
+            c.I64(max);
+            c.LocalGet(A);
+            c.I64(max);
+            c.I64Op(0x53); // i64.lt_s
+            c.Raw(0x1B);   // select: A when A < max, else max
+            c.LocalSet(A);
+            c.LocalGet(A);
+            c.I64(min);
+            c.LocalGet(A);
+            c.I64(min);
+            c.I64Op(0x55); // i64.gt_s
+            c.Raw(0x1B);   // select: A when A > min, else min
+            c.LocalSet(A);
+        }
+
         private void Canonicalize(IrType type)
         {
             var (kind, size, signed) = cg.Shape(type);

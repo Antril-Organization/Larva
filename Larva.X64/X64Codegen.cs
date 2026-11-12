@@ -342,7 +342,14 @@ namespace Larva.X64
 
         // ── Unwind info ────────────────────────────────────────
 
-        internal const int PrologueSize = 11; // push rbp (1) + mov rbp, rsp (3) + sub rsp, imm32 (7)
+        internal const int PrologueSize = 16; // push rbp (1) + mov rbp, rsp (3) + probe slot (5) + sub rsp, imm32 (7)
+
+        /// <summary>
+        /// A frame of this size or more must touch every page it spans before <c>rsp</c> moves (Windows commits the stack one
+        /// guard page at a time: skipping a page is an access violation, not growth). Smaller frames stay within a page of
+        /// the return address the call pushed.
+        /// </summary>
+        internal const int ProbeThreshold = 4096;
 
         /// <summary>
         /// UNWIND_INFO for the fixed prologue, with RBP as frame register; with scopes, followed by the exception handler
@@ -506,9 +513,14 @@ namespace Larva.X64
             PlanPins();
             PlanExceptions();
 
-            // Prologue (fixed size: the unwind info describes it).
+            // Prologue (fixed size: the unwind info describes it). The frame size is known only at the end, so the probe
+            // slot is a 5-byte nop, rewritten as a jump to the stack-probe loop (after the function) when the frame is large.
             a.PushRbp();
             a.Mov(Reg.Rbp, Reg.Rsp);
+            int probeSlotAt = a.Position;
+            a.Nop5();
+            var afterProbe = new Label();
+            a.Bind(afterProbe);
             int frameSizeAt = a.Position + 3;
             a.SubRsp32(0);
 
@@ -557,6 +569,8 @@ namespace Larva.X64
 
             int frameSize = (frame + outgoing + 15) / 16 * 16;
             a.PatchInt32(frameSizeAt, frameSize);
+            if (frameSize >= X64Codegen.ProbeThreshold)
+                EmitStackProbe(probeSlotAt, afterProbe, frameSize);
             int size = a.Position - start;
             var scopes = EmitFilters();
 
@@ -572,6 +586,29 @@ namespace Larva.X64
             }
             var (info, fixups) = X64Codegen.UnwindInfo(frameSize, scopes);
             return new X64Function(cg.Symbol(function), start, size, frameSize, [.. roots], info, fixups);
+        }
+
+        /// <summary>
+        /// The stack probe of a large frame (what MSVC's <c>__chkstk</c> does, inline so neither the in-process image nor the
+        /// linker needs the symbol): reads one byte per page from <c>rsp - 4096</c> down to the frame's end, in that order,
+        /// so each access lands at most one page past the committed stack and the guard page moves down with it. It runs
+        /// from the prologue slot, before <c>rsp</c> moves (the kernel may push an exception frame at <c>rsp</c> at any
+        /// time), using only <c>rax</c>, <c>r10</c> and <c>r11</c> (no argument register), and jumps back to the <c>sub rsp</c>.
+        /// </summary>
+        private void EmitStackProbe(int slotAt, Label afterProbe, int frameSize)
+        {
+            var probe = new Label();
+            var loop = new Label();
+            a.Bind(probe);
+            a.Mov(Reg.R10, Reg.Rbp);                      // rbp == rsp here
+            a.MovImm(Reg.R11, frameSize / 4096);          // pages crossed; the rest stays within a page of the last probe
+            a.Bind(loop);
+            a.SubImm(Reg.R10, 4096);
+            a.Load(Reg.Rax, Mem.At(Reg.R10), 1, false);   // touches the page (a read is enough for a guard page)
+            a.SubImm(Reg.R11, 1);
+            a.Jcc(Cond.NE, loop);
+            a.Jmp(afterProbe);
+            a.PatchJmp(slotAt, probe);
         }
 
         // ── Exceptions ─────────────────────────────────────────
@@ -1725,6 +1762,26 @@ namespace Larva.X64
                 case BinaryOp.Sub: a.FloatSub(Xmm.X0, Xmm.X1, size); break;
                 case BinaryOp.Mul: a.FloatMul(Xmm.X0, Xmm.X1, size); break;
                 case BinaryOp.Div: a.FloatDiv(Xmm.X0, Xmm.X1, size); break;
+                case BinaryOp.Rem:
+                {
+                    // fmod (the remainder of the truncating division, with the dividend's sign) by the runtime's exact
+                    // soft float, larva_float_rem(left, right, result, limbs) with one limb (a double); a single (or a half,
+                    // already a single here) is widened and narrowed around it, which is exact: the remainder of two
+                    // singles is a single. a - trunc(a / b) * b would not be exact.
+                    int dividend = Temp(8), divisor = Temp(8);
+                    if (size == 4)
+                    {
+                        a.FloatResize(Xmm.X0, Xmm.X0, 4);
+                        a.FloatResize(Xmm.X1, Xmm.X1, 4);
+                    }
+                    a.StoreFloat(Frame(dividend), Xmm.X0, 8);
+                    a.StoreFloat(Frame(divisor), Xmm.X1, 8);
+                    int remainder = WideHelper("larva_float_rem", dividend, divisor, 1);
+                    a.LoadFloat(Xmm.X0, Frame(remainder), 8);
+                    if (size == 4)
+                        a.FloatResize(Xmm.X0, Xmm.X0, 8);
+                    break;
+                }
                 case BinaryOp.Eq or BinaryOp.Ne:
                     // Unordered (NaN) sets PF: == is false and != is true for NaN.
                     a.FloatCompare(Xmm.X0, Xmm.X1, size);
@@ -1812,32 +1869,9 @@ namespace Larva.X64
             if (fromKind == X64Codegen.Kind.Float)
             {
                 a.LoadFloat(Xmm.X0, Frame(value), fromSize);
-                if (to == IrType.U64)
-                {
-                    // ≥ 2^63: convert x - 2^63 and set the top bit back.
-                    var small = new Label();
-                    var done = new Label();
-                    a.MovImm(Reg.Rax, fromSize == 4 ? 0x5F00_0000L : 0x43E0_0000_0000_0000L); // 2^63
-                    if (fromSize == 4)
-                        a.BitsToFloat(Xmm.X1, Reg.Rax);
-                    else
-                        a.BitsToFloat(Xmm.X1, Reg.Rax);
-                    a.FloatCompare(Xmm.X0, Xmm.X1, fromSize);
-                    a.Jcc(Cond.B, small);
-                    a.FloatSub(Xmm.X0, Xmm.X1, fromSize);
-                    a.FloatToInt(Reg.Rax, Xmm.X0, fromSize);
-                    a.MovImm(Reg.Rcx, long.MinValue);
-                    a.Xor(Reg.Rax, Reg.Rcx);
-                    a.Jmp(done);
-                    a.Bind(small);
-                    a.FloatToInt(Reg.Rax, Xmm.X0, fromSize);
-                    a.Bind(done);
-                }
-                else
-                {
-                    a.FloatToInt(Reg.Rax, Xmm.X0, fromSize);
-                }
-                Canonicalize(Reg.Rax, to);
+                if (fromSize == 4)
+                    a.FloatResize(Xmm.X0, Xmm.X0, 4); // a single widened to a double is exact: one set of bounds below
+                FloatToIntSaturating(to);
                 a.Store(Frame(value), Reg.Rax, 8);
                 return value;
             }
@@ -1875,6 +1909,64 @@ namespace Larva.X64
             Canonicalize(Reg.Rax, to);
             a.Store(Frame(value), Reg.Rax, 8);
             return value;
+        }
+
+        /// <summary>
+        /// The double in <c>xmm0</c> as the integer <paramref name="to"/> in <c>rax</c> (canonical), with Larva's rule for
+        /// every back end: a value out of the target's range gives the nearest limit and NaN gives 0 (LLVM's
+        /// <c>fptosi.sat</c>/<c>fptoui.sat</c>), never <c>cvttsd2si</c>'s "integer indefinite" 0x8000… or a wrapped value.
+        /// </summary>
+        private void FloatToIntSaturating(IrType to)
+        {
+            int size = cg.Shape(to).Size;
+            var done = new Label();
+            a.MovImm(Reg.Rax, 0);
+            a.FloatCompare(Xmm.X0, Xmm.X0, 8);
+            a.Jcc(Cond.P, done);                                        // NaN → 0
+            void Bound(double bound) { a.MovImm(Reg.Rcx, BitConverter.DoubleToInt64Bits(bound)); a.BitsToFloat(Xmm.X1, Reg.Rcx); }
+            if (to.IsSigned)
+            {
+                long max = size == 8 ? long.MaxValue : (1L << (8 * size - 1)) - 1;
+                long min = -max - 1;
+                Bound(size == 8 ? 9223372036854775808.0 : max + 1);     // 2^(bits-1): the first double past the maximum
+                a.MovImm(Reg.Rax, max);
+                a.FloatCompare(Xmm.X0, Xmm.X1, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≥ 2^(bits-1) → max
+                Bound(min);
+                a.MovImm(Reg.Rax, min);
+                a.FloatCompare(Xmm.X1, Xmm.X0, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≤ min → min
+                a.FloatToInt(Reg.Rax, Xmm.X0, 8);                       // in range: the truncation is exact
+            }
+            else
+            {
+                ulong max = size == 8 ? ulong.MaxValue : (1UL << (8 * size)) - 1;
+                Bound(size == 8 ? 18446744073709551616.0 : max + 1);    // 2^bits
+                a.MovImm(Reg.Rax, (long)max);
+                a.FloatCompare(Xmm.X0, Xmm.X1, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≥ 2^bits → max
+                a.MovImm(Reg.Rax, 0);
+                Bound(0.0);
+                a.FloatCompare(Xmm.X1, Xmm.X0, 8);
+                a.Jcc(Cond.AE, done);                                   // x ≤ 0 → 0 (negatives, -0)
+                if (size == 8)
+                {
+                    // ≥ 2^63: convert x - 2^63 and set the top bit back.
+                    var small = new Label();
+                    Bound(9223372036854775808.0);
+                    a.FloatCompare(Xmm.X0, Xmm.X1, 8);
+                    a.Jcc(Cond.B, small);
+                    a.FloatSub(Xmm.X0, Xmm.X1, 8);
+                    a.FloatToInt(Reg.Rax, Xmm.X0, 8);
+                    a.MovImm(Reg.Rcx, long.MinValue);
+                    a.Xor(Reg.Rax, Reg.Rcx);
+                    a.Jmp(done);
+                    a.Bind(small);
+                }
+                a.FloatToInt(Reg.Rax, Xmm.X0, 8);
+            }
+            a.Bind(done);
+            Canonicalize(Reg.Rax, to);
         }
 
         private int WideConvert(int value, IrType from, IrType to, X64Codegen.Kind fromKind, bool fromSigned, X64Codegen.Kind toKind)
