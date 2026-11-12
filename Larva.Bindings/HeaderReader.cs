@@ -1063,7 +1063,7 @@ namespace Larva.Bindings
 
         private static bool IsIdentifier(string w) => w.Length > 0 && (char.IsLetter(w[0]) || w[0] == '_') && w.All(c => char.IsLetterOrDigit(c) || c == '_');
 
-        /// <summary>An integer literal (decimal, hex, with C suffixes, in parentheses, negated), or null.</summary>
+        /// <summary>An integer literal (decimal, hex, octal `0755`, binary `0b101`, with C suffixes, in parentheses, negated), or null.</summary>
         private static long? Integer(string text)
         {
             text = text.Trim();
@@ -1078,6 +1078,19 @@ namespace Larva.Bindings
             {
                 if (!long.TryParse(text[2..], System.Globalization.NumberStyles.HexNumber, null, out value))
                     return null;
+            }
+            else if (text.StartsWith("0b", StringComparison.OrdinalIgnoreCase))
+            {
+                if (text.Length < 3 || text.Length > 66 || !text[2..].All(c => c is '0' or '1'))
+                    return null;
+                value = Convert.ToInt64(text[2..], 2);
+            }
+            else if (text.Length > 1 && text[0] == '0' && text.All(char.IsAsciiDigit))
+            {
+                // C's octal: a leading zero (`0755` is 493).
+                if (text.Length > 22 || !text.All(c => c is >= '0' and <= '7'))
+                    return null;
+                value = Convert.ToInt64(text, 8);
             }
             else if (!long.TryParse(text, out value))
                 return null;

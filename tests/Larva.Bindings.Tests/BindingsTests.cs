@@ -129,6 +129,32 @@ public sealed class BindingsTests : CheckedTest
             string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
     }
 
+    /// <summary>C's integer literals: a leading zero is octal (`0755` is 493, not 755), `0b` binary, `0x` hex, in #defines and enums alike.</summary>
+    [Fact]
+    public void Octal_and_binary_literals_are_read_as_C_reads_them()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #define MODE 0755
+            #define MASK 0777u
+            #define HEX 0x1F
+            #define BIN 0b101
+            #define ZERO 0
+            #define TEN 10
+            #define NEG -010
+            #define BAD 089
+            enum E { EA = 0755, EB = 010, EC, ED = 0b11 };
+            """, "lib.dll");
+        Log(description);
+        Check("octal #defines, with a suffix, negated; `0` and plain decimals as before; `089` is not a number",
+            description.Contains("const MODE = 493\n") && description.Contains("const MASK = 511\n") && description.Contains("const NEG = -8\n")
+            && description.Contains("const ZERO = 0\n") && description.Contains("const TEN = 10\n") && !description.Contains("BAD"));
+        Check("hex and binary", description.Contains("const HEX = 31\n") && description.Contains("const BIN = 5\n"));
+        Check("enum members: octal values, the next member counts on from them, binary",
+            description.Contains("const EA = 493\n") && description.Contains("const EB = 8\n") && description.Contains("const EC = 9\n") && description.Contains("const ED = 3\n")
+            && reader.Enums.Single().Members.Select(m => m.Value).SequenceEqual([493, 8, 9, 3]));
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
