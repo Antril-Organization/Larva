@@ -4127,6 +4127,18 @@ static void collect_major(int walk_stack) {
     for (size_t i = 0; i < pending; i++)
         mark_object(header_of(to_finalize[i]));
     drain_marks();
+    /* Remembered and carded objects go back to plain old ones: the next store into them passes the barrier again (a major
+       collection without a minor one before it, when the nursery was empty, would otherwise leave them unseen). Before the
+       sweep: a remembered object that dies in it is freed memory afterwards, which must not be written. */
+    for (size_t i = 0; i < remembered_count; i++) {
+        GcHeader *header = header_of(remembered[i]);
+        if (header->age == AGE_REMEMBERED)
+            header->age = AGE_OLD;
+    }
+    for (size_t i = 0; i < carded_count; i++)
+        header_of(carded[i])->flags &= (uint8_t)~FLAG_CARDED;
+    remembered_count = 0;
+    carded_count = 0;
     /* Sweep (objects in an open arena region belong to it, not to the collector). */
     int64_t survived = 0;
     for (size_t i = 0; i < live.capacity; i++) {
@@ -4232,17 +4244,6 @@ static void collect_major(int walk_stack) {
                 memset(large_info(header)->cards, 0, ((size_t)large_info(header)->size + CARD - 1) / CARD);
         }
     }
-    /* Remembered and carded objects go back to plain old ones: the next store into them passes the barrier again (a major
-       collection without a minor one before it, when the nursery was empty, would otherwise leave them unseen). */
-    for (size_t i = 0; i < remembered_count; i++) {
-        GcHeader *header = header_of(remembered[i]);
-        if (header->age == AGE_REMEMBERED)
-            header->age = AGE_OLD;
-    }
-    for (size_t i = 0; i < carded_count; i++)
-        header_of(carded[i])->flags &= (uint8_t)~FLAG_CARDED;
-    remembered_count = 0;
-    carded_count = 0;
     old_bytes = survived;
     old_objects = gc_live;
     /* The next major collection waits until the old generation doubles: its work per allocation stays bounded. */
