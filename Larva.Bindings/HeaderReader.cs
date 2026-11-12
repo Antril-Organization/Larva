@@ -78,10 +78,27 @@ namespace Larva.Bindings
         private readonly Dictionary<string, long> constantValues = new(StringComparer.Ordinal);
         private readonly List<string> functions = [];
         private readonly HashSet<string> functionNames = new(StringComparer.Ordinal);
-        private readonly bool longIs64;
+        private readonly bool longIs64, wcharIs32, longDoubleIs64;
 
-        /// <param name="longIs64">Whether C's <c>long</c> is 64 bits (LP64, Linux and macOS) or 32 (Windows).</param>
-        public HeaderReader(bool? longIs64 = null) => this.longIs64 = longIs64 ?? !OperatingSystem.IsWindows();
+        /// <param name="longIs64">Whether C's <c>long</c> is 64 bits (LP64, Linux and macOS) or 32 (Windows). Default: the host's.</param>
+        /// <param name="wcharIs32">
+        /// Whether <c>wchar_t</c> is 32 bits (Linux, macOS: <c>u32</c>) or 16 (Windows: <c>wchar</c>, a UTF-16 string as a
+        /// parameter). Default: as <paramref name="longIs64"/> says (every LP64 platform has the 32-bit one).
+        /// </param>
+        /// <param name="longDoubleIs64">
+        /// Whether <c>long double</c> is a plain double (Windows, macOS on ARM: <c>f64</c>) or wider (x86-64 Linux: 16 bytes,
+        /// a type the bindings cannot carry). Default: the host's when <paramref name="longIs64"/> is not given, else not LP64.
+        /// </param>
+        public HeaderReader(bool? longIs64 = null, bool? wcharIs32 = null, bool? longDoubleIs64 = null)
+        {
+            this.longIs64 = longIs64 ?? !OperatingSystem.IsWindows();
+            this.wcharIs32 = wcharIs32 ?? this.longIs64;
+            this.longDoubleIs64 = longDoubleIs64 ?? (longIs64 is null ? HostLongDoubleIs64 : !this.longIs64);
+        }
+
+        /// <summary>Whether this machine's C `long double` is a plain double: Windows, and macOS on ARM.</summary>
+        public static bool HostLongDoubleIs64 => OperatingSystem.IsWindows()
+            || OperatingSystem.IsMacOS() && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
 
         /// <summary>Reads <paramref name="header"/> (its text) for <paramref name="library"/>: the description text.</summary>
         /// <summary>
@@ -961,10 +978,11 @@ namespace Larva.Bindings
                 }
                 return Pointers("void", stars); // opaque: pointers to it are void*
             }
-            string? primitive = Primitive(Canonical(words));
+            string canonical = Canonical(words);
+            string? primitive = Primitive(canonical);
             if (primitive is null)
             {
-                why = $"unknown type `{baseText}`";
+                why = canonical == "long double" ? "`long double` is wider than f64 on this platform (16 bytes): not a type the bindings carry" : $"unknown type `{baseText}`";
                 return null;
             }
             if (primitive == "char" || primitive == "wchar")
@@ -1064,7 +1082,7 @@ namespace Larva.Bindings
         {
             "void" => "void",
             "char" or "signed char" => "char", "unsigned char" => "u8",
-            "wchar_t" or "WCHAR" or "char16_t" => "wchar",
+            "wchar_t" => wcharIs32 ? "u32" : "wchar", "WCHAR" or "char16_t" => "wchar",
             "short" or "short int" or "signed short" or "signed short int" or "int16_t" or "SHORT" or "INT16" => "i16",
             "unsigned short" or "unsigned short int" or "uint16_t" or "USHORT" or "WORD" or "UINT16" => "u16",
             "int" or "signed int" or "int32_t" or "INT" or "INT32" or "BOOL" or "LONG32" or "errno_t" => "i32",
@@ -1074,7 +1092,7 @@ namespace Larva.Bindings
             "long long" or "long long int" or "signed long long" or "int64_t" or "__int64" or "LONGLONG" or "INT64" or "ptrdiff_t" or "intptr_t" or "ssize_t" or "LONG_PTR" or "INT_PTR" => "i64",
             "unsigned long long" or "unsigned long long int" or "uint64_t" or "unsigned __int64" or "ULONGLONG" or "UINT64" or "size_t" or "uintptr_t" or "rsize_t" or "ULONG_PTR" or "UINT_PTR" or "DWORD64" or "DWORD_PTR" or "SIZE_T" => "u64",
             "int8_t" or "INT8" => "i8", "uint8_t" or "BYTE" or "UINT8" or "UCHAR" => "u8",
-            "float" or "FLOAT" => "f32", "double" or "DOUBLE" or "long double" => "f64",
+            "float" or "FLOAT" => "f32", "double" or "DOUBLE" => "f64", "long double" => longDoubleIs64 ? "f64" : null,
             "bool" or "_Bool" or "BOOLEAN" => "bool",
             "HANDLE" or "HMODULE" or "HINSTANCE" or "HWND" or "FARPROC" or "LPVOID" or "PVOID" or "HGLOBAL" or "HLOCAL" or "HDC" => "void*",
             "LPCSTR" or "LPSTR" or "PCSTR" or "PSTR" => "char*",

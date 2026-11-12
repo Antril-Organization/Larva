@@ -242,6 +242,35 @@ public sealed class BindingsTests : CheckedTest
             string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
     }
 
+    /// <summary>`long double` and `wchar_t` have the platform's sizes: 8 and 2 bytes on Windows, 16 and 4 on x86-64 Linux.</summary>
+    [Fact]
+    public void Long_double_and_wchar_t_are_sized_by_the_platform()
+    {
+        const string header = """
+            typedef struct { long double d; wchar_t w; } Wide;
+            long double LD(long double x);
+            void W(wchar_t w, const wchar_t* text, wchar_t* out, Wide* p);
+            """;
+        var windows = new HeaderReader(longIs64: false);
+        string windowsDescription = windows.Read(header, "lib.dll");
+        Log(windowsDescription);
+        Check("Windows: long double is f64, wchar_t is u16 and a UTF-16 string as a parameter",
+            windowsDescription.Contains("struct Wide { f64 d; u16 w }\n") && windowsDescription.Contains("LD(f64 x) : f64\n")
+            && windowsDescription.Contains("W(u16 w, String<u16>? text, String<u16>? out, Wide* p)\n"));
+        var linux = new HeaderReader(longIs64: true);
+        string linuxDescription = linux.Read(header, "lib.so");
+        Log(linuxDescription);
+        Check("LP64: wchar_t is u32 (pointers to it u32*, no UTF-16 string); long double is 16 bytes, so LD is skipped and Wide opaque, each saying why",
+            linuxDescription.Contains("W(u32 w, u32* text, u32* out, void* p)\n") && !linuxDescription.Contains("LD(") && !linuxDescription.Contains("struct Wide")
+            && linux.Skipped.Any(s => s.Name == "LD" && s.Why.Contains("long double")) && linux.Opaque.Any(o => o.Name == "Wide" && o.Why.Contains("long double")),
+            string.Join("; ", linux.Skipped.Select(s => $"{s.Name}: {s.Why}").Concat(linux.Opaque.Select(o => $"{o.Name}: {o.Why}"))));
+        var mac = new HeaderReader(longIs64: true, longDoubleIs64: true);
+        Check("given explicitly (macOS on ARM: LP64 with a plain-double long double)", mac.Read(header, "lib.dylib").Contains("struct Wide { f64 d; u32 w }\n"));
+        var host = new HeaderReader();
+        Check("by default the host's sizes", host.Read(header, "lib").Contains("struct Wide {") == HeaderReader.HostLongDoubleIs64
+            && host.Read(header, "lib").Contains(OperatingSystem.IsWindows() ? "W(u16 w," : "W(u32 w,"));
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
