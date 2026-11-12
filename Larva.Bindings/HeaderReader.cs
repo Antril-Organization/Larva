@@ -896,13 +896,30 @@ namespace Larva.Bindings
                 // A pointer to a function pointer (an out parameter that receives one): an untyped pointer.
                 return stars > 0 ? Pointers("void", stars) : functionType;
             }
+            // Whether the pointee is const (`const char*`, `char const*`, `LPCSTR`): a `const` before the first `*` of a
+            // level qualifies that level's base type, which is the pointee unless a typedef below it adds the pointer
+            // (`const LPSTR` is `char* const`: a const pointer to writable chars).
+            bool constPointee = ConstBase(Tokens(c), out _);
             // typedef aliases, followed to the end
             for (int guard = 0; guard < 16 && words.Count == 1 && typedefs.TryGetValue(words[0], out string? target); guard++)
             {
                 var targetWords = Tokens(target);
                 stars += targetWords.Count(w => w == "*");
+                bool constTarget = ConstBase(targetWords, out bool starBelow);
+                if (starBelow)
+                    constPointee = constTarget; // the const seen so far qualified this pointer, not what it points to
+                else
+                    constPointee |= constTarget;
                 words = targetWords.Where(w => w is not ("const" or "volatile" or "*")).ToList();
                 baseText = string.Join(' ', words);
+            }
+            // Windows' string pointer names when no header defined them: `const char*` / `char*` (and wide).
+            if (words.Count == 1 && words[0] is "LPCSTR" or "PCSTR" or "LPSTR" or "PSTR" or "LPCWSTR" or "PCWSTR" or "LPWSTR" or "PWSTR")
+            {
+                stars++;
+                constPointee = words[0] is "LPCSTR" or "PCSTR" or "LPCWSTR" or "PCWSTR";
+                words = [words[0].EndsWith("WSTR", StringComparison.Ordinal) ? "wchar_t" : "char"];
+                baseText = words[0];
             }
             string tagOrName = words[0] is "struct" or "union" ? words[^1] : words[0];
             if (StructName(tagOrName) is { } structName)
@@ -931,10 +948,11 @@ namespace Larva.Bindings
             }
             if (primitive == "char" || primitive == "wchar")
             {
-                // char* as a parameter is a C string (a copy with its terminator; null when C takes NULL), as a result a
+                // `const char*` as a parameter is a C string (a copy with its terminator; null when C takes NULL);
+                // `char*` a buffer C writes into (bytes the caller owns: a copy would lose what C wrote); as a result a
                 // pointer to bytes.
                 if (stars == 1 && parameter)
-                    return primitive == "char" ? "str?" : "String<u16>?";
+                    return constPointee ? primitive == "char" ? "str?" : "String<u16>?" : primitive == "char" ? "u8*" : "u16*";
                 return Pointers(primitive == "char" ? "i8" : "u16", stars);
             }
             if (primitive == "void" && stars == 0 && (parameter || field))
@@ -943,6 +961,17 @@ namespace Larva.Bindings
                 return null;
             }
             return Pointers(primitive, stars);
+        }
+
+        /// <summary>
+        /// Whether a `const` qualifies the base type of one level of a C type (before its first `*`, or anywhere when it
+        /// has none), and whether the level has a `*` of its own.
+        /// </summary>
+        private static bool ConstBase(List<string> tokens, out bool hasStar)
+        {
+            int star = tokens.IndexOf("*");
+            hasStar = star >= 0;
+            return tokens.Take(hasStar ? star : tokens.Count).Contains("const");
         }
 
         /// <summary>The struct with layout behind a tag or typedef name (aliases followed), or null when it has none.</summary>
@@ -1017,8 +1046,6 @@ namespace Larva.Bindings
             "float" or "FLOAT" => "f32", "double" or "DOUBLE" or "long double" => "f64",
             "bool" or "_Bool" or "BOOLEAN" => "bool",
             "HANDLE" or "HMODULE" or "HINSTANCE" or "HWND" or "FARPROC" or "LPVOID" or "PVOID" or "HGLOBAL" or "HLOCAL" or "HDC" => "void*",
-            "LPCSTR" or "LPSTR" or "PCSTR" or "PSTR" => "char*",
-            "LPCWSTR" or "LPWSTR" or "PCWSTR" or "PWSTR" => "wchar*",
             _ => null,
         };
 

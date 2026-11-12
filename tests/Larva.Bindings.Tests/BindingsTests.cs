@@ -222,6 +222,9 @@ public sealed class BindingsTests : CheckedTest
             && realDescription.Contains("GetSystemTime(SYSTEMTIME* ") && realDescription.Contains("GetSystemTimeAsFileTime(FILETIME* ")
             && realDescription.Contains("union LARGE_INTEGER {") && realDescription.Contains("QueryPerformanceCounter(LARGE_INTEGER* "),
             $"{realParsed.Structs.Count} structs, {realParsed.Functions.Count} functions, {real.Skipped.Count} skipped, {real.Opaque.Count} opaque, {watch.ElapsedMilliseconds} ms");
+        Check("a buffer kernel32 writes into (LPSTR) is a u8* parameter, a name it reads (LPCSTR) a str?",
+            realDescription.Contains(" hModule, u8* lpFilename, u32 nSize) : u32\n") && realDescription.Contains("GetModuleHandleA(str? lpModuleName) : ")
+            && realDescription.Contains("GetEnvironmentVariableA(str? lpName, u8* lpBuffer, u32 nSize) : u32\n"));
         var known = new HashSet<string>(Exports.Read(System32("kernel32.dll")));
         int exported = realParsed.Functions.Count(f => known.Contains(f.Entry));
         Check("hundreds of its functions are kernel32 exports", exported > 300, $"{exported} of {realParsed.Functions.Count}; e.g. {string.Join(" | ", real.Opaque.Take(4).Select(o => $"{o.Name}: {o.Why}"))}");
@@ -266,6 +269,43 @@ public sealed class BindingsTests : CheckedTest
             BindingDescription.Layout("Packed", parsed.Structs) == (7, 1) && BindingDescription.Layout("Packed2", parsed.Structs) == (10, 2) && BindingDescription.Layout("Natural", parsed.Structs) == (16, 8) &&
             BindingDescription.Layout("LARGE_INTEGER", parsed.Structs) == (8, 8) && BindingDescription.Layout("Value", parsed.Structs) == (8, 8)
             && BindingDescription.Layout("Tagged", parsed.Structs) == (16, 8) && BindingDescription.Layout("Small", parsed.Structs) == (2, 2) && BindingDescription.Layout("Pair", parsed.Structs) == (4, 2));
+    }
+
+    /// <summary>`const char*` is an input string; a writable `char*` is a buffer C fills (bytes), never a string copied in and lost.</summary>
+    [Fact]
+    public void Char_buffers_are_byte_pointers_and_const_chars_are_strings()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            typedef char CHAR;
+            typedef CHAR* LPSTR;
+            typedef const CHAR* LPCSTR;
+            typedef const char CCHAR;
+            typedef unsigned long DWORD;
+            DWORD GetModuleFileNameA(void* hModule, LPSTR lpFilename, DWORD nSize);
+            void* GetModuleHandleA(LPCSTR lpModuleName);
+            int Fill(char* buffer, int n);
+            int FillW(wchar_t* buffer, int n);
+            int Read(const char* text);
+            int ReadW(const wchar_t* text);
+            int ReadAfter(char const* text);
+            int ReadAlias(CCHAR* text);
+            int ConstPointer(const LPSTR buffer);
+            int FillPointer(char* const buffer);
+            char* Dup(const char* s);
+            int Many(char** list);
+            """, "kernel32.dll", "K32");
+        Log(description);
+        Check("a writable char* (also through LPSTR, also a const pointer to it) is a u8* buffer; a wchar_t* a u16* one",
+            description.Contains("GetModuleFileNameA(void* hModule, u8* lpFilename, u32 nSize) : u32\n") && description.Contains("Fill(u8* buffer, i32 n) : i32\n")
+            && description.Contains("FillW(u16* buffer, i32 n) : i32\n") && description.Contains("ConstPointer(u8* buffer) : i32\n") && description.Contains("FillPointer(u8* buffer) : i32\n"));
+        Check("a const char* (written before or after, through LPCSTR, through a const typedef) is a str?; a const wchar_t* a String<u16>?",
+            description.Contains("GetModuleHandleA(str? lpModuleName) : void*\n") && description.Contains("Read(str? text) : i32\n") && description.Contains("ReadW(String<u16>? text) : i32\n")
+            && description.Contains("ReadAfter(str? text) : i32\n") && description.Contains("ReadAlias(str? text) : i32\n"));
+        Check("results and deeper pointers stay pointers to bytes", description.Contains("Dup(str? s) : i8*\n") && description.Contains("Many(i8** list) : i32\n"));
+        var withoutTypedefs = new HeaderReader(longIs64: false).Read("int A(LPSTR s); int B(LPCSTR s); int C(LPWSTR s); int D(LPCWSTR s);", "kernel32.dll", "K32");
+        Check("Windows' string names without their typedefs: the const ones strings, the others buffers",
+            withoutTypedefs.Contains("A(u8* s) : i32\n") && withoutTypedefs.Contains("B(str? s) : i32\n") && withoutTypedefs.Contains("C(u16* s) : i32\n") && withoutTypedefs.Contains("D(String<u16>? s) : i32\n"), withoutTypedefs);
     }
 
     // ── SDL3 ──
