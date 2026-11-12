@@ -246,6 +246,30 @@ public sealed unsafe class AotTests : CheckedTest
         Check("worker_promote writes the type's domain into the new header", Regex.IsMatch(source, @"worker_promote[\s\S]{0,800}header->domain = \(int8_t\)\(type->flags >> 8\);"));
     }
 
+    /// <summary>
+    /// A raw copy (mem.copy) of handles into an old array is a store of handles the compiled code puts no write barrier
+    /// on: the runtime's copy must card the array (when its type holds handles), or the next minor collection leaves the
+    /// copied slots pointing at forwarded nursery objects. LARVA_GC_VERIFY reports such a slot after every collection.
+    /// </summary>
+    [Fact]
+    public void Llvm_raw_copies_of_handles_into_old_objects_take_the_write_barrier()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.CopyBarrierProgram() with { Name = "copy" }, "copy.lvo");
+        string exe = Path.Combine(Directory, "copy-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "copy_churn", "-o", exe, program);
+        Check("llvm: larva native --exe --entry copy_churn", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, ["300000"], stats: true, verify: true);
+        var barriers = Regex.Match(errors, @"barrier calls (\d+)");
+        Check("llvm: copy.exe 300000 = 299999 under LARVA_GC_VERIFY: the copied handles survive the minor collections, each copy a barrier call",
+            exit == 0 && output.Trim() == "299999" && !errors.Contains("larva verify") && Regex.IsMatch(errors, @"collections [1-9]\d* \(")
+            && barriers.Success && long.Parse(barriers.Groups[1].Value) >= 300000 && errors.Contains("errors 0"),
+            $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static string Save(IrModule module, string file, GcConfig? gc = null)
@@ -259,7 +283,7 @@ public sealed unsafe class AotTests : CheckedTest
     }
 
     private static (int Exit, string Output, string Errors) Execute(string exe, string[]? arguments = null, bool stress = false, bool stats = false, int nursery = 0,
-        bool generations = true)
+        bool generations = true, bool verify = false)
     {
         var start = new ProcessStartInfo(exe) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         foreach (var argument in arguments ?? [])
@@ -272,6 +296,8 @@ public sealed unsafe class AotTests : CheckedTest
             start.Environment["LARVA_GC_NURSERY"] = nursery.ToString();
         if (!generations)
             start.Environment["LARVA_GC_GENERATIONS"] = "0";
+        if (verify)
+            start.Environment["LARVA_GC_VERIFY"] = "1";
         using var process = Process.Start(start)!;
         var errors = process.StandardError.ReadToEndAsync();
         string output = process.StandardOutput.ReadToEnd();

@@ -1977,6 +1977,7 @@ static int table_remove(Table *t, uintptr_t key) {
 /* ── State ───────────────────────────────────────────────────────── */
 
 static Table live;          /* payload / cell → size, kind (heap cells, large gc objects) */
+static int large_index_stale = 1;  /* a large object was made or freed since index_large (a copy into one looks it up) */
 static Table frames;        /* function address → index into root_sets */
 static Table finalizers;    /* gc payload → its finalizer */
 static Table region_of;     /* gc payload → its arena region + 1 */
@@ -2525,6 +2526,8 @@ static void *old_allocate(const LarvaType *type, int64_t payload) {
         ((LargeInfo *)block)->size = payload;
         bytes_since += total;
     }
+    if (!small)
+        large_index_stale = 1;
     header->type = type;
     header->refcount = 1;
     header->domain = (int8_t)(type->flags >> 8);
@@ -2615,6 +2618,7 @@ static void gc_free(void *payload) {
         return;
     }
     table_remove(&live, (uintptr_t)payload);
+    large_index_stale = 1;
     if (header->flags & FLAG_LARGE) {
         free(large_info(header)->cards);
         larva_aligned_free(large_info(header));
@@ -3163,6 +3167,7 @@ static int compare_addresses(const void *a, const void *b) {
 }
 
 static void index_large(void) {
+    large_index_stale = 0;
     large_count = 0;
     for (size_t i = 0; i < live.capacity; i++) {
         Entry *e = &live.entries[i];
@@ -4473,10 +4478,55 @@ LARVA_API void *larva_mem_alloc(int64_t size) {
 
 LARVA_API void larva_mem_free(void *block) { free(block); }
 
-/* `count` bytes from `source` to `target` (the ranges may overlap). */
+/* The old gc object (a chunk slot or a large object, never a young one) that `address` lies in, or NULL. Under the
+   runtime's lock when threads exist (the large index is rebuilt here when a large object was made or freed since). */
+static GcHeader *old_object_at(uintptr_t address) {
+    if (address >= small_low && address < small_high) {
+        uintptr_t base = address & ~(uintptr_t)(CHUNK - 1);
+        if (!chunk_map[(base - small_low) / CHUNK])
+            return NULL;
+        Chunk *chunk = (Chunk *)base;
+        uintptr_t offset = address - base;
+        if (offset < CHUNK_DATA)
+            return NULL;
+        size_t slot = (offset - CHUNK_DATA) / chunk->block;
+        if (slot >= chunk->bump)
+            return NULL;
+        GcHeader *header = (GcHeader *)chunk_slot(chunk, slot);
+        return header->domain == SLOT_FREE ? NULL : header;
+    }
+    if (live.count == 0)
+        return NULL;
+    if (large_index_stale)
+        index_large();
+    if (large_count == 0 || address < large_starts[0] - GC_HEADER)
+        return NULL;
+    size_t low = 0, high = large_count;
+    while (high - low > 1) {
+        size_t middle = (low + high) / 2;
+        if (large_starts[middle] - GC_HEADER <= address)
+            low = middle;
+        else
+            high = middle;
+    }
+    return address <= large_ends[low] ? header_of((void *)large_starts[low]) : NULL;
+}
+
+/* `count` bytes from `source` to `target` (the ranges may overlap). A copy into an old gc object that holds handles is a
+   store of handles into it: the generational write barrier applies (the object is remembered, or its cards marked), or a
+   minor collection would leave the copied handles pointing into the nursery. A copy into a young object, into memory
+   that is no gc object, or into an object without handles costs the lookup only. */
 LARVA_API void larva_mem_copy(void *target, const void *source, int64_t count) {
-    if (count > 0)
-        memmove(target, source, (size_t)count);
+    if (count <= 0)
+        return;
+    memmove(target, source, (size_t)count);
+    if (!nursery_high || in_nursery(target))
+        return;
+    int locked = rt_enter();
+    GcHeader *header = old_object_at((uintptr_t)target);
+    if (header && header->age == AGE_OLD && ((header->type->flags & TYPE_CONSERVATIVE) || header->type->handles > 0))
+        gc_wb_unlocked((char *)header + GC_HEADER, target, count);
+    rt_leave(locked);
 }
 
 /* The first `count` bytes of `left` and `right` compared as unsigned values: < 0, 0 or > 0. */

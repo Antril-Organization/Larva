@@ -215,6 +215,47 @@ internal static class NativePrograms
     }
 
     /// <summary>
+    /// unsafe copy_churn(n: i64) -> i32 { let arr = gc [gc Point; 100000]; for i in 0..n { let tmp = gc [gc Point; 1]; tmp[0] = gc Point{i,i};
+    /// mem.copy(&amp;arr[0], &amp;tmp[0], 8) } arr[0].y }  — every iteration copies a young handle into the old array by a raw copy
+    /// (mem.copy, not a store: no write barrier in compiled code), so the runtime's copy must card the array, or the minor
+    /// collections the churn triggers leave arr[0] pointing into the nursery (→ n - 1; LARVA_GC_VERIFY=1 reports the slot).
+    /// </summary>
+    public static IrModule CopyBarrierProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var pointer = IrType.PtrMut(IrType.U8);
+        var f = new FunctionBuilder("copy_churn", IrType.I32) { Unsafe = true };
+        int n = f.Argument(IrType.I64, "n");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int zero = f.Local(IrType.I64, "zero");
+        int p = f.Local(Point, "p", mutable: true);
+        int arr = f.Local(IrType.Gc(new ArrayType(gcPoint)), "arr");
+        int tmp = f.Local(IrType.Gc(new ArrayType(gcPoint)), "tmp", mutable: true);
+        int targetRef = f.Local(IrType.RefMut(gcPoint), "target_ref", mutable: true), sourceRef = f.Local(IrType.RefMut(gcPoint), "source_ref", mutable: true);
+        int target = f.Local(pointer, "target", mutable: true), source = f.Local(pointer, "source", mutable: true);
+        int moved = f.Local(IrType.Unit, "moved", mutable: true);
+        int last = f.Local(gcPoint, "last", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int head = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(zero, Int(0, IrType.I64))
+         .Assign(arr, Rvalue.NewArray(AllocKind.Gc, gcPoint, Int(100000, IrType.I64)))
+         .Assign(i, Int(0, IrType.I64)).Goto(head);
+        f.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(c), body, exit);
+        f.At(body)
+         .Assign(tmp, Rvalue.NewArray(AllocKind.Gc, gcPoint, Int(1, IrType.I64)))
+         .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+         .Assign(new Place(tmp).Deref().Index(zero), Rvalue.Gc(Move(p)))
+         .Assign(targetRef, Rvalue.RefMut(new Place(arr).Deref().Index(zero)))
+         .Assign(target, Rvalue.Cast(Move(targetRef), pointer))
+         .Assign(sourceRef, Rvalue.RefMut(new Place(tmp).Deref().Index(zero)))
+         .Assign(source, Rvalue.Cast(Move(sourceRef), pointer))
+         .Assign(moved, new IntrinsicRvalue("mem.copy", [Copy(target), Copy(source), Int(8, IrType.I64)]))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        f.At(exit).Assign(last, Copy(new Place(arr).Deref().Index(zero))).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(last).Deref().Field(1))).Return();
+        return new IrModule(GcPrograms.StructDefs, [f.Build()]);
+    }
+
+    /// <summary>
     /// unsafe remember_churn(n: i64) -> i32 { let mut last; for i in 0..n { let arr = gc [gc Point; 100000]; arr[0] = gc Point{i,i}; last = arr[0] } last.y }
     /// — every iteration stores a handle into a large array (800 KB: old at once, its memory given back to the system when
     /// it dies), so the write barrier lists it (cards), and it dies before the next collection (→ n - 1).
