@@ -53,11 +53,16 @@ internal static class SourceBuild
         }
     }
 
-    public static int Lib(string[] args)
+    /// <summary>
+    /// <c>larva lib</c>. <paramref name="projectOptions"/>: what the frontend is told when a project is being compiled
+    /// (<see cref="Larva.Build.QueenProject.FrontendOptions"/>: its BUILD chunk merged with this machine's defaults, as
+    /// <c>larva build</c> does); without one, this machine's defaults alone.
+    /// </summary>
+    public static int Lib(string[] args, JsonObject? projectOptions = null)
     {
         string? output = null, core = null;
         var inputs = new List<string>();
-        var options = Larva.Build.LarvaDefaults.FrontendOptions();
+        var options = projectOptions ?? Larva.Build.LarvaDefaults.FrontendOptions();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "-o" && i + 1 < args.Length)

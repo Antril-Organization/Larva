@@ -237,7 +237,9 @@ internal static class HiveCommand
             {
                 Directory.CreateDirectory(work);
                 string library = Path.Combine(work, project.Name + ".dll");
-                if (SourceBuild.Lib(["-o", library, .. project.AllLibraries().Where(QueenProject.IsAssembly), .. sources]) != 0)
+                // Compiled as `larva build` compiles it: with the project's BUILD settings (this machine's defaults fill in
+                // what the chunk does not set), not with the defaults alone.
+                if (SourceBuild.Lib(["-o", library, .. project.AllLibraries().Where(QueenProject.IsAssembly), .. sources], project.FrontendOptions()) != 0)
                     throw new HiveException($"{project.Name} does not compile: nothing was packed");
             }
             var name = HivePacker.NameOf(project);
