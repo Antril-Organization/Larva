@@ -666,13 +666,24 @@ into namespace System
 
 			FormatInteger(i64 value, str format) : str => FormatInteger((u64)value, 64, true, format);
 
-			/// An f64 by `format` (no format, G or R: the shortest text that reads back as the same number).
+			/// A finite f64 as `print` writes it: the shortest digits that read back as the same number, in exponent
+			/// form (`1e+20`, `1.5e-07`) when the exponent is below -4 or at least 15.
+			ShortestDouble(f64 value) : str
+			{
+				NumberText text = new NumberText();
+				if (Float64.Bits(value) < 0)
+					text.Add('-');
+				General(text, Shortest(value), 0, 15, 'g');
+				return text.Made();
+			}
+
+			/// An f64 by `format` (G or R: the shortest text that reads back as the same number; `nan`, `inf`, `-inf`).
 			FormatDouble(f64 value, str format) : str
 			{
 				if (value != value)
-					return "NaN";
+					return "nan";
 				if (value - value != 0)
-					return value > 0 ? "Infinity" : "-Infinity";
+					return value > 0 ? "inf" : "-inf";
 				u8 letter = Letter(format);
 				i32 precision = Precision(format);
 				NumberText text = new NumberText();
@@ -692,9 +703,9 @@ into namespace System
 			FormatSingle(f32 value, str format) : str
 			{
 				if (value != value)
-					return "NaN";
+					return "nan";
 				if (value - value != 0)
-					return value > 0 ? "Infinity" : "-Infinity";
+					return value > 0 ? "inf" : "-inf";
 				u8 letter = Letter(format);
 				i32 precision = Precision(format);
 				NumberText text = new NumberText();
@@ -718,7 +729,7 @@ into namespace System
 				i32 biased = (i32)((bits >> 10) & 31);
 				u64 mantissa = (u64)(bits & 1023);
 				if (biased == 31)
-					return mantissa != 0 ? "NaN" : negative ? "-Infinity" : "Infinity";
+					return mantissa != 0 ? "nan" : negative ? "-inf" : "inf";
 				i32 e2 = -24;
 				if (biased != 0)
 				{
@@ -753,7 +764,7 @@ into namespace System
 				u256 hidden = (u256)1 << fractionBits;
 				u256 mantissa = bits & (hidden - 1);
 				if (biased == exponentMask)
-					return mantissa != 0 ? "NaN" : negative ? "-Infinity" : "Infinity";
+					return mantissa != 0 ? "nan" : negative ? "-inf" : "inf";
 				i32 e2 = 1 - bias - fractionBits;
 				if (biased != 0)
 				{

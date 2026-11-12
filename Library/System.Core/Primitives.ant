@@ -195,18 +195,42 @@ into namespace System
 			return i == n;
 		}
 
+		/// What a trimmed text names besides a number: 1 for nan (`nan`, `NaN`), 2 for +inf (`inf`, `+inf`,
+		/// `Infinity`, `+Infinity`), 3 for -inf (`-inf`, `-Infinity`), 0 otherwise.
+		static Special(str trimmed) : i32
+		{
+			if (trimmed == "nan" || trimmed == "NaN" || trimmed == "-nan")
+				return 1;
+			if (trimmed == "inf" || trimmed == "+inf" || trimmed == "Infinity" || trimmed == "+Infinity")
+				return 2;
+			if (trimmed == "-inf" || trimmed == "-Infinity")
+				return 3;
+			return 0;
+		}
+
 		public:
 			/// As text by a format: F, N, E, P, G, R and a precision (`(2.5).ToString("F2")` is "2.50").
 			ToString(str format) : str => NumberFormat.FormatDouble(this, format);
 
-			/// The number as `print` writes it (up to 15 significant digits).
+			/// The shortest text that reads back as the same number, as `print` writes it (15 significant digits when
+			/// they are enough, else 16 or 17); `nan`, `inf` and `-inf` for the values that are no number.
 			ToString() : str
 			{
+				if (this != this)
+					return "nan";
+				if (this - this != 0)
+					return this > 0 ? "inf" : "-inf";
 				i64 count = FormatInto(this);
 				u8[] digits = new u8[(i32)count];
+				u16[] wide = new u16[(i32)count];
 				loop (i32 i = 0..digits.Length)
+				{
 					digits[i] = (u8)FormattedUnit(i);
-				return new String<u8>(digits);
+					wide[i] = digits[i];
+				}
+				if (ParseBits(wide) == BitsOf(this))
+					return new String<u8>(digits);
+				return NumberFormat.ShortestDouble(this);
 			}
 
 			CompareTo(f64 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
@@ -222,16 +246,14 @@ into namespace System
 			static IsInfinity(f64 x) : bool => x - x != 0 && x == x;
 			static IsFinite(f64 x) : bool => x - x == 0;
 
-			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			/// The number `text` writes (digits, a point, an exponent; `nan`, `inf`, `-inf` as ToString writes them, or
+			/// `NaN`, `Infinity`, `-Infinity`); a FormatError otherwise.
 			static Parse(str text) : f64
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN")
-					return NaN;
-				if (trimmed == "Infinity" || trimmed == "+Infinity")
-					return PositiveInfinity;
-				if (trimmed == "-Infinity")
-					return NegativeInfinity;
+				i32 special = Special(trimmed);
+				if (special != 0)
+					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
 				if (!IsNumber(trimmed.Units()))
 					throw new FormatError("not a number: " + text);
 				return FromBitsOf(ParseBits(Unicode.ToUtf16(trimmed)));
@@ -241,7 +263,7 @@ into namespace System
 			static TryParse(str text) : f64?
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+				if (Special(trimmed) != 0)
 					return Parse(trimmed);
 				if (!IsNumber(trimmed.Units()))
 					return null;
@@ -723,16 +745,13 @@ into namespace System
 			static IsInfinity(f128 x) : bool => x - x != 0 && x == x;
 			static IsFinite(f128 x) : bool => x - x == 0;
 
-			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			/// The number `text` writes (digits, a point, an exponent; `nan`, `inf`, `-inf`); a FormatError otherwise.
 			static Parse(str text) : f128
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN")
-					return NaN;
-				if (trimmed == "Infinity" || trimmed == "+Infinity")
-					return PositiveInfinity;
-				if (trimmed == "-Infinity")
-					return NegativeInfinity;
+				i32 special = Float64.Special(trimmed);
+				if (special != 0)
+					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
 				if (!Float64.IsNumber(trimmed.Units()))
 					throw new FormatError("not a number: " + text);
 				return Read(trimmed.Units());
@@ -742,7 +761,7 @@ into namespace System
 			static TryParse(str text) : f128?
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+				if (Float64.Special(trimmed) != 0)
 					return Parse(trimmed);
 				if (!Float64.IsNumber(trimmed.Units()))
 					return null;
@@ -886,16 +905,13 @@ into namespace System
 			static IsInfinity(f256 x) : bool => x - x != 0 && x == x;
 			static IsFinite(f256 x) : bool => x - x == 0;
 
-			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			/// The number `text` writes (digits, a point, an exponent; `nan`, `inf`, `-inf`); a FormatError otherwise.
 			static Parse(str text) : f256
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN")
-					return NaN;
-				if (trimmed == "Infinity" || trimmed == "+Infinity")
-					return PositiveInfinity;
-				if (trimmed == "-Infinity")
-					return NegativeInfinity;
+				i32 special = Float64.Special(trimmed);
+				if (special != 0)
+					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
 				if (!Float64.IsNumber(trimmed.Units()))
 					throw new FormatError("not a number: " + text);
 				return Read(trimmed.Units());
@@ -905,7 +921,7 @@ into namespace System
 			static TryParse(str text) : f256?
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+				if (Float64.Special(trimmed) != 0)
 					return Parse(trimmed);
 				if (!Float64.IsNumber(trimmed.Units()))
 					return null;
