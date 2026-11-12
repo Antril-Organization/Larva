@@ -206,6 +206,8 @@ namespace Larva.Hir.Lowering
                 // The program's entry runs every static constructor first.
                 Emit(lowerer.StaticInitFunction, [], new Place(Temp(IrType.Unit)));
             }
+            if (IsIterator)
+                EndIfDisposing();
             Block(body.Block);
             if (open && IsIterator)
                 EndIterator();
