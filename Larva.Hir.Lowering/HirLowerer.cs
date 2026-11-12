@@ -87,6 +87,8 @@ namespace Larva.Hir.Lowering
         /// table during it, holds <see cref="Sync"/>. One lock for all of them (never one per table) means there is no
         /// lock order to get wrong: a helper that adds a function while another holds the lock for a literal just
         /// re-enters it. <see cref="errors"/> has its own lock and takes nothing else while holding it.
+        /// What the threads add lands in thread order; <see cref="OrderParallelAdditions"/> puts it in a fixed order
+        /// afterwards (same program, same IR, same binary).
         /// </summary>
         internal readonly object Sync = new();
         internal readonly List<StructDef> Structs = [];
@@ -109,40 +111,170 @@ namespace Larva.Hir.Lowering
                 return new IrModule([.. Structs], []);
         }
 
+        // ── Additions from several threads ─────────────────
+        //
+        // Every addition made while bodies lower (lambdas, displays, iterator steps, imports, boxes, literal data and
+        // globals) goes through these, which take the lock and record where it came from: the plan (function) being
+        // lowered on this thread and its rank among that plan's additions. OrderParallelAdditions then sorts what the
+        // threads added by (name or content, owning plan, rank) and renumbers every reference, so the module does not
+        // depend on which thread got to the lock first. A memoized helper (a box, $units, an import) is added by the
+        // first plan to need it: its name is unique on its own, so the plan only breaks ties that cannot happen.
+
+        /// <summary>Where an item added during body lowering came from (its sort key).</summary>
+        private readonly record struct Origin(string Key, int Plan, int Rank, string? Renamed);
+
+        private readonly List<Origin> structOrigins = [], functionOrigins = [], globalOrigins = [], dataOrigins = [];
+        private int baseStructs, baseFunctions, baseGlobals, baseData;
+
+        /// <summary>The function of the plan this thread is lowering (-1 outside one), and its additions so far.</summary>
+        [ThreadStatic] private static int currentPlan, currentRank;
+
+        private Origin OriginOf(string key, string? renamed = null) => new(key, currentPlan, currentRank++, renamed);
+
         internal int AddStruct(StructDef def)
         {
             lock (Sync)
             {
+                structOrigins.Add(OriginOf(def.Name));
                 Structs.Add(def);
                 return Structs.Count - 1;
             }
         }
 
-        internal int AddFunction(IrFunction function)
+        /// <summary>
+        /// Adds a function. <paramref name="key"/> orders it when its name is not unique (<c>$NativeCall0</c>: by its
+        /// signature); <paramref name="renamed"/> is the prefix such a function is renamed with (its final index after it).
+        /// </summary>
+        internal int AddFunction(IrFunction function, string? key = null, string? renamed = null)
         {
             lock (Sync)
             {
+                functionOrigins.Add(OriginOf(key ?? function.Name, renamed));
                 Functions.Add(function);
                 return Functions.Count - 1;
             }
         }
 
-        internal int AddGlobal(GlobalDef def)
+        internal int AddGlobal(GlobalDef def, string? key = null, string? renamed = null)
         {
             lock (Sync)
             {
+                globalOrigins.Add(OriginOf(key ?? def.Name, renamed));
                 Globals.Add(def);
                 return Globals.Count - 1;
             }
         }
 
+        /// <summary>Adds static data; it is ordered by its content (two identical entries are interchangeable).</summary>
         internal int AddData(StaticData data)
         {
             lock (Sync)
             {
+                dataOrigins.Add(OriginOf(DataKey(data)));
                 Data.Add(data);
                 return Data.Count - 1;
             }
+        }
+
+        private static string DataKey(StaticData data)
+        {
+            var text = new System.Text.StringBuilder(IR.Text.IrPrinter.FormatType(data.Element)).Append(':').Append(data.Values.Length);
+            foreach (var value in data.Values)
+                text.Append(',').Append(value);
+            return text.ToString();
+        }
+
+        /// <summary>Marks the start of body lowering: what is added from here on is ordered afterwards.</summary>
+        private void BeginParallelAdditions()
+        {
+            baseStructs = Structs.Count;
+            baseFunctions = Functions.Count;
+            baseGlobals = Globals.Count;
+            baseData = Data.Count;
+            structOrigins.Clear();
+            functionOrigins.Clear();
+            globalOrigins.Clear();
+            dataOrigins.Clear();
+        }
+
+        /// <summary>
+        /// Puts what the threads added in a fixed order (see <see cref="Sync"/>) and renumbers every reference to it:
+        /// in the tables, and in the memo dictionaries the rest of the lowering may still consult.
+        /// </summary>
+        private void OrderParallelAdditions()
+        {
+            // old index -> new index of a table's tail, sorted by origin.
+            static int[] Order(int count, List<Origin> origins)
+            {
+                var sorted = Enumerable.Range(0, count)
+                    .OrderBy(i => origins[i].Key, StringComparer.Ordinal).ThenBy(i => origins[i].Plan).ThenBy(i => origins[i].Rank)
+                    .ToArray();
+                var map = new int[count];
+                for (int n = 0; n < count; n++)
+                    map[sorted[n]] = n;
+                return map;
+            }
+            static void Reorder<T>(List<T> table, int head, int[] map)
+            {
+                var tail = table.GetRange(head, map.Length);
+                for (int i = 0; i < map.Length; i++)
+                    table[head + map[i]] = tail[i];
+            }
+            if (structOrigins.Count != Structs.Count - baseStructs || functionOrigins.Count != Functions.Count - baseFunctions
+                || globalOrigins.Count != Globals.Count - baseGlobals || dataOrigins.Count != Data.Count - baseData)
+                throw new InvalidOperationException("an addition during body lowering did not go through Add*");
+            int[] structMap = Order(structOrigins.Count, structOrigins), functionMap = Order(functionOrigins.Count, functionOrigins);
+            int[] globalMap = Order(globalOrigins.Count, globalOrigins), dataMap = Order(dataOrigins.Count, dataOrigins);
+            int S(int s) => s < baseStructs ? s : baseStructs + structMap[s - baseStructs];
+            int F(int f) => f < baseFunctions ? f : baseFunctions + functionMap[f - baseFunctions];
+            int G(int g) => g < baseGlobals ? g : baseGlobals + globalMap[g - baseGlobals];
+            int D(int d) => d < baseData ? d : baseData + dataMap[d - baseData];
+            var ids = new IR.Linking.IdMap(S, F, G, D);
+            Reorder(Structs, baseStructs, structMap);
+            Reorder(Functions, baseFunctions, functionMap);
+            Reorder(Globals, baseGlobals, globalMap);
+            Reorder(Data, baseData, dataMap);
+            for (int s = 0; s < Structs.Count; s++)
+                Structs[s] = ids.Struct(Structs[s]);
+            for (int f = 0; f < Functions.Count; f++)
+            {
+                if (Functions[f] is { } function)
+                    Functions[f] = ids.Function(function);
+            }
+            for (int g = 0; g < Globals.Count; g++)
+                Globals[g] = ids.Global(Globals[g]);
+            for (int i = 0; i < Implementations.Count; i++)
+                Implementations[i] = Implementations[i] with { Function = F(Implementations[i].Function) };
+            // Names that carried a thread-order number take their final index.
+            for (int i = 0; i < functionOrigins.Count; i++)
+            {
+                if (functionOrigins[i].Renamed is { } prefix)
+                    Functions[F(baseFunctions + i)] = Functions[F(baseFunctions + i)]! with { Name = prefix + F(baseFunctions + i) };
+            }
+            for (int i = 0; i < globalOrigins.Count; i++)
+            {
+                if (globalOrigins[i].Renamed is { } prefix)
+                    Globals[G(baseGlobals + i)] = Globals[G(baseGlobals + i)] with { Name = prefix + G(baseGlobals + i) };
+            }
+            // The memo tables keep indices too.
+            foreach (var key in literalData.Keys.ToArray())
+                literalData[key] = D(literalData[key]);
+            foreach (var key in literalGlobals.Keys.ToArray())
+                literalGlobals[key] = G(literalGlobals[key]);
+            foreach (var key in stringUnits.Keys.ToArray())
+                stringUnits[key] = F(stringUnits[key]);
+            foreach (var key in importGlobals.Keys.ToArray())
+                importGlobals[key] = G(importGlobals[key]);
+            foreach (var key in rawImports.Keys.ToArray())
+                rawImports[key] = F(rawImports[key]);
+            foreach (var key in nativeCalls.Keys.ToArray())
+                nativeCalls[key] = F(nativeCalls[key]);
+            foreach (var key in boxes.Keys.ToArray())
+            {
+                var box = boxes[key];
+                boxes[key] = new Box(S(box.Struct), S(box.Vtable), G(box.VtableGlobal), F(box.Maker));
+            }
+            BeginParallelAdditions();
         }
 
         /// <summary>The root header struct and its vtable struct.</summary>
@@ -1476,7 +1608,8 @@ namespace Larva.Hir.Lowering
             {
                 if (!literalGlobals.TryGetValue((text, unit), out int index))
                 {
-                    index = AddGlobal(new GlobalDef($"$literal{Globals.Count}", type));
+                    // Named by its index once the additions are ordered (OrderParallelAdditions).
+                    index = AddGlobal(new GlobalDef($"$literal{Globals.Count}", type), key: $"$literal\0{unit.Keyword()}\0{text}", renamed: "$literal");
                     literalGlobals[(text, unit)] = index;
                 }
                 return index;

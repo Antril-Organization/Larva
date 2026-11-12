@@ -9,10 +9,12 @@ namespace Larva.Hir.Lowering
     {
         private void LowerBodies()
         {
+            BeginParallelAdditions();
             if (Options.Parallel)
                 System.Threading.Tasks.Parallel.ForEach(Plans, LowerPlan);
             else
                 Plans.ForEach(LowerPlan);
+            OrderParallelAdditions();
             foreach (var info in Types.Where(i => i.IsClass))
                 Functions[info.VtableMaker] = VtableMaker(info);
         }
@@ -34,6 +36,8 @@ namespace Larva.Hir.Lowering
             var info = Types[plan.Type];
             var method = plan.Synthetic ?? info.Definition.Methods[plan.Method];
             string where = $"{info.Name}.{method.Name}";
+            currentPlan = plan.Function;
+            currentRank = 0;
             try
             {
                 var function = new BodyLowerer(this, plan, info, method).Lower();
@@ -49,6 +53,10 @@ namespace Larva.Hir.Lowering
                 var built = empty.Build();
                 lock (Sync)
                     Functions[plan.Function] = built;
+            }
+            finally
+            {
+                currentPlan = -1;
             }
         }
 

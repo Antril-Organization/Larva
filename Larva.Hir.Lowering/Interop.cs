@@ -290,6 +290,7 @@ namespace Larva.Hir.Lowering
             {
                 if (nativeCalls.TryGetValue(signature, out int known))
                     return known;
+                // Numbered by its index once the additions are ordered (OrderParallelAdditions); ordered by its signature.
                 var b = new FunctionBuilder($"$NativeCall{Functions.Count}", signature.Result) { Linkage = Linkage.Internal };
                 int code = b.Argument(signature, "code", mutable: true);
                 var arguments = signature.Parameters.Select((p, i) => Operand.Copy(b.Argument(p, $"a{i}", mutable: true))).ToArray();
@@ -297,7 +298,8 @@ namespace Larva.Hir.Lowering
                 b.CallIndirect(Operand.Copy(code), arguments, FunctionBuilder.ReturnPlace, done);
                 b.At(done).Return();
                 var built = b.Build();
-                return nativeCalls[signature] = AddFunction(built with { Attributes = [.. built.Attributes, new IrAttribute("Larva.NativeCall", [])] });
+                return nativeCalls[signature] = AddFunction(built with { Attributes = [.. built.Attributes, new IrAttribute("Larva.NativeCall", [])] },
+                    key: "$NativeCall\0" + IR.Text.IrPrinter.FormatType(signature), renamed: "$NativeCall");
             }
         }
     }
