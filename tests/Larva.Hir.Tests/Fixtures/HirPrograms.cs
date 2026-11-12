@@ -205,6 +205,43 @@ internal static class HirPrograms
                     [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(2)), C))))]),
                 Ret(Int(0))).Done();
         }
+        // NestedRethrow(n): try { try { Throws(n); } catch (Error e) { try { throw new Error(5); } catch (Error) { Counter = 1; } throw; } } catch (Error e2) { return e2.Code * 10 + Counter; } return 0;
+        // (`throw;` rethrows the outer exception, not the one the nested catch handled in between.)
+        {
+            var m = M("NestedRethrow", n);
+            var e = m.Local("e", E_);
+            var e2 = m.Local("e2", E_);
+            m.Do(Try(Blk(Try(Blk(S(Call(throws, I, Arg(0)))),
+                        [new H.CatchClause(E_, e.Local, null, Blk(
+                            Try(Blk(Throw(New(E_, errorNew, Int(5)))), [new H.CatchClause(E_, -1, null, Blk(S(Set(C, Int(1)))))]),
+                            Throw(null)))])),
+                    [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(10)), C))))]),
+                Ret(Int(0))).Done();
+        }
+        // RethrowAfterFinally(n): try { try { Throws(n); } catch (Error e) { try { Counter = 1; } finally { Counter += 10; } throw; } } catch (Error e2) { return e2.Code * 100 + Counter; } return 0;
+        {
+            var m = M("RethrowAfterFinally", n);
+            var e = m.Local("e", E_);
+            var e2 = m.Local("e2", E_);
+            m.Do(Try(Blk(Try(Blk(S(Call(throws, I, Arg(0)))),
+                        [new H.CatchClause(E_, e.Local, null, Blk(
+                            Try(Blk(S(Set(C, Int(1)))), [], Blk(S(AddTo(C, Int(10))))),
+                            Throw(null)))])),
+                    [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(100)), C))))]),
+                Ret(Int(0))).Done();
+        }
+        // NestedFinally(n): Counter = 0; try { try { Throws(n); } finally { try { throw new Error(5); } catch (Error) { Counter += 3; } try { Counter += 20; } finally { Counter += 100; } } } catch (Error e2) { return e2.Code * 1000 + Counter; } return Counter;
+        // (the finally goes on with the exception that was passing, after nested handlers took others; on the normal path too.)
+        {
+            var m = M("NestedFinally", n);
+            var e2 = m.Local("e2", E_);
+            m.Do(S(Set(C, Int(0))),
+                Try(Blk(Try(Blk(S(Call(throws, I, Arg(0)))), [], Blk(
+                        Try(Blk(Throw(New(E_, errorNew, Int(5)))), [new H.CatchClause(E_, -1, null, Blk(S(AddTo(C, Int(3)))))]),
+                        Try(Blk(S(AddTo(C, Int(20)))), [], Blk(S(AddTo(C, Int(100)))))))),
+                    [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(1000)), C))))]),
+                Ret(C)).Done();
+        }
         // Nulls(): Animal? a = null; r = 0; if (a == null) r += 1; Animal x = a ?? new Dog(); r += x.Speak(); return r;
         {
             var m = M("Nulls");
