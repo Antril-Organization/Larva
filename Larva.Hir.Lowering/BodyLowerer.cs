@@ -111,7 +111,11 @@ namespace Larva.Hir.Lowering
 
         private int regionCount;
 
-        private sealed record LoopFrame(int Label, int Break, int Continue, int TryDepth);
+        /// <summary>
+        /// A loop or a switch: where <c>break</c> and <c>continue</c> go, and the try frames above which each runs the
+        /// finally blocks (a switch's <c>continue</c> is its loop's: it leaves the tries between the switch and the loop too).
+        /// </summary>
+        private sealed record LoopFrame(int Label, int Break, int Continue, int TryDepth, int ContinueTryDepth);
 
         private readonly List<TryFrame> tries = [];
 
@@ -572,7 +576,7 @@ namespace Larva.Hir.Lowering
                     var loop = FindLoop(s.Label);
                     if (loop.Continue < 0)
                         throw new LoweringException("`continue` inside a switch that is not in a loop");
-                    RunFinally(loop.TryDepth);
+                    RunFinally(loop.ContinueTryDepth);
                     Goto(loop.Continue);
                     break;
                 }
@@ -650,7 +654,7 @@ namespace Larva.Hir.Lowering
         {
             if (!entered)
                 EnterIteration(body);
-            loops.Add(new LoopFrame(label, breakTarget, continueTarget, tries.Count));
+            loops.Add(new LoopFrame(label, breakTarget, continueTarget, tries.Count, tries.Count));
             Statement(body);
             loops.RemoveAt(loops.Count - 1);
         }
@@ -857,7 +861,7 @@ namespace Larva.Hir.Lowering
             int value = Temp(type);
             Into(new Place(value), s.Value);
             int after = NewBlock();
-            loops.Add(new LoopFrame(s.Label, after, loops.Count > 0 ? loops[^1].Continue : -1, tries.Count));
+            loops.Add(new LoopFrame(s.Label, after, loops.Count > 0 ? loops[^1].Continue : -1, tries.Count, loops.Count > 0 ? loops[^1].ContinueTryDepth : -1));
             foreach (var section in s.Sections)
             {
                 int body = NewBlock(), next = NewBlock();

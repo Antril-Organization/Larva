@@ -324,6 +324,23 @@ internal static class HirPrograms
             var e = m.Local("e", E_);
             m.Do(Let(i, Int(1)), Let(e, New(E_, errorNew, Add(i, Mul(Inc(i), Int(10))))), Ret(F(e, code, I))).Done();
         }
+        // ContinueFinally(): s = 0; for (k = 0; k < 3; k++) { try { switch (k) { case 1: continue; default: s += 1; } s += 100; } finally { s += 1000; } } return s;
+        //   (3 finally runs + 2 full passes: 3000 + 202 = 3202)
+        {
+            var m = M("ContinueFinally");
+            var s = m.Local("s", I);
+            var k = m.Local("k", I);
+            m.Do(Let(s, Int(0)),
+                new ForStmt([Let(k, Int(0))], Lt(k, Int(3)), [Inc(k)], Blk(
+                    Try(Blk(
+                            new SwitchStmt(k, [
+                                new SwitchSection([new ConstantPattern(HirConstant.Int(1))], null, new ContinueStmt()),
+                                new SwitchSection([new DiscardPattern()], null, S(AddTo(s, Int(1)))),
+                            ]),
+                            S(AddTo(s, Int(100)))),
+                        [], Blk(S(AddTo(s, Int(1000))))))),
+                Ret(s)).Done();
+        }
         return p;
     }
 
