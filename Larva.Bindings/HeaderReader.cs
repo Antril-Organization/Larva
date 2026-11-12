@@ -296,7 +296,7 @@ namespace Larva.Bindings
             // `UINT64_C(0x20)`, `SDL_UINT64_C(0x20)`: the literal of a constant-making macro.
             if (System.Text.RegularExpressions.Regex.Match(body, @"^[A-Za-z_]\w*_C\s*\(\s*([^()]+?)\s*\)$") is { Success: true } wrapped)
                 body = wrapped.Groups[1].Value;
-            if (Integer(body) is { } value && IsIdentifier(parts[1]))
+            if (IsIdentifier(parts[1]) && Evaluate(body) is { } value)
                 Constant(parts[1], value);
         }
 
@@ -778,7 +778,7 @@ namespace Larva.Bindings
                 foreach (var m in System.Text.RegularExpressions.Regex.Matches(declaration, @"\[([^\]]*)\]").Cast<System.Text.RegularExpressions.Match>())
                 {
                     string inside = m.Groups[1].Value.Trim();
-                    long? n = Integer(inside) ?? (constantValues.TryGetValue(inside, out long known) ? known : null);
+                    long? n = Evaluate(inside);
                     if (n is null || n <= 0 || n > MaxArrayFields)
                     {
                         count = -1; // unknown or too long: the struct stays opaque
@@ -856,8 +856,11 @@ namespace Larva.Bindings
                         Origins.TryAdd(name, currentFile);
                 }
             }
-            long next = 0;
-            foreach (string piece in t[(open + 1)..close].Split(','))
+            // The next value: null after a member whose expression could not be evaluated (the members numbered after
+            // it are unknown too, until one says its value); each is skipped with the reason, never given a wrong value.
+            long? next = 0;
+            string? unknown = null;
+            foreach (string piece in SplitMembers(t[(open + 1)..close]))
             {
                 string entry = piece.Trim();
                 if (entry.Length == 0)
@@ -869,17 +872,42 @@ namespace Larva.Bindings
                 if (equals >= 0)
                 {
                     string expression = entry[(equals + 1)..].Trim();
-                    if (Integer(expression) is { } given)
-                        next = given;
-                    else if (constantValues.TryGetValue(expression, out long known))
-                        next = known;
-                    else
-                        continue; // an expression: not followed
+                    next = Evaluate(expression);
+                    if (next is null)
+                    {
+                        Skipped.Add((name, $"enum member: its value `{expression}` could not be evaluated"));
+                        unknown = name;
+                        continue;
+                    }
                 }
-                Constant(name, next);
-                members.Add((name, next));
+                else if (next is null)
+                {
+                    Skipped.Add((name, $"enum member: numbered after `{unknown}`, whose value could not be evaluated"));
+                    continue;
+                }
+                Constant(name, next.Value);
+                members.Add((name, next.Value));
                 next++;
             }
+        }
+
+        /// <summary>An enum's members, split at the commas outside parentheses (`A = MAX(1, 2)`; `<<` is no bracket).</summary>
+        private static List<string> SplitMembers(string body)
+        {
+            var pieces = new List<string>();
+            int depth = 0, start = 0;
+            for (int i = 0; i < body.Length; i++)
+            {
+                if (body[i] == '(') depth++;
+                else if (body[i] == ')') depth--;
+                else if (body[i] == ',' && depth == 0)
+                {
+                    pieces.Add(body[start..i]);
+                    start = i + 1;
+                }
+            }
+            pieces.Add(body[start..]);
+            return pieces;
         }
 
         private void Prototype(string t)
@@ -1195,6 +1223,176 @@ namespace Larva.Bindings
         }
 
         private static bool IsIdentifier(string w) => w.Length > 0 && (char.IsLetter(w[0]) || w[0] == '_') && w.All(c => char.IsLetterOrDigit(c) || c == '_');
+
+        /// <summary>
+        /// A C integer constant expression over literals (integer, character) and the constants read so far (`#define`s,
+        /// enum members): arithmetic, shifts, bitwise and logical operators, comparisons, `?:`, parentheses and casts to
+        /// integer types. Null when it is anything else (a string, a float, `sizeof`, an unknown name).
+        /// </summary>
+        private long? Evaluate(string expression)
+        {
+            if (Integer(expression) is { } literal)
+                return literal;
+            var evaluator = new ConstantExpression(expression, constantValues);
+            return evaluator.Evaluate();
+        }
+
+        /// <summary>A recursive-descent evaluator of C integer constant expressions (C precedence, 64-bit arithmetic).</summary>
+        private sealed class ConstantExpression(string text, Dictionary<string, long> constants)
+        {
+            private int at;
+            private bool failed;
+
+            public long? Evaluate()
+            {
+                long value = Conditional();
+                SkipSpaces();
+                return failed || at < text.Length ? null : value;
+            }
+
+            private void SkipSpaces()
+            {
+                while (at < text.Length && char.IsWhiteSpace(text[at]))
+                    at++;
+            }
+
+            private bool Take(string op)
+            {
+                SkipSpaces();
+                if (string.CompareOrdinal(text, at, op, 0, op.Length) != 0)
+                    return false;
+                // `<` is not `<<` or `<=`, `&` not `&&`, `|` not `||`, `=` only as `==`
+                char next = at + op.Length < text.Length ? text[at + op.Length] : '\0';
+                if (op is "<" or ">" && (next == op[0] || next == '=') || op is "&" or "|" && next == op[0] || op is "!" && next == '=')
+                    return false;
+                at += op.Length;
+                return true;
+            }
+
+            private long Conditional()
+            {
+                long condition = Binary(0);
+                if (!Take("?"))
+                    return condition;
+                long whenTrue = Conditional();
+                if (!Take(":"))
+                    failed = true;
+                long whenFalse = Conditional();
+                return condition != 0 ? whenTrue : whenFalse;
+            }
+
+            private static readonly string[][] Levels =
+            [
+                ["||"], ["&&"], ["|"], ["^"], ["&"], ["==", "!="], ["<=", ">=", "<", ">"], ["<<", ">>"], ["+", "-"], ["*", "/", "%"],
+            ];
+
+            private long Binary(int level)
+            {
+                if (level == Levels.Length)
+                    return Unary();
+                long left = Binary(level + 1);
+                while (true)
+                {
+                    string? op = Levels[level].FirstOrDefault(Take);
+                    if (op is null)
+                        return left;
+                    long right = Binary(level + 1);
+                    left = op switch
+                    {
+                        "||" => left != 0 || right != 0 ? 1 : 0,
+                        "&&" => left != 0 && right != 0 ? 1 : 0,
+                        "|" => left | right,
+                        "^" => left ^ right,
+                        "&" => left & right,
+                        "==" => left == right ? 1 : 0,
+                        "!=" => left != right ? 1 : 0,
+                        "<=" => left <= right ? 1 : 0,
+                        ">=" => left >= right ? 1 : 0,
+                        "<" => left < right ? 1 : 0,
+                        ">" => left > right ? 1 : 0,
+                        "<<" => right is >= 0 and < 64 ? left << (int)right : Fail(),
+                        ">>" => right is >= 0 and < 64 ? left >> (int)right : Fail(),
+                        "+" => left + right,
+                        "-" => left - right,
+                        "*" => left * right,
+                        "/" => right != 0 ? left / right : Fail(),
+                        _ => right != 0 ? left % right : Fail(),
+                    };
+                }
+            }
+
+            private long Fail()
+            {
+                failed = true;
+                return 0;
+            }
+
+            private long Unary()
+            {
+                if (Take("-"))
+                    return -Unary();
+                if (Take("+"))
+                    return Unary();
+                if (Take("~"))
+                    return ~Unary();
+                if (Take("!"))
+                    return Unary() == 0 ? 1 : 0;
+                SkipSpaces();
+                if (at < text.Length && text[at] == '(')
+                {
+                    int close = MatchingParenthesis(text, at);
+                    if (close < 0)
+                        return Fail();
+                    string inside = text[(at + 1)..close].Trim();
+                    // a cast to an integer type: `(DWORD)`, `(unsigned long)`, `(int32_t)`
+                    if (inside.Length > 0 && inside.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(w => IsTypeWord(w) || IsIdentifier(w) && !constants.ContainsKey(w)) && !inside.Contains('*'))
+                    {
+                        at = close + 1;
+                        return Unary();
+                    }
+                    at++;
+                    long value = Conditional();
+                    if (!Take(")"))
+                        return Fail();
+                    return value;
+                }
+                return Primary();
+            }
+
+            private long Primary()
+            {
+                SkipSpaces();
+                if (at >= text.Length)
+                    return Fail();
+                char c = text[at];
+                if (c == '\'')
+                {
+                    int end = text.IndexOf('\'', at + 1);
+                    if (end < 0 || end == at + 1)
+                        return Fail();
+                    string inside = text[(at + 1)..end];
+                    at = end + 1;
+                    return inside.Length == 1 ? inside[0] : inside is ['\\', var escaped] ? escaped switch { 'n' => '\n', 't' => '\t', 'r' => '\r', '0' => '\0', _ => escaped } : Fail();
+                }
+                int start = at;
+                while (at < text.Length && (char.IsLetterOrDigit(text[at]) || text[at] == '_'))
+                    at++;
+                string word = text[start..at];
+                if (word.Length == 0)
+                    return Fail();
+                if (char.IsDigit(word[0]))
+                    return Integer(word) ?? Fail();
+                if (constants.TryGetValue(word, out long known))
+                    return known;
+                // a constant-making macro around a literal: `UINT64_C(0x20)`
+                if (word.EndsWith("_C", StringComparison.Ordinal) && Take("("))
+                {
+                    long value = Conditional();
+                    return Take(")") ? value : Fail();
+                }
+                return Fail(); // sizeof, a type, an unknown name
+            }
+        }
 
         /// <summary>An integer literal (decimal, hex, with C suffixes, in parentheses, negated), or null.</summary>
         private static long? Integer(string text)

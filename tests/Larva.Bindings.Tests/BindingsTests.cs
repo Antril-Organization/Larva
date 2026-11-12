@@ -345,6 +345,40 @@ public sealed class BindingsTests : CheckedTest
             BindingDescription.Layout("P1", parsed.Structs) == (5, 1) && BindingDescription.Layout("P4", parsed.Structs) == (5, 1) && BindingDescription.Layout("N1", parsed.Structs) == (8, 4));
     }
 
+    /// <summary>Enum members and #defines with constant expressions: evaluated, and the numbering continues from the result; what cannot be evaluated is skipped with the reason.</summary>
+    [Fact]
+    public void Enum_members_continue_from_an_evaluated_expression()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #define BASE 10
+            #define SHIFTED (1 << 4)
+            #define BOTH (BASE + SHIFTED)
+            #define MASK ~0u
+            #define CAST ((unsigned long)0x10)
+            #define LETTER 'A'
+            #define PICK (BASE > 5 ? 1 : 2)
+            #define TEXT "no"
+            #define REAL 1.5
+            enum Flags { A = 1 << 1, B, C, D = BASE + 2, E, F = (A | D) * 2, G, H = sizeof(int), I, J = 40, K };
+            typedef struct { int items[BASE + 2]; } Sized;
+            """, "mylib.dll", "My");
+        Log(description);
+        Check("#defines with expressions over earlier constants, casts, char literals and ?: are constants; strings and floats are not",
+            description.Contains("const SHIFTED = 16\n") && description.Contains("const BOTH = 26\n") && description.Contains("const MASK = -1\n") && description.Contains("const CAST = 16\n")
+            && description.Contains("const LETTER = 65\n") && description.Contains("const PICK = 1\n") && !description.Contains("TEXT") && !description.Contains("REAL"));
+        Check("enum members after an expression continue from its value",
+            description.Contains("const A = 2\n") && description.Contains("const B = 3\n") && description.Contains("const C = 4\n") && description.Contains("const D = 12\n")
+            && description.Contains("const E = 13\n") && description.Contains("const F = 28\n") && description.Contains("const G = 29\n") && description.Contains("const J = 40\n") && description.Contains("const K = 41\n"));
+        Check("a member that cannot be evaluated (sizeof) and the ones numbered after it are skipped with the reason, never given a value",
+            !description.Contains("const H = ") && !description.Contains("const I = ")
+            && reader.Skipped.Any(s => s.Name == "H" && s.Why.Contains("sizeof(int)")) && reader.Skipped.Any(s => s.Name == "I" && s.Why.Contains("after `H`")),
+            string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+        Check("an array length from an expression", description.Contains("struct Sized { i32[12] items }\n"));
+        var members = reader.Enums.Single().Members;
+        Check("the enum's members: the evaluated ones, in order", members.Count == 9 && members[0] == ("A", 2) && members[6] == ("G", 29) && members[8] == ("K", 41), string.Join(", ", members));
+    }
+
     // ── SDL3 ──
 
     /// <summary>
