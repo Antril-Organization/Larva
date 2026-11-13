@@ -71,8 +71,9 @@ internal static class RunCommand
             output = Path.ChangeExtension(output, ".js");
 
         // What the program was built with, besides its files: the effective BUILD settings (the .queen's merged with
-        // `larva config`), the options given here, and the larva that built it. Kept next to the output: any change rebuilds.
-        string fingerprint = Fingerprint(project, options);
+        // `larva config`) and the larva that built it. Kept next to the output: any change rebuilds. Options given here
+        // always build and are not in the stamp: a plain `larva run` after `larva run --backend x64` runs what was built.
+        string fingerprint = Fingerprint(project);
         string stamp = output + StampExtension;
         if (rebuild || options.Count > 0 || !UpToDate(project, queen, output) || ReadStamp(stamp) != fingerprint)
         {
@@ -142,16 +143,15 @@ internal static class RunCommand
 
     /// <summary>
     /// What a build depends on besides its files: every effective BUILD setting (the project's, with `larva config` filling
-    /// in what it does not set), the build options given on the command line, and the larva that builds. A line each, so a
-    /// stamp is readable.
+    /// in what it does not set) and the larva that builds. A line each, so a stamp is readable. The options given on the
+    /// command line are not part of it: a run with options always builds, and a run without them accepts the program as it
+    /// was last built (else `larva run --backend x64` followed by `larva run` would build twice for nothing).
     /// </summary>
-    internal static string Fingerprint(Larva.Build.QueenProject project, IReadOnlyList<string> options)
+    internal static string Fingerprint(Larva.Build.QueenProject project)
     {
         var version = typeof(RunCommand).Assembly.GetName().Version?.ToString() ?? "0";
         var lines = new List<string> { $"larva: {version}", $"format: {Larva.Hir.Encoding.LvaFormat.Version}" };
         lines.AddRange(project.EffectiveBuild().Select(s => $"{s.Key}: {s.Value}"));
-        if (options.Count > 0)
-            lines.Add("options: " + string.Join(" ", options));
         return string.Join("\n", lines) + "\n";
     }
 
