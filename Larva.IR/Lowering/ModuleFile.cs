@@ -9,12 +9,12 @@ namespace Larva.IR.Lowering
     /// The on-disk form of a compiled module (<c>.lvm</c>): everything a runtime needs, nothing from the compiler.
     /// <code>
     /// file      = "LRVA" version:byte body
-    /// body      = gc entry:sv types fields constants witnesses functions metadata      (nibble stream)
-    /// gc        = mode:4 capabilities:uv plugin:name
+    /// body      = gc domains entry:sv types fields constants witnesses functions metadata data globals      (nibble stream)
+    /// gc        = mode:4 capabilities:uv plugin:name            domains = n:uv gc*     (empty: one domain, the program's gc)
     /// types     = n:uv type*                       fields    = n:uv {owner:type field:uv}*
     /// constants = n:uv {type bits:sv}*             witnesses = n:uv {type:uv layout}*
     /// layout    = size:uv align:uv flags:4 gc:uv offset:uv*
-    /// function  = name args:uv witnesses:uv argTypes localTypes roots safepoints handlers body:bytes
+    /// function  = name args:uv witnesses:uv domain:uv argTypes localTypes roots safepoints handlers native body:bytes
     /// roots     = n:uv {isArg:4 slot:uv hasOffsets:4 [offsets]}*
     /// safepoint = op:uv roots            handler = start:uv end:uv hasType:4 [type:uv] target:uv
     /// metadata  = bytes (see MetadataEncoding)           bytes = n:uv byte*
@@ -23,16 +23,18 @@ namespace Larva.IR.Lowering
     public static class ModuleFile
     {
         public const string Extension = ".lvm";
-        public const byte Version = 1;
+        /// <summary>Version 2 added the GC domains (the program's and each function's); readers of version 1 refuse it by the number.</summary>
+        public const byte Version = 2;
         private static readonly byte[] Magic = "LRVA"u8.ToArray();
 
         public static byte[] Write(IlModule module)
         {
             NibbleWriter writer = new();
 
-            writer.WriteNibble((int)module.Gc.Mode);
-            writer.WriteUnsigned((ulong)module.Gc.Capabilities);
-            IrEncoder.WriteName(writer, module.Gc.PluginName ?? "");
+            WriteGc(writer, module.Gc);
+            writer.WriteUnsigned((ulong)module.Domains.Length);
+            foreach (var domain in module.Domains)
+                WriteGc(writer, domain);
             writer.WriteSigned(module.Entry);
 
             writer.WriteUnsigned((ulong)module.Types.Length);
@@ -117,6 +119,7 @@ namespace Larva.IR.Lowering
             foreach (var function in module.Functions)
             {
                 string name = $"`{function.Name}`:";
+                Index(function.Domain, Math.Max(1, module.Domains.Length), $"{name} GC domain");
                 if (function.ArgumentTypes.Length != function.ArgumentCount)
                     throw new InvalidDataException($"{name} {function.ArgumentCount} arguments but {function.ArgumentTypes.Length} argument types.");
                 foreach (int t in function.ArgumentTypes)
@@ -179,10 +182,10 @@ namespace Larva.IR.Lowering
                 throw new InvalidDataException($"unsupported module version {file[Magic.Length]} (expected {Version})");
 
             NibbleReader reader = new(file[(Magic.Length + 1)..]);
-            var mode = (GcMode)reader.ReadNibble();
-            var capabilities = (GcCapabilities)reader.ReadUnsigned();
-            string plugin = IrDecoder.ReadName(ref reader);
-            var gc = new GcConfig(mode, capabilities, plugin.Length == 0 ? null : plugin);
+            var gc = ReadGc(ref reader);
+            var domains = new GcConfig[Count(ref reader)];
+            for (int i = 0; i < domains.Length; i++)
+                domains[i] = ReadGc(ref reader);
             int entry = checked((int)reader.ReadSigned());
 
             var types = new IrType[Count(ref reader)];
@@ -221,7 +224,24 @@ namespace Larva.IR.Lowering
             var globals = new GlobalDef[IrDecoder.ReadCount(ref reader)];
             for (int i = 0; i < globals.Length; i++)
                 globals[i] = IrDecoder.ReadGlobal(ref reader);
-            return new IlModule(types, fields, constants, witnesses, functions) { Metadata = metadata, Gc = gc, Entry = entry, Data = data, Globals = globals };
+            return new IlModule(types, fields, constants, witnesses, functions) { Metadata = metadata, Gc = gc, Domains = domains, Entry = entry, Data = data, Globals = globals };
+        }
+
+        private static void WriteGc(NibbleWriter writer, GcConfig gc)
+        {
+            writer.WriteNibble((int)gc.Mode);
+            writer.WriteUnsigned((ulong)gc.Capabilities);
+            IrEncoder.WriteName(writer, gc.PluginName ?? "");
+        }
+
+        private static GcConfig ReadGc(ref NibbleReader reader)
+        {
+            int mode = reader.ReadNibble();
+            if (mode > (int)GcMode.Plugin)
+                throw new InvalidDataException($"unknown GC mode {mode}");
+            var capabilities = (GcCapabilities)reader.ReadUnsigned();
+            string plugin = IrDecoder.ReadName(ref reader);
+            return new GcConfig((GcMode)mode, capabilities, plugin.Length == 0 ? null : plugin);
         }
 
         public static void Save(IlModule module, string path) => File.WriteAllBytes(path, Write(module));
@@ -235,6 +255,7 @@ namespace Larva.IR.Lowering
             IrEncoder.WriteName(writer, function.Name);
             writer.WriteUnsigned((ulong)function.ArgumentCount);
             writer.WriteUnsigned((ulong)function.TypeParameterCount);
+            writer.WriteUnsigned((ulong)function.Domain);
             WriteInts(writer, function.ArgumentTypes);
             WriteInts(writer, function.LocalTypes);
             WriteRoots(writer, function.GcRoots);
@@ -272,6 +293,7 @@ namespace Larva.IR.Lowering
             string name = IrDecoder.ReadName(ref reader);
             int arguments = Count(ref reader);
             int typeParameters = Count(ref reader);
+            int domain = IrDecoder.ReadInt(ref reader, "domain");
             var argumentTypes = ReadInts(ref reader);
             var localTypes = ReadInts(ref reader);
             var roots = ReadRoots(ref reader);
@@ -302,6 +324,7 @@ namespace Larva.IR.Lowering
             return new IlFunction(name, arguments, localTypes, body)
             {
                 TypeParameterCount = typeParameters,
+                Domain = domain,
                 ArgumentTypes = argumentTypes,
                 GcRoots = roots,
                 Safepoints = safepoints,

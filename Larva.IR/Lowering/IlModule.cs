@@ -106,6 +106,8 @@ namespace Larva.IR.Lowering
         {
             var builder = new System.Text.StringBuilder();
             builder.AppendLine($".gc     {Gc}");
+            for (int i = 0; i < Domains.Length; i++)
+                builder.AppendLine($".domain {i} = {Domains[i]}");
             if (Entry >= 0)
                 builder.AppendLine($".entry  fn.{Entry} ({Functions[Entry].Name})");
             for (int i = 0; i < Types.Length; i++)
@@ -123,7 +125,8 @@ namespace Larva.IR.Lowering
             {
                 builder.AppendLine();
                 string witnesses = function.TypeParameterCount > 0 ? $"witnesses: {function.TypeParameterCount}, " : "";
-                builder.AppendLine($".function {function.Name} ({witnesses}args: {function.ArgumentCount}, locals: [{string.Join(", ", function.LocalTypes.Select(t => $"type.{t}"))}])");
+                string domain = Domains.Length > 1 ? $"domain: {function.Domain}, " : "";
+                builder.AppendLine($".function {function.Name} ({witnesses}{domain}args: {function.ArgumentCount}, locals: [{string.Join(", ", function.LocalTypes.Select(t => $"type.{t}"))}])");
                 if (function.GcRoots.Length > 0)
                     builder.AppendLine($".gcroots {string.Join(", ", function.GcRoots)}");
                 foreach (var safepoint in function.Safepoints)

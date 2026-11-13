@@ -144,6 +144,48 @@ public sealed unsafe class LinkerTests : CheckedTest
             string.Join(" | ", lowered.Errors.Select(e => e.Message)));
     }
 
+    /// <summary>The .lvm module file keeps the GC domains (the program's and each function's), as the VM and `larva dis` use them.</summary>
+    [Fact]
+    public void Module_files_keep_the_gc_domains()
+    {
+        var lowered = Linker.Link([Object(Geom()), Object(App(), GcConfig.RefCount)], new LinkOptions { MixedDomains = true });
+        Check("geom + refcounted app link", lowered.Success, string.Join(" | ", lowered.Errors.Select(e => e.Message)));
+        if (!lowered.Success)
+            return;
+        var il = lowered.Il!;
+        Check("the lowered module has two domains and app's functions are in domain 1", il.Domains is [{ Mode: GcMode.Default }, { Mode: GcMode.RefCount }]
+            && il.Functions.Where(f => f.Name.StartsWith("app::")).All(f => f.Domain == 1) && il.Functions.Where(f => f.Name.StartsWith("geom::")).All(f => f.Domain == 0));
+        var bytes = ModuleFile.Write(il);
+        var reread = ModuleFile.Read(bytes);
+        Check("the domains survive the file", reread.Domains.SequenceEqual(il.Domains), string.Join(", ", reread.Domains.Select(d => d.ToString())));
+        Check("each function's domain survives the file", reread.Functions.Select(f => f.Domain).SequenceEqual(il.Functions.Select(f => f.Domain)) && reread.Functions.Any(f => f.Domain == 1));
+        Check("the text form (larva dis) shows them", reread.ToString() is var text && text.Contains(".domain 0 = ") && text.Contains(".domain 1 = ") && text.Contains("domain: 1, args:"), reread.ToString()[..200]);
+        Check("the reread program runs on the VM with its domains: main() = 7", Equals(new Interpreter(reread).Run("app::main"), 7L));
+        var olderVersion = (byte[])bytes.Clone();
+        olderVersion[4] = 1;
+        string refusal = "";
+        try
+        {
+            ModuleFile.Read(olderVersion);
+        }
+        catch (InvalidDataException e)
+        {
+            refusal = e.Message;
+        }
+        Check("a version 1 file is refused by its version (as a version 1 reader refuses this one)", refusal.Contains("version 1") && refusal.Contains("expected 2"), refusal);
+        var badDomain = il with { Functions = [il.Functions[0] with { Domain = 7 }, .. il.Functions[1..]] };
+        refusal = "";
+        try
+        {
+            ModuleFile.Read(ModuleFile.Write(badDomain));
+        }
+        catch (InvalidDataException e)
+        {
+            refusal = e.Message;
+        }
+        Check("a function in a domain the file does not declare is refused", refusal.Contains("GC domain 7"), refusal);
+    }
+
     // ── Mixed GC domains (stage 2 on): each pair run on the VM, LLVM and x64 ──
 
     [Fact]
