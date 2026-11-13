@@ -37,6 +37,7 @@ export async function run(options = {}) {
     // ── Input and the command line: read by the program one UTF-16 unit at a time ──
     const fs = node && !options.readLine ? await import("node:fs") : null;
     const decoder = new TextDecoder();
+    const standardOutput = new TextDecoder(), standardError = new TextDecoder(); // streams 1 and 2 as text (see larva_stream_write)
     const readLine = options.readLine ?? (fs ? () => {
         const collected = [], one = new Uint8Array(1);
         for (;;) {
@@ -656,7 +657,15 @@ export async function run(options = {}) {
                 if (start < 0 || wanted < 0 || start + wanted > length) return -1n;
                 try {
                     const data = bytes.slice(at + 8 + start, at + 8 + start + wanted);
-                    const written = fd < 3 ? files.writeSync(fd, data) : files.writeSync(fd, data, 0, wanted, positions.get(fd));
+                    if (fd < 3) {
+                        // Standard output and error go the way Console.Write's text goes (one buffer, see print): written
+                        // apart they would land before the text waiting in that buffer. A sequence cut at the end of
+                        // the chunk waits in the decoder for its rest.
+                        const text = (fd === 2 ? standardError : standardOutput).decode(data, { stream: true });
+                        if (fd === 2) { flush(); error(text); } else print(text);
+                        return BigInt(wanted);
+                    }
+                    const written = files.writeSync(fd, data, 0, wanted, positions.get(fd));
                     if (fd >= 3) positions.set(fd, positions.get(fd) + written);
                     return BigInt(written);
                 } catch { return -1n; }
@@ -671,7 +680,7 @@ export async function run(options = {}) {
                 return BigInt(at);
             },
             larva_stream_length: handle => { const fd = Number(handle); if (fd < 3) return -1n; try { return BigInt(files.fstatSync(fd).size); } catch { return -1n; } },
-            larva_stream_flush: handle => Number(handle) < 3 || positions.has(Number(handle)) ? 0n : -1n,
+            larva_stream_flush: handle => { if (Number(handle) < 3) { flush(); return 0n; } return positions.has(Number(handle)) ? 0n : -1n; },
             // System.Math: floats as their bits (BigInt).
             larva_math_sqrt: x => toBits(Math.sqrt(fromBits(x))),
             larva_math_sin: x => toBits(Math.sin(fromBits(x))),
