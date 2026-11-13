@@ -564,6 +564,139 @@ public sealed unsafe class X64Tests : CheckedTest
         return (lines, invalid);
     }
 
+    /// <summary>
+    /// A comparison stored into a bool and branched on right after uses the comparison's flags (<c>cmp</c> + <c>jcc</c>,
+    /// negated when the "then" block is the next one); operands are read in place from their slots (sub-word ones extended
+    /// by their signedness) or as immediates. Every comparison, both block orders, constants that fit an immediate and
+    /// ones that do not, and NaN, against C#'s operators.
+    /// </summary>
+    [Fact]
+    public void Comparisons_branch_on_their_flags()
+    {
+        var ops = new[] { BinaryOp.Eq, BinaryOp.Ne, BinaryOp.Lt, BinaryOp.Le, BinaryOp.Gt, BinaryOp.Ge };
+        var types = new[] { IrType.I8, IrType.U8, IrType.I32, IrType.U32, IrType.I64, IrType.U64, IrType.F64 };
+        var functions = new List<IrFunction>();
+        var cases = new List<(string Name, IrType Type, BinaryOp Op, BigInteger? Constant)>();
+        foreach (var type in types)
+        {
+            BigInteger max = type.IsFloat ? 0 : type.IsSigned ? (BigInteger.One << (type.BitWidth!.Value - 1)) - 1 : (BigInteger.One << type.BitWidth!.Value) - 1;
+            BigInteger?[] constants = type.IsFloat ? [null, BitConverter.DoubleToUInt64Bits(2.5)] : [null, 5, max, type.IsSigned ? -1 : null];
+            foreach (var op in ops)
+            {
+                foreach (var constant in constants.Distinct())
+                {
+                    foreach (bool thenNext in new[] { true, false })
+                    {
+                        string name = $"{type}_{op}_{constant?.ToString() ?? "y"}_{thenNext}";
+                        var f = new FunctionBuilder(name, IrType.I32);
+                        int x = f.Argument(type, "x"), y = f.Argument(type, "y");
+                        int c = f.Local(IrType.Bool, "c");
+                        int one = f.NewBlock(), two = f.NewBlock();
+                        f.Assign(c, Rvalue.Binary(op, Copy(x), constant is { } k ? Const(k, type) : Copy(y)));
+                        f.If(Copy(c), thenNext ? one : two, thenNext ? two : one);
+                        f.At(thenNext ? one : two).Assign(FunctionBuilder.ReturnPlace, Int(1)).Return();
+                        f.At(thenNext ? two : one).Assign(FunctionBuilder.ReturnPlace, Int(2)).Return();
+                        functions.Add(f.Build());
+                        cases.Add((name, type, op, constant));
+                    }
+                }
+            }
+        }
+        using var image = Load(new IrModule([], [.. functions]));
+        BigInteger Wrap(BigInteger v, IrType type)
+        {
+            int bits = type.BitWidth!.Value;
+            v &= (BigInteger.One << bits) - 1;
+            return type.IsSigned && v >= BigInteger.One << (bits - 1) ? v - (BigInteger.One << bits) : v;
+        }
+        bool Holds<T>(BinaryOp op, T l, T r) where T : IComparisonOperators<T, T, bool>, IEqualityOperators<T, T, bool> => op switch
+        {
+            BinaryOp.Eq => l == r, BinaryOp.Ne => l != r, BinaryOp.Lt => l < r, BinaryOp.Le => l <= r, BinaryOp.Gt => l > r, _ => l >= r,
+        };
+        BigInteger[] integers = [-200, -5, -1, 0, 1, 5, 7, 127, 128, 255, BigInteger.One << 31, (BigInteger.One << 32) - 1, -(BigInteger.One << 31), BigInteger.One << 40, -(BigInteger.One << 63)];
+        double[] doubles = [-1.5, 0, 2.5, 3, double.NaN, double.NegativeInfinity];
+        int wrong = 0;
+        var first = new List<string>();
+        foreach (var (name, type, op, constant) in cases)
+        {
+            if (type.IsFloat)
+            {
+                var call = (delegate* unmanaged<double, double, int>)image.Address(name);
+                foreach (double l in doubles)
+                {
+                    foreach (double r in doubles)
+                    {
+                        double right = constant is null ? r : 2.5;
+                        int expected = Holds(op, l, right) ? 1 : 2, got = call(l, r);
+                        if (got != expected && wrong++ < 5)
+                            first.Add($"{name}({l}, {right}) gave {got}");
+                    }
+                }
+                continue;
+            }
+            var integer = (delegate* unmanaged<long, long, int>)image.Address(name);
+            foreach (var l in integers)
+            {
+                foreach (var r in integers)
+                {
+                    var right = Wrap(constant ?? r, type);
+                    int expected = Holds(op, Wrap(l, type), right) ? 1 : 2;
+                    int got = integer((long)(ulong)(l & ulong.MaxValue), (long)(ulong)(r & ulong.MaxValue));
+                    if (got != expected && wrong++ < 5)
+                        first.Add($"{name}({Wrap(l, type)}, {right}) gave {got}");
+                }
+            }
+        }
+        Check($"all {cases.Count} comparisons branch right", wrong == 0, string.Join("; ", first));
+    }
+
+    /// <summary>Integer operations with an immediate right operand (and shifts whose amount wraps at the width) give the VM's results.</summary>
+    [Fact]
+    public void Immediate_operands_give_the_vms_results()
+    {
+        var ops = new[] { BinaryOp.Add, BinaryOp.Sub, BinaryOp.Mul, BinaryOp.And, BinaryOp.Or, BinaryOp.Shl, BinaryOp.Shr, BinaryOp.Div, BinaryOp.Rem };
+        var types = new[] { IrType.I8, IrType.U8, IrType.I32, IrType.U32, IrType.I64 };
+        var functions = new List<IrFunction>();
+        var cases = new List<(string Name, IrType Type)>();
+        foreach (var type in types)
+        {
+            foreach (var op in ops)
+            {
+                foreach (var constant in new BigInteger[] { 3, type.BitWidth!.Value + 1, type.IsSigned ? -1 : 1, type.IsSigned ? -7 : 100 })
+                {
+                    string name = $"{type}_{op}_{constant}";
+                    var f = new FunctionBuilder(name, type);
+                    int x = f.Argument(type, "x");
+                    f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Copy(x), Const(constant, type))).Return();
+                    functions.Add(f.Build());
+                    cases.Add((name, type));
+                }
+            }
+        }
+        var module = new IrModule([], [.. functions]);
+        using var image = Load(module);
+        var vm = Vm(module);
+        int wrong = 0;
+        var first = new List<string>();
+        foreach (var (name, type) in cases)
+        {
+            foreach (long input in new long[] { -100, -1, 0, 1, 7, 100, 127 })
+            {
+                object argument = ((PrimitiveType)type).Kind switch
+                {
+                    Primitive.I8 => (sbyte)input, Primitive.U8 => (byte)input, Primitive.I32 => (int)input, Primitive.U32 => (uint)input, _ => input,
+                };
+                var expected = new BigInteger(System.Convert.ToDecimal(vm.Run(name, argument)));
+                long raw = ((delegate* unmanaged<long, long>)image.Address(name))(input);
+                int bits = type.BitWidth!.Value;
+                var got = (new BigInteger(raw) & ((BigInteger.One << bits) - 1)) is var low && type.IsSigned && low >= BigInteger.One << (bits - 1) ? low - (BigInteger.One << bits) : low;
+                if (got != expected && wrong++ < 5)
+                    first.Add($"{name}({argument}) gave {got}, VM {expected}");
+            }
+        }
+        Check($"all {cases.Count} operations agree with the VM", wrong == 0, string.Join("; ", first));
+    }
+
     // ── Helpers ────────────────────────────────────────────────
 
     private static X64Program Compile(IrModule module, GcConfig? gc = null)
