@@ -132,6 +132,8 @@ internal static class BindProfile
             }
             if (model.NotExported.Count + others > 0)
                 Console.Error.WriteLine($"larva: {model.NotExported.Count + others} declaration(s) of the headers that {libraryName} does not export, left out");
+            foreach (var (where, why) in model.Reader.Unparsed)
+                Console.Error.WriteLine($"larva: warning: {where}: {why}");
 
             // 3. The profile over the model: every hook, then the description it leaves.
             string described = Path.Combine(work, "binding.bind");

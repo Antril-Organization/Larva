@@ -129,6 +129,251 @@ public sealed class BindingsTests : CheckedTest
             string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
     }
 
+    /// <summary>C's integer literals: a leading zero is octal (`0755` is 493, not 755), `0b` binary, `0x` hex, in #defines and enums alike.</summary>
+    [Fact]
+    public void Octal_and_binary_literals_are_read_as_C_reads_them()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #define MODE 0755
+            #define MASK 0777u
+            #define HEX 0x1F
+            #define BIN 0b101
+            #define ZERO 0
+            #define TEN 10
+            #define NEG -010
+            #define BAD 089
+            enum E { EA = 0755, EB = 010, EC, ED = 0b11 };
+            """, "lib.dll");
+        Log(description);
+        Check("octal #defines, with a suffix, negated; `0` and plain decimals as before; `089` is not a number",
+            description.Contains("const MODE = 493\n") && description.Contains("const MASK = 511\n") && description.Contains("const NEG = -8\n")
+            && description.Contains("const ZERO = 0\n") && description.Contains("const TEN = 10\n") && !description.Contains("BAD"));
+        Check("hex and binary", description.Contains("const HEX = 31\n") && description.Contains("const BIN = 5\n"));
+        Check("enum members: octal values, the next member counts on from them, binary",
+            description.Contains("const EA = 493\n") && description.Contains("const EB = 8\n") && description.Contains("const EC = 9\n") && description.Contains("const ED = 3\n")
+            && reader.Enums.Single().Members.Select(m => m.Value).SequenceEqual([493, 8, 9, 3]));
+    }
+
+    /// <summary>`void (*ops[4])(int)` in a struct: four function pointers in a row, the callback type kept, not one pointer.</summary>
+    [Fact]
+    public void Arrays_of_function_pointers_are_struct_fields_of_N_callbacks()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #define OPS 4
+            typedef struct { int tag; void (*ops[4])(int); int (*single)(void); double (*grid[2][3])(void); void (*named[OPS])(void*); } Table;
+            void Use(Table* t);
+            """, "lib.dll");
+        Log(description);
+        Check("the field is `func*<i32> : void[4]`; a single pointer stays as it was; a two-dimensional array is one row; a #define as the length",
+            description.Contains("struct Table { i32 tag; func*<i32> : void[4] ops; func*<> : i32 single; func*<> : f64[6] grid; func*<void*> : void[4] named }\n")
+            && description.Contains("Use(Table* t)\n"), string.Join("; ", reader.Opaque.Select(o => $"{o.Name}: {o.Why}")));
+        var parsed = BindingDescription.Parse(description);
+        Check("the layout counts the pointers: 4 (+4) + 32 + 8 + 48 + 32 bytes, 8-aligned", BindingDescription.Layout("Table", parsed.Structs) == (128, 8));
+        var assembly = BindingGenerator.Build(parsed);
+        var table = assembly.Types.Single(t => t.Name == "Table");
+        Check("the assembly's struct holds an inline array of 4 native function types",
+            table.Fields.Single(f => f.Name == "ops").Type is global::Larva.Hir.InlineArrayType { Count: 4, Element: global::Larva.Hir.NativeFuncType },
+            table.Fields.Single(f => f.Name == "ops").Type.ToString());
+    }
+
+    /// <summary>Attributes with nested parentheses (`visibility("default")`, `align(16)`), before, inside or after a declarator, leave it readable.</summary>
+    [Fact]
+    public void Attributes_around_declarations_are_stripped_with_their_parentheses_matched()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            __attribute__((visibility("default"))) int Visible(int x);
+            int __attribute__((visibility("default"))) Middle(int x);
+            int After(int x) __attribute__((nonnull(1), warn_unused_result));
+            extern __attribute__((visibility("default"))) __attribute__((noinline)) int Twice(int x);
+            __declspec(dllexport) int Exported(int x);
+            __declspec(align(16)) int Aligned(int x);
+            extern int Plain(int x);
+            static inline int Inlined(int x) { return x; }
+            typedef struct __attribute__((packed)) { unsigned char c; unsigned int v; } Tight;
+            int __attribute__((format(printf, 1, 2))) Formatted(const char* fmt, ...);
+            void Use(Tight* t);
+            """, "lib.dll");
+        Log(description);
+        Check("every attributed prototype is read; only the variadic one is skipped, for being variadic",
+            description.Contains("Visible(i32 x) : i32\n") && description.Contains("Middle(i32 x) : i32\n") && description.Contains("After(i32 x) : i32\n")
+            && description.Contains("Twice(i32 x) : i32\n") && description.Contains("Exported(i32 x) : i32\n") && description.Contains("Aligned(i32 x) : i32\n")
+            && description.Contains("Plain(i32 x) : i32\n") && description.Contains("Inlined(i32 x) : i32\n") && description.Contains("Use(Tight* t)\n")
+            && reader.Skipped.Count == 1 && reader.Skipped[0] == ("Formatted", "variadic"),
+            string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+    }
+
+    /// <summary>
+    /// C's type words in any order (`long unsigned int` is how clang spells size_t), `enum Tag` as a type, and `struct Tag`
+    /// as a type when the struct is defined later or only declared.
+    /// </summary>
+    [Fact]
+    public void Reordered_type_words_enum_tags_and_struct_tags_are_types()
+    {
+        var reader = new HeaderReader(longIs64: true);
+        string description = reader.Read("""
+            enum Tag { TAG_A, TAG_B };
+            typedef enum Tag TagT;
+            struct Later;
+            struct Never;
+            long unsigned int Size(void);
+            unsigned long long int Big(int long a, short unsigned b, long signed int c, char unsigned d, long long unsigned e);
+            enum Tag GetTag(enum Tag t, enum Tag* out, TagT u);
+            struct Later* MakeLater(const struct Later* from);
+            struct Never* MakeNever(const struct Never* n, struct Unknown* u);
+            struct Holder { enum Tag t; struct Later* later; };
+            void Hold(struct Holder* h);
+            struct Later { int x; };
+            """, "lib.dll");
+        Log(description);
+        Check("`long unsigned int` is u64 (LP64), the other orders of the words likewise",
+            description.Contains("Size() : u64\n") && description.Contains("Big(i64 a, u16 b, i64 c, u8 d, u64 e) : u64\n"));
+        Check("`enum Tag` is i32 by value, i32* by pointer, through a typedef too; the prototype that starts with `enum` is read",
+            description.Contains("GetTag(i32 t, i32* out, i32 u) : i32\n")
+            && reader.TypedefUses.GetValueOrDefault("GetTag#0") == "Tag" && reader.TypedefUses.GetValueOrDefault("GetTag#result") == "Tag"
+            && reader.TypedefUses.GetValueOrDefault("GetTag#2") == "TagT" && reader.Enums.Single().Names.SequenceEqual(["TagT", "Tag"]),
+            string.Join("; ", reader.TypedefUses.Select(u => $"{u.Key}={u.Value}")));
+        Check("`struct Later*` is Later* (its body comes later), `struct Never*` and `struct Unknown*` are void* (opaque), in fields too",
+            description.Contains("MakeLater(Later* from) : Later*\n") && description.Contains("MakeNever(void* n, void* u) : void*\n")
+            && description.Contains("struct Holder { i32 t; Later* later }\n") && description.Contains("Hold(Holder* h)\n")
+            && reader.TypedefUses.GetValueOrDefault("Holder.t") == "Tag" && reader.Skipped.Count == 0,
+            string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+    }
+
+    /// <summary>`long double` and `wchar_t` have the platform's sizes: 8 and 2 bytes on Windows, 16 and 4 on x86-64 Linux.</summary>
+    [Fact]
+    public void Long_double_and_wchar_t_are_sized_by_the_platform()
+    {
+        const string header = """
+            typedef struct { long double d; wchar_t w; } Wide;
+            long double LD(long double x);
+            void W(wchar_t w, const wchar_t* text, wchar_t* out, Wide* p);
+            """;
+        var windows = new HeaderReader(longIs64: false);
+        string windowsDescription = windows.Read(header, "lib.dll");
+        Log(windowsDescription);
+        Check("Windows: long double is f64, wchar_t is u16, a const wchar_t* a UTF-16 string and a writable one a u16* buffer",
+            windowsDescription.Contains("struct Wide { f64 d; u16 w }\n") && windowsDescription.Contains("LD(f64 x) : f64\n")
+            && windowsDescription.Contains("W(u16 w, String<u16>? text, u16* out, Wide* p)\n"));
+        var linux = new HeaderReader(longIs64: true);
+        string linuxDescription = linux.Read(header, "lib.so");
+        Log(linuxDescription);
+        Check("LP64: wchar_t is u32 (pointers to it u32*, no UTF-16 string); long double is 16 bytes, so LD is skipped and Wide opaque, each saying why",
+            linuxDescription.Contains("W(u32 w, u32* text, u32* out, void* p)\n") && !linuxDescription.Contains("LD(") && !linuxDescription.Contains("struct Wide")
+            && linux.Skipped.Any(s => s.Name == "LD" && s.Why.Contains("long double")) && linux.Opaque.Any(o => o.Name == "Wide" && o.Why.Contains("long double")),
+            string.Join("; ", linux.Skipped.Select(s => $"{s.Name}: {s.Why}").Concat(linux.Opaque.Select(o => $"{o.Name}: {o.Why}"))));
+        var mac = new HeaderReader(longIs64: true, longDoubleIs64: true);
+        Check("given explicitly (macOS on ARM: LP64 with a plain-double long double)", mac.Read(header, "lib.dylib").Contains("struct Wide { f64 d; u32 w }\n"));
+        var host = new HeaderReader();
+        Check("by default the host's sizes", host.Read(header, "lib").Contains("struct Wide {") == HeaderReader.HostLongDoubleIs64
+            && host.Read(header, "lib").Contains(OperatingSystem.IsWindows() ? "W(u16 w," : "W(u32 w,"));
+    }
+
+    /// <summary>
+    /// A header under a path with non-ASCII characters: the preprocessor's line markers write them as octal escapes
+    /// (`\303\261` for `ñ`), which must still match the header's folder for its #defines to count.
+    /// </summary>
+    [Fact]
+    public void Headers_under_non_ASCII_paths_keep_their_defines()
+    {
+        string folder = Path.Combine(TestEnvironment.TempFolder("headers"), "año ñ");
+        Directory.CreateDirectory(folder);
+        string header = Path.Combine(folder, "api.h");
+        File.WriteAllText(header, "#define A_ONE 1\n#define A_TWO 2\nint F(int x);\n");
+        // Preprocessed text as clang writes it, without clang: the marker's path escaped.
+        string escaped = Path.GetFullPath(header).Replace("\\", "\\\\").Replace("ñ", "\\303\\261");
+        var reader = new HeaderReader(longIs64: false);
+        reader.DefineRoots.Add(folder);
+        string description = reader.Read($"# 1 \"{escaped}\"\n#define A_ONE 1\n# 1 \"<built-in>\" 1\n#define SYSTEM 9\n# 2 \"{escaped}\" 2\n#define A_TWO 2\nint F(int x);\n", "lib.dll");
+        Log(description);
+        Check("the defines after the escaped marker are the header's; a system one is not; the function knows its file",
+            description.Contains("const A_ONE = 1\n") && description.Contains("const A_TWO = 2\n") && !description.Contains("SYSTEM")
+            && reader.Origins.GetValueOrDefault("F") == Path.GetFullPath(header).Replace('\\', '/'), string.Join("; ", reader.Origins.Select(o => $"{o.Key}={o.Value}")));
+        if (HeaderReader.FindClang() is null)
+            return;
+        var real = new HeaderReader(longIs64: false);
+        string realDescription = real.ReadFile(header, "lib.dll");
+        Log(realDescription);
+        Check("through clang: both defines and the function", realDescription.Contains("const A_ONE = 1\n") && realDescription.Contains("const A_TWO = 2\n") && realDescription.Contains("F(i32 x) : i32\n"));
+    }
+
+    /// <summary>
+    /// `extern "C" { … }`: the declarations inside are read as they are (the braces are not a body). Through clang the
+    /// `#ifdef __cplusplus` guards go away because the preprocessor runs as C (`-x c`); read as it is, the block stays.
+    /// </summary>
+    [Fact]
+    public void Extern_C_blocks_are_read_through()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #ifdef __cplusplus
+            extern "C" {
+            #endif
+            #define INSIDE 1
+            int Inside(int x);
+            typedef struct { int a; } S;
+            extern "C" {
+              extern int Nested(S* s);
+              struct T { S s; int (*cb)(void); };
+            }
+            #ifdef __cplusplus
+            }
+            #endif
+            int Outside(S* s, struct T* t);
+            int Body(int x) { if (x) { return 1; } return 0; }
+            """, "lib.dll");
+        Log(description);
+        Check("the functions and the struct inside the block, a nested block, and what follows the block",
+            description.Contains("const INSIDE = 1\n") && description.Contains("struct S { i32 a }\n") && description.Contains("struct T { S s; func*<> : i32 cb }\n")
+            && description.Contains("Inside(i32 x) : i32\n") && description.Contains("Nested(S* s) : i32\n") && description.Contains("Outside(S* s, T* t) : i32\n")
+            && description.Contains("Body(i32 x) : i32\n") && reader.Skipped.Count == 0, string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+        if (HeaderReader.FindClang() is null)
+            return;
+        string folder = TestEnvironment.TempFolder("headers");
+        string header = Path.Combine(folder, "externc.h");
+        File.WriteAllText(header, "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint Inside(int x);\n#ifdef __cplusplus\n}\n#endif\n");
+        var real = new HeaderReader(longIs64: false);
+        Check("through clang, run as C, the guarded block is gone and the function read", real.ReadFile(header, "lib.dll").Contains("Inside(i32 x) : i32\n"));
+    }
+
+    /// <summary>
+    /// A header mixing declarations the reader can and cannot read: each unreadable one is left out with a warning naming
+    /// its line (the header's own line after a line marker), and everything else is read; the bind never aborts.
+    /// </summary>
+    [Fact]
+    public void Unreadable_declarations_are_skipped_with_their_line_and_the_rest_is_read()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            # 1 "C:\\api\\mixed.h"
+            int Good1(int x);
+            typedef struct { int a; } Twice;
+            struct Twice { int b; };
+            int Good2(int x);
+            typedef void (*Broken)(int;
+            int Good3(int x);
+            typedef struct Pair { int a; } Pair;
+            int Good4(int x);
+            struct Open { int a;
+            int Good5(int x);
+            """, "lib.dll");
+        Log(description);
+        Log(string.Join("\n", reader.Unparsed.Select(u => $"{u.Where}: {u.Why}")));
+        Check("the good prototypes before and between the bad declarations are read, and the struct defined twice keeps its first body",
+            description.Contains("Good1(i32 x) : i32\n") && description.Contains("Good2(i32 x) : i32\n") && description.Contains("Good3(i32 x) : i32\n")
+            && description.Contains("Good4(i32 x) : i32\n") && description.Contains("struct Twice { i32 a }\n") && description.Contains("struct Pair { i32 a }\n")
+            && !description.Contains("Broken") && !description.Contains("Open"));
+        Check("each unreadable declaration is a warning with the header's line: the second `Twice` (line 3), `typedef … (int;` (line 5), the unclosed `struct Open` (line 9, swallowing Good5)",
+            reader.Unparsed.Count == 3
+            && reader.Unparsed[0] == ("C:/api/mixed.h:3", "struct `Twice` is defined twice: the first definition is kept")
+            && reader.Unparsed[1].Where == "C:/api/mixed.h:5" && reader.Unparsed[1].Why.Contains("typedef void (*Broken)(int")
+            && reader.Unparsed[2].Where == "C:/api/mixed.h:9" && reader.Unparsed[2].Why.Contains("struct Open"),
+            string.Join("; ", reader.Unparsed.Select(u => $"{u.Where}: {u.Why}")));
+        Check("the description parses", BindingDescription.Parse(description).Functions.Count == 4);
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
@@ -269,6 +514,32 @@ public sealed class BindingsTests : CheckedTest
             BindingDescription.Layout("Packed", parsed.Structs) == (7, 1) && BindingDescription.Layout("Packed2", parsed.Structs) == (10, 2) && BindingDescription.Layout("Natural", parsed.Structs) == (16, 8) &&
             BindingDescription.Layout("LARGE_INTEGER", parsed.Structs) == (8, 8) && BindingDescription.Layout("Value", parsed.Structs) == (8, 8)
             && BindingDescription.Layout("Tagged", parsed.Structs) == (16, 8) && BindingDescription.Layout("Small", parsed.Structs) == (2, 2) && BindingDescription.Layout("Pair", parsed.Structs) == (4, 2));
+    }
+
+    /// <summary>A union under `#pragma pack` is packed like a struct: its alignment drops, and so does that of a struct holding it.</summary>
+    [Fact]
+    public void Unions_under_pragma_pack_keep_the_packing()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #pragma pack(push, 1)
+            typedef union { unsigned char c; unsigned int v; } PU;
+            typedef struct { unsigned char c; PU u; } PS;
+            #pragma pack(pop)
+            typedef struct { unsigned char c; PU u; } Natural;   /* the packed union keeps its alignment of 1 here */
+            typedef union { unsigned char c; unsigned int v; } NU;
+            void Use(PS* s, Natural* n, NU* u);
+            """, "lib.dll");
+        Log(description);
+        Check("`union PU pack 1`, the struct under the same pack, the union after the pop without one",
+            description.Contains("union PU pack 1 { u8 c; u32 v }\n") && description.Contains("struct PS pack 1 { u8 c; PU u }\n")
+            && description.Contains("union NU { u8 c; u32 v }\n") && description.Contains("Use(PS* s, Natural* n, NU* u)\n"));
+        var parsed = BindingDescription.Parse(description);
+        Check("layouts as C: PU 4/1, PS 5/1, Natural 5/1 (the packed union inside), NU 4/4",
+            BindingDescription.Layout("PU", parsed.Structs) == (4, 1) && BindingDescription.Layout("PS", parsed.Structs) == (5, 1)
+            && BindingDescription.Layout("Natural", parsed.Structs) == (5, 1) && BindingDescription.Layout("NU", parsed.Structs) == (4, 4),
+            $"{BindingDescription.Layout("PU", parsed.Structs)} {BindingDescription.Layout("Natural", parsed.Structs)}");
+        Check("the description's own text keeps the union's pack", parsed.ToText().Contains("union PU pack 1 {"), parsed.ToText());
     }
 
     /// <summary>`const char*` is an input string; a writable `char*` is a buffer C fills (bytes), never a string copied in and lost.</summary>

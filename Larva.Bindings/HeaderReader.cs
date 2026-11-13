@@ -19,6 +19,9 @@ namespace Larva.Bindings
         /// <summary>Structs left opaque although they have a body, each with why.</summary>
         public List<(string Name, string Why)> Opaque { get; } = [];
 
+        /// <summary>Declarations the reader could not read and left out, each as <c>file:line</c> with why; the rest of the header is read.</summary>
+        public List<(string Where, string Why)> Unparsed { get; } = [];
+
         /// <summary>A C enum: the names it goes by (its tag and the typedefs of it), its members and the header it is in.</summary>
         public sealed record CEnum(List<string> Names, List<(string Name, long Value)> Members, string? File);
 
@@ -39,6 +42,7 @@ namespace Larva.Bindings
 
         private readonly HashSet<string> enumNames = new(StringComparer.Ordinal);
         private string? currentFile;
+        private int currentLine;
 
         /// <summary>The header a declaration came from, kept among the declarations where its line marker was.</summary>
         private const string FileMarker = "\u0002file";
@@ -78,10 +82,27 @@ namespace Larva.Bindings
         private readonly Dictionary<string, long> constantValues = new(StringComparer.Ordinal);
         private readonly List<string> functions = [];
         private readonly HashSet<string> functionNames = new(StringComparer.Ordinal);
-        private readonly bool longIs64;
+        private readonly bool longIs64, wcharIs32, longDoubleIs64;
 
-        /// <param name="longIs64">Whether C's <c>long</c> is 64 bits (LP64, Linux and macOS) or 32 (Windows).</param>
-        public HeaderReader(bool? longIs64 = null) => this.longIs64 = longIs64 ?? !OperatingSystem.IsWindows();
+        /// <param name="longIs64">Whether C's <c>long</c> is 64 bits (LP64, Linux and macOS) or 32 (Windows). Default: the host's.</param>
+        /// <param name="wcharIs32">
+        /// Whether <c>wchar_t</c> is 32 bits (Linux, macOS: <c>u32</c>) or 16 (Windows: <c>wchar</c>, a UTF-16 string as a
+        /// parameter). Default: as <paramref name="longIs64"/> says (every LP64 platform has the 32-bit one).
+        /// </param>
+        /// <param name="longDoubleIs64">
+        /// Whether <c>long double</c> is a plain double (Windows, macOS on ARM: <c>f64</c>) or wider (x86-64 Linux: 16 bytes,
+        /// a type the bindings cannot carry). Default: the host's when <paramref name="longIs64"/> is not given, else not LP64.
+        /// </param>
+        public HeaderReader(bool? longIs64 = null, bool? wcharIs32 = null, bool? longDoubleIs64 = null)
+        {
+            this.longIs64 = longIs64 ?? !OperatingSystem.IsWindows();
+            this.wcharIs32 = wcharIs32 ?? this.longIs64;
+            this.longDoubleIs64 = longDoubleIs64 ?? (longIs64 is null ? HostLongDoubleIs64 : !this.longIs64);
+        }
+
+        /// <summary>Whether this machine's C `long double` is a plain double: Windows, and macOS on ARM.</summary>
+        public static bool HostLongDoubleIs64 => OperatingSystem.IsWindows()
+            || OperatingSystem.IsMacOS() && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
 
         /// <summary>Reads <paramref name="header"/> (its text) for <paramref name="library"/>: the description text.</summary>
         /// <summary>
@@ -92,6 +113,44 @@ namespace Larva.Bindings
         public List<string> DefineRoots { get; } = [];
 
         private static readonly System.Text.RegularExpressions.Regex LineMarker = new(@"^#\s*(?:line\s+)?\d+\s+\x22([^\x22]*)\x22", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// The file a line marker names, as a path with `/`: the preprocessor writes it as a C string, `\\` for each
+        /// backslash and every byte outside ASCII as an octal escape (`\303\261` for `ñ`, UTF-8).
+        /// </summary>
+        private static string MarkerPath(string quoted)
+        {
+            if (!quoted.Contains('\\'))
+                return quoted;
+            var bytes = new List<byte>(quoted.Length);
+            for (int i = 0; i < quoted.Length; i++)
+            {
+                char c = quoted[i];
+                if (c == '\\' && i + 1 < quoted.Length)
+                {
+                    char next = quoted[i + 1];
+                    if (next is >= '0' and <= '7')
+                    {
+                        int value = 0, digits = 0;
+                        while (digits < 3 && i + 1 < quoted.Length && quoted[i + 1] is >= '0' and <= '7')
+                        {
+                            value = value * 8 + (quoted[++i] - '0');
+                            digits++;
+                        }
+                        bytes.Add((byte)value);
+                        continue;
+                    }
+                    if (next is '\\' or '"' or '\'')
+                    {
+                        bytes.Add((byte)next);
+                        i++;
+                        continue;
+                    }
+                }
+                bytes.AddRange(Encoding.UTF8.GetBytes([c]));
+            }
+            return Encoding.UTF8.GetString(bytes.ToArray()).Replace('\\', '/');
+        }
 
         public string Read(string header, string library, string? className = null)
         {
@@ -105,7 +164,7 @@ namespace Larva.Bindings
                     continue;
                 if (LineMarker.Match(trimmed) is { Success: true } marker)
                 {
-                    file = marker.Groups[1].Value.Replace("\\\\", "/").Replace('\\', '/');
+                    file = MarkerPath(marker.Groups[1].Value);
                     continue;
                 }
                 // Before any line marker (a header read as it is) every define counts; after one, only the user's files'.
@@ -116,23 +175,19 @@ namespace Larva.Bindings
                 }
             }
             currentFile = null;
-            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(Decorations.Replace(LayoutAttributes(d), " "), "(*").Trim())
-                .Where(d => d.Length > 0).ToList();
+            var declarations = Declarations(code).Select(d => (Text: d.Text.StartsWith(FileMarker, StringComparison.Ordinal) ? d.Text : Callable.Replace(StripDecorations(d.Text), "(*").Trim(), d.Line))
+                .Where(d => d.Text.Length > 0).ToList();
             // Types first, prototypes after: a prototype may use a typedef written below it in another header.
-            foreach (string declaration in declarations)
+            foreach (bool types in new[] { true, false })
             {
-                if (declaration.StartsWith(FileMarker, StringComparison.Ordinal))
-                    currentFile = declaration[FileMarker.Length..];
-                else if (IsTypeDeclaration(declaration))
-                    Declaration(declaration);
-            }
-            currentFile = null;
-            foreach (string declaration in declarations)
-            {
-                if (declaration.StartsWith(FileMarker, StringComparison.Ordinal))
-                    currentFile = declaration[FileMarker.Length..];
-                else if (!IsTypeDeclaration(declaration))
-                    Declaration(declaration);
+                currentFile = null;
+                foreach (var (declaration, line) in declarations)
+                {
+                    if (declaration.StartsWith(FileMarker, StringComparison.Ordinal))
+                        currentFile = declaration[FileMarker.Length..];
+                    else if (IsTypeDeclaration(declaration) == types)
+                        TryDeclaration(declaration, line);
+                }
             }
             var text = new StringBuilder();
             text.Append("library ").Append(library).Append('\n');
@@ -144,7 +199,7 @@ namespace Larva.Bindings
             {
                 if (ResolveStruct(definition) is { } fields)
                     text.Append(definition.IsUnion ? "union " : "struct ").Append(definition.Name)
-                        .Append(!definition.IsUnion && definition.Pack is > 0 and < 8 ? $" pack {definition.Pack}" : "").Append(" { ").Append(string.Join("; ", fields.Select(f => $"{f.Type} {f.Name}"))).Append(" }\n");
+                        .Append(definition.Pack is > 0 and < 8 ? $" pack {definition.Pack}" : "").Append(" { ").Append(string.Join("; ", fields.Select(f => $"{f.Type} {f.Name}"))).Append(" }\n");
             }
             foreach (string function in functions)
                 text.Append(function).Append('\n');
@@ -167,7 +222,8 @@ namespace Larva.Bindings
             string? clang = FindClang();
             if (clang is null)
                 return null;
-            var start = new System.Diagnostics.ProcessStartInfo(clang) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            // clang writes UTF-8 (the console's code page would mangle non-ASCII text in string literals).
+            var start = new System.Diagnostics.ProcessStartInfo(clang) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, StandardOutputEncoding = Encoding.UTF8 };
             start.ArgumentList.Add("-E");
             start.ArgumentList.Add("-dD"); // the #defines too, each after a line marker naming its file
             start.ArgumentList.Add("-x");
@@ -321,16 +377,27 @@ namespace Larva.Bindings
             return null;
         }
 
-        /// <summary>Top-level declarations (ending in <c>;</c>), bodies <c>{ … }</c> of functions skipped, directives dropped.</summary>
-        private static List<string> Declarations(string code)
+        /// <summary>
+        /// Top-level declarations (ending in <c>;</c>), bodies <c>{ … }</c> of functions skipped, directives dropped, each
+        /// with the line it starts on (the header's own line after a line marker). Text left unterminated at the end
+        /// (an unmatched <c>{</c>) is a declaration too, for the reader to refuse with its line.
+        /// </summary>
+        private static List<(string Text, int Line)> Declarations(string code)
         {
-            var declarations = new List<string>();
+            var declarations = new List<(string, int)>();
             var current = new StringBuilder();
-            int depth = 0, parens = 0;
+            int depth = 0, parens = 0, externBlocks = 0, line = 1, startLine = 1;
             bool directive = false, lineStart = true;
+            void Take()
+            {
+                declarations.Add((current.ToString(), startLine));
+                current.Clear();
+            }
             for (int i = 0; i < code.Length; i++)
             {
                 char c = code[i];
+                if (c == '\n')
+                    line++;
                 if (lineStart && c == '#')
                     directive = true;
                 lineStart = c == '\n';
@@ -341,42 +408,60 @@ namespace Larva.Bindings
                         directive = false;
                         // `#pragma pack(…)`: kept in place (it changes the structs declared after it).
                         int lineStart2 = code.LastIndexOf('\n', Math.Max(0, i - 1)) + 1;
-                        string line = code[lineStart2..i].Trim();
-                        if (System.Text.RegularExpressions.Regex.IsMatch(line, @"^#\s*pragma\s+pack\s*\("))
-                            declarations.Add(PackMarker + line[(line.IndexOf('(') + 1)..line.LastIndexOf(')')]);
-                        else if (LineMarker.Match(line) is { Success: true } marker)
-                            declarations.Add(FileMarker + marker.Groups[1].Value.Replace("\\\\", "/").Replace('\\', '/'));
+                        string text = code[lineStart2..i].Trim();
+                        if (System.Text.RegularExpressions.Regex.IsMatch(text, @"^#\s*pragma\s+pack\s*\("))
+                            declarations.Add((PackMarker + text[(text.IndexOf('(') + 1)..text.LastIndexOf(')')], line));
+                        else if (LineMarker.Match(text) is { Success: true } marker)
+                        {
+                            declarations.Add((FileMarker + MarkerPath(marker.Groups[1].Value), line));
+                            line = int.Parse(System.Text.RegularExpressions.Regex.Match(text, @"\d+").Value); // the next line's number in that file
+                        }
                     }
                     continue;
                 }
+                if (current.Length == 0 && !char.IsWhiteSpace(c))
+                    startLine = line;
                 if (c == '{')
                 {
+                    // `extern "C" {` (a header read without the preprocessor, or an unguarded block): the declarations
+                    // inside are read as they are, the braces dropped.
+                    if (depth == 0 && parens == 0 && current.ToString().Trim() is "extern \"C\"" or "extern \"C++\"")
+                    {
+                        externBlocks++;
+                        current.Clear();
+                        continue;
+                    }
                     depth++;
                     current.Append(c);
                     continue;
                 }
                 if (c == '}')
                 {
+                    if (depth == 0 && externBlocks > 0)
+                    {
+                        externBlocks--;
+                        current.Clear();
+                        continue;
+                    }
                     depth--;
                     current.Append(c);
                     // A function definition: its body ends the declaration without a `;`.
                     if (depth == 0 && parens == 0 && !current.ToString().TrimStart().StartsWith("typedef") && !StartsWithAggregate(current.ToString()))
-                    {
-                        declarations.Add(current.ToString());
-                        current.Clear();
-                    }
+                        Take();
                     continue;
                 }
                 if (c == '(') parens++;
                 else if (c == ')') parens--;
                 if (c == ';' && depth == 0)
                 {
-                    declarations.Add(current.ToString());
-                    current.Clear();
+                    Take();
                     continue;
                 }
-                current.Append(c == '\n' ? ' ' : c);
+                if (current.Length > 0 || !char.IsWhiteSpace(c))
+                    current.Append(c == '\n' ? ' ' : c); // no leading whitespace: an empty `current` marks where a declaration starts
             }
+            if (current.ToString().Trim().Length > 0)
+                Take();
             return declarations;
         }
 
@@ -391,17 +476,50 @@ namespace Larva.Bindings
         {
             if (t.StartsWith(PackMarker, StringComparison.Ordinal))
                 return true;
-            if (t.StartsWith("typedef ") || t.StartsWith("enum ") || t.StartsWith("enum{"))
+            if (t.StartsWith("typedef ") || t.StartsWith("enum{"))
                 return true;
             if (!StartsWithAggregate(t))
                 return false;
+            // `enum Tag F(enum Tag t);` and `struct S* F(void);` are prototypes; `enum Tag { … }`, `enum Tag;` are declarations.
             int brace = t.IndexOf('{'), paren = t.IndexOf('(');
             return paren < 0 || brace >= 0 && brace < paren;
         }
 
         private static readonly System.Text.RegularExpressions.Regex Decorations = new(
-            @"__declspec\s*\([^)]*\)|__attribute__\s*\(\(.*?\)\)|__pragma\s*\([^)]*\)|\b(extern|static|inline|__inline|__forceinline|__inline__|_Noreturn|__restrict|restrict|__unaligned)\b",
+            @"\b(extern|static|inline|__inline|__forceinline|__inline__|_Noreturn|__restrict|restrict|__unaligned)\b",
             System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static readonly string[] DecoratingKeywords = ["__pragma"];
+
+        /// <summary>
+        /// A declaration without its decorations: `__attribute__((…))` and `__declspec(…)` through <see cref="LayoutAttributes"/>
+        /// (their parentheses matched: `visibility("default")`, `align(16)` nest; `packed` / `aligned(n)` kept as markers for
+        /// the struct they belong to), `__pragma(…)` likewise, wherever they stand, and the storage words.
+        /// </summary>
+        private static string StripDecorations(string declaration)
+        {
+            declaration = LayoutAttributes(declaration);
+            var text = new StringBuilder(declaration.Length);
+            for (int i = 0; i < declaration.Length;)
+            {
+                string? keyword = DecoratingKeywords.FirstOrDefault(k => string.CompareOrdinal(declaration, i, k, 0, k.Length) == 0
+                    && (i == 0 || !(char.IsLetterOrDigit(declaration[i - 1]) || declaration[i - 1] == '_')));
+                if (keyword is not null)
+                {
+                    int open = i + keyword.Length;
+                    while (open < declaration.Length && char.IsWhiteSpace(declaration[open]))
+                        open++;
+                    if (open < declaration.Length && declaration[open] == '(' && MatchingParenthesis(declaration, open) is var close && close > open)
+                    {
+                        text.Append(' ');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                text.Append(declaration[i++]);
+            }
+            return Decorations.Replace(text.ToString(), " ");
+        }
 
         /// <summary>`(__cdecl *name)`, `( * name)`: a function pointer's declarator, written `(*name)` for the rest of the reader.</summary>
         private static readonly System.Text.RegularExpressions.Regex Callable = new(
@@ -521,6 +639,24 @@ namespace Larva.Bindings
                 pack = value;
         }
 
+        /// <summary>
+        /// One declaration, or a warning in <see cref="Unparsed"/> naming its line: what the reader cannot make sense of
+        /// (text C would refuse, a shape the reader does not know) is left out, never the whole header.
+        /// </summary>
+        private void TryDeclaration(string t, int line)
+        {
+            currentLine = line;
+            try
+            {
+                Declaration(t);
+            }
+            catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException or InvalidOperationException or FormatException or NullReferenceException)
+            {
+                string shown = t.Length > 60 ? t[..57] + "…" : t;
+                Unparsed.Add(($"{currentFile ?? "header"}:{line}", $"`{shown}` could not be read"));
+            }
+        }
+
         private void Declaration(string t)
         {
             if (t.StartsWith(PackMarker, StringComparison.Ordinal))
@@ -533,11 +669,11 @@ namespace Larva.Bindings
                 Typedef(t[8..].Trim());
                 return;
             }
-            if (t.StartsWith("enum ") || t.StartsWith("enum{"))
+            if ((t.StartsWith("enum ") || t.StartsWith("enum{")) && IsTypeDeclaration(t))
             {
                 int brace = t.IndexOf('{');
                 string tag = brace < 0 ? "" : t[4..brace].Trim();
-                Enum(t, IsIdentifier(tag) ? [tag] : []);
+                Enum(t, IsIdentifier(tag) ? [tag] : []); // `enum Tag;` alone: nothing to read
                 return;
             }
             if (IsTypeDeclaration(t))
@@ -553,6 +689,7 @@ namespace Larva.Bindings
                     opaque.Add(tag); // a forward declaration: opaque unless a body follows
                 return;
             }
+            t = TakeLayout(t, out _, out _); // a layout attribute on a function means nothing to its binding
             int body = t.IndexOf('{');
             Prototype(body < 0 ? t : t[..body]); // a function definition: its prototype is the part before the body
         }
@@ -670,6 +807,12 @@ namespace Larva.Bindings
         /// </summary>
         private void DefineStruct(string name, string tag, string body, bool isUnion = false, bool packed = false, int? aligned = null)
         {
+            if (structs.ContainsKey(name))
+            {
+                // Defined twice (two headers, or a header read without the preprocessor and its include guard): the first wins.
+                Unparsed.Add(($"{currentFile ?? "header"}:{currentLine}", $"{(isUnion ? "union" : "struct")} `{name}` is defined twice: the first definition is kept"));
+                return;
+            }
             var raw = new RawStruct { Name = name, Fields = [], IsUnion = isUnion, Pack = packed ? 1 : pack };
             if (aligned is { } alignment)
                 raw.Why = $"aligned({(alignment > 0 ? alignment.ToString() : "…")}): an alignment the bindings cannot carry";
@@ -711,9 +854,11 @@ namespace Larva.Bindings
                     }
                     if (declaration.Contains("(*"))
                     {
-                        // a function pointer field: `ret (*name)(params)`
+                        // a function pointer field: `ret (*name)(params)`, or an array of them: `ret (*name[N])(params)`
                         var (type, fieldName) = SplitParameter(declaration, raw.Fields.Count + 1);
-                        raw.Fields.Add(new RawField(type, fieldName, null));
+                        int declaratorOpen = declaration.IndexOf("(*", StringComparison.Ordinal), declaratorClose = declaration.IndexOf(')', declaratorOpen);
+                        string declarator = declaratorClose < 0 ? declaration[declaratorOpen..] : declaration[declaratorOpen..declaratorClose];
+                        raw.Fields.Add(Field(type, 0, declarator, fieldName)); // `[N]` in the declarator: N function pointers in a row
                         continue;
                     }
                     var parts = BindingDescription.SplitTopLevel(declaration);
@@ -972,7 +1117,10 @@ namespace Larva.Bindings
             int pointerOpen = p.IndexOf("(*", StringComparison.Ordinal);
             if (pointerOpen >= 0 && p.IndexOf(')', pointerOpen) is var pointerClose && pointerClose > 0)
             {
-                string name = Tokens(p[(pointerOpen + 2)..pointerClose]).LastOrDefault(IsIdentifier) ?? $"p{index}";
+                string declarator = p[(pointerOpen + 2)..pointerClose];
+                if (declarator.IndexOf('[') is var arrayOpen && arrayOpen >= 0)
+                    declarator = declarator[..arrayOpen]; // `(*name[N])`: the name is before the length
+                string name = Tokens(declarator).LastOrDefault(IsIdentifier) ?? $"p{index}";
                 return (p[..pointerOpen] + "(*)" + p[(pointerClose + 1)..], name);
             }
             int bracket = p.IndexOf('[');
@@ -1047,6 +1195,8 @@ namespace Larva.Bindings
                 words = targetWords.Where(w => w is not ("const" or "volatile" or "*")).ToList();
                 baseText = string.Join(' ', words);
             }
+            if (words[0] == "enum")
+                return Pointers("i32", stars); // `enum Tag`: its number (the language may give it the enum type by its name)
             // Windows' string pointer names when no header defined them: `const char*` / `char*` (and wide).
             if (words.Count == 1 && words[0] is "LPCSTR" or "PCSTR" or "LPSTR" or "PSTR" or "LPCWSTR" or "PCWSTR" or "LPWSTR" or "PWSTR")
             {
@@ -1074,10 +1224,11 @@ namespace Larva.Bindings
                 }
                 return Pointers("void", stars); // opaque: pointers to it are void*
             }
-            string? primitive = Primitive(baseText);
+            string canonical = Canonical(words);
+            string? primitive = Primitive(canonical);
             if (primitive is null)
             {
-                why = $"unknown type `{baseText}`";
+                why = canonical == "long double" ? "`long double` is wider than f64 on this platform (16 bytes): not a type the bindings carry" : $"unknown type `{baseText}`";
                 return null;
             }
             if (primitive == "char" || primitive == "wchar")
@@ -1162,12 +1313,34 @@ namespace Larva.Bindings
 
         private static string Pointers(string type, int stars) => type + new string('*', stars);
 
+        private static readonly HashSet<string> BasicTypeWords = new(StringComparer.Ordinal) { "unsigned", "short", "long", "int", "char", "double", "float" };
+
+        /// <summary>
+        /// C's basic type words in one spelling, whatever their order (`long unsigned int` is clang's `size_t`,
+        /// `unsigned long long int`, `int long`): the spelling <see cref="Primitive"/> knows. Other words stay as written.
+        /// </summary>
+        private static string Canonical(List<string> words)
+        {
+            if (words.Count < 2 || !words.All(BasicTypeWords.Contains))
+                return string.Join(' ', words);
+            bool unsigned = words.Contains("unsigned");
+            int longs = words.Count(w => w == "long");
+            if (words.Contains("double"))
+                return longs > 0 ? "long double" : "double";
+            if (words.Contains("float"))
+                return "float";
+            if (words.Contains("char"))
+                return unsigned ? "unsigned char" : "char";
+            string width = words.Contains("short") ? "short" : longs >= 2 ? "long long" : longs == 1 ? "long" : "int";
+            return unsigned ? "unsigned " + width : width;
+        }
+
         /// <summary>C's own type names to the description's; char and wchar_t stay as such for the caller to decide.</summary>
         private string? Primitive(string c) => c switch
         {
             "void" => "void",
             "char" or "signed char" => "char", "unsigned char" => "u8",
-            "wchar_t" or "WCHAR" or "char16_t" => "wchar",
+            "wchar_t" => wcharIs32 ? "u32" : "wchar", "WCHAR" or "char16_t" => "wchar",
             "short" or "short int" or "signed short" or "signed short int" or "int16_t" or "SHORT" or "INT16" => "i16",
             "unsigned short" or "unsigned short int" or "uint16_t" or "USHORT" or "WORD" or "UINT16" => "u16",
             "int" or "signed int" or "int32_t" or "INT" or "INT32" or "BOOL" or "LONG32" or "errno_t" => "i32",
@@ -1177,7 +1350,7 @@ namespace Larva.Bindings
             "long long" or "long long int" or "signed long long" or "int64_t" or "__int64" or "LONGLONG" or "INT64" or "ptrdiff_t" or "intptr_t" or "ssize_t" or "LONG_PTR" or "INT_PTR" => "i64",
             "unsigned long long" or "unsigned long long int" or "uint64_t" or "unsigned __int64" or "ULONGLONG" or "UINT64" or "size_t" or "uintptr_t" or "rsize_t" or "ULONG_PTR" or "UINT_PTR" or "DWORD64" or "DWORD_PTR" or "SIZE_T" => "u64",
             "int8_t" or "INT8" => "i8", "uint8_t" or "BYTE" or "UINT8" or "UCHAR" => "u8",
-            "float" or "FLOAT" => "f32", "double" or "DOUBLE" or "long double" => "f64",
+            "float" or "FLOAT" => "f32", "double" or "DOUBLE" => "f64", "long double" => longDoubleIs64 ? "f64" : null,
             "bool" or "_Bool" or "BOOLEAN" => "bool",
             "HANDLE" or "HMODULE" or "HINSTANCE" or "HWND" or "FARPROC" or "LPVOID" or "PVOID" or "HGLOBAL" or "HLOCAL" or "HDC" => "void*",
             _ => null,
@@ -1394,7 +1567,7 @@ namespace Larva.Bindings
             }
         }
 
-        /// <summary>An integer literal (decimal, hex, with C suffixes, in parentheses, negated), or null.</summary>
+        /// <summary>An integer literal (decimal, hex, octal `0755`, binary `0b101`, with C suffixes, in parentheses, negated), or null.</summary>
         private static long? Integer(string text)
         {
             text = text.Trim();
@@ -1409,6 +1582,19 @@ namespace Larva.Bindings
             {
                 if (!long.TryParse(text[2..], System.Globalization.NumberStyles.HexNumber, null, out value))
                     return null;
+            }
+            else if (text.StartsWith("0b", StringComparison.OrdinalIgnoreCase))
+            {
+                if (text.Length < 3 || text.Length > 66 || !text[2..].All(c => c is '0' or '1'))
+                    return null;
+                value = Convert.ToInt64(text[2..], 2);
+            }
+            else if (text.Length > 1 && text[0] == '0' && text.All(char.IsAsciiDigit))
+            {
+                // C's octal: a leading zero (`0755` is 493).
+                if (text.Length > 22 || !text.All(c => c is >= '0' and <= '7'))
+                    return null;
+                value = Convert.ToInt64(text, 8);
             }
             else if (!long.TryParse(text, out value))
                 return null;

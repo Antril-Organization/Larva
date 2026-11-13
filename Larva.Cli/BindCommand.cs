@@ -72,6 +72,8 @@ internal static class BindCommand
                     Console.Error.WriteLine($"larva: skipped {name}: {why}");
                 foreach (var (name, why) in reader.Opaque)
                     Console.Error.WriteLine($"larva: opaque {name}: {why}");
+                foreach (var (where, why) in reader.Unparsed)
+                    Console.Error.WriteLine($"larva: warning: {where}: {why}");
             }
             var description = BindingDescription.Parse(descriptionText);
             var exports = File.Exists(library) ? Exports.Read(library) : null;
