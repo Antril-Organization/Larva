@@ -1056,6 +1056,26 @@ into namespace System
 	/// Numbers as text and back.
 	public static class Number
 	{
+		/// The digits of `top`, then 19 for each of parts[count - 1] … parts[0] (with their leading zeros).
+		Chunked(u64 top, u64[] parts, i32 count) : str
+		{
+			i32 lead = DigitCount(top);
+			u8[] digits = new u8[lead + 19 * count];
+			WriteDigits(top, digits, lead);
+			loop (i32 i = 0..count)
+			{
+				u64 part = parts[count - 1 - i];
+				i32 at = lead + 19 * (i + 1);
+				loop (i32 j = 0..19)
+				{
+					at--;
+					digits[at] = (u8)(48 + part % 10);
+					part = part / 10;
+				}
+			}
+			return new String<u8>(digits);
+		}
+
 		public:
 			/// The decimal digits of `value` (with a '-' when negative).
 			Format(i64 value) : str
@@ -1073,48 +1093,41 @@ into namespace System
 				return String<u8>.Decimal(value, false);
 			}
 
-			/// The decimal digits of a 128-bit `value`.
+			/// The decimal digits of a 128-bit `value`: 19 digits at a time (one division by 10^19 for each, the digits
+			/// of each part from a u64).
 			FormatUnsigned(u128 value) : str
 			{
-				i32 count = 1;
-				u128 rest = value;
-				loop (rest >= 10)
+				if ((value >> 64) == 0)
+					return FormatUnsigned((u64)value);
+				u64[] parts = new u64[2];
+				i32 count = 0;
+				u128 chunk = 10000000000000000000;
+				loop (value >= chunk)
 				{
-					rest = rest / 10;
+					u128 rest = value / chunk;
+					parts[count] = (u64)(value - rest * chunk);
 					count++;
+					value = rest;
 				}
-				u8[] digits = new u8[count];
-				i32 at = count;
-				do
-				{
-					at--;
-					digits[at] = (u8)(48 + (u64)(value % 10));
-					value = value / 10;
-				}
-				loop (value > 0);
-				return new String<u8>(digits);
+				return Chunked((u64)value, parts, count);
 			}
 
-			/// The decimal digits of a 256-bit `value`.
+			/// The decimal digits of a 256-bit `value`: 19 digits at a time, as for 128 bits.
 			FormatUnsigned(u256 value) : str
 			{
-				i32 count = 1;
-				u256 rest = value;
-				loop (rest >= 10)
+				if ((value >> 64) == 0)
+					return FormatUnsigned((u64)value);
+				u64[] parts = new u64[4];
+				i32 count = 0;
+				u256 chunk = 10000000000000000000;
+				loop (value >= chunk)
 				{
-					rest = rest / 10;
+					u256 rest = value / chunk;
+					parts[count] = (u64)(value - rest * chunk);
 					count++;
+					value = rest;
 				}
-				u8[] digits = new u8[count];
-				i32 at = count;
-				do
-				{
-					at--;
-					digits[at] = (u8)(48 + (u64)(value % 10));
-					value = value / 10;
-				}
-				loop (value > 0);
-				return new String<u8>(digits);
+				return Chunked((u64)value, parts, count);
 			}
 
 			/// How many decimal digits `value` has (1 for 0).
