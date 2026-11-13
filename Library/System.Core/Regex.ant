@@ -6,7 +6,10 @@
 
 into namespace System.Text
 {
-	/// A node of a parsed pattern (Kind says which: see the constants), and, while matching, a continuation of a repeat.
+	/// A node of a parsed pattern. Kind: 0 the end of the pattern, 1 a literal unit, 2 a class (Table), 3 `.`, 4 a
+	/// sequence, 5 alternatives, 6 a group's start, 7 its end, 8 a repeat, 9 the end of one iteration of a repeat, 10 `^`,
+	/// 11 `$`, 12 `\b`, 13 `\B`. Once the pattern is parsed, every node knows the node after it (Next), so matching walks
+	/// fixed links and allocates nothing.
 	public final class RegexNode
 	{
 		public:
@@ -16,11 +19,14 @@ into namespace System.Text
 			List<RegexNode> Children;
 			RegexNode Child;
 			RegexNode Repeat;
+			RegexNode Next;
 			i32 Index;
 			i32 Min;
 			i32 Max;
 			i32 Count;
 			bool Lazy;
+			/// A repeat of one literal, class or `.`: matched by a loop over the units (no iterations).
+			bool Units;
 
 			new(i32 kind)
 			{
@@ -29,21 +35,8 @@ into namespace System.Text
 				Children = new List<RegexNode>();
 				Child = this;
 				Repeat = this;
+				Next = this;
 				Max = -1;
-			}
-	}
-
-	/// What is left to match after a node: a list of nodes.
-	public final class RegexCont
-	{
-		public:
-			RegexNode Node;
-			RegexCont? Next;
-
-			new(RegexNode node, RegexCont? next)
-			{
-				Node = node;
-				Next = next;
 			}
 	}
 
@@ -415,46 +408,195 @@ into namespace System.Text
 		i32 groups;
 		str pattern;
 
+		// The units a match can start with (when every match takes at least one: `prefilter`), and whether every
+		// match starts at the beginning (`^` first).
+		u8[] first;
+		bool prefilter;
+		bool anchored;
+
+		// Repeats of more than one unit: per repeat, the iterations done and where the current one started.
+		i32 repeats;
+		i32[] counts;
+		i32[] iterationStarts;
+
+		// Failures remembered per (end of an iteration, position): what finishing an iteration at a position gives
+		// depends on nothing else when every such repeat is `*`, `+` or `?` of something that takes a unit (no counts
+		// to reach, no empty iterations, no backreferences), so each one is tried once (`(a+)+b` is not exponential).
+		bool memoizable;
+		i32 tails;
+		u64[] failed;
+		u8[] failedText;
+		// Whether this search remembers them (not past 2^28 bits: 32 MB).
+		bool remember;
+
 		// The matcher's state for one search: the text and the groups' bounds.
 		u8[] s;
 		i32[] starts;
 		i32[] ends;
 		i32 matchEnd;
 
-		Rest(i32 pos, RegexCont? rest) : i32
-		{
-			if (rest is RegexCont next)
-				return Run(next.Node, pos, next.Next);
-			return pos;
-		}
-
-		Run(RegexNode node, i32 pos, RegexCont? rest) : i32
+		/// Whether a node can match without taking a unit; the units it can start with are added to `table`.
+		static Scan(RegexNode node, u8[] table) : bool
 		{
 			i32 kind = node.Kind;
-			if (kind == 0)
-				return Rest(pos, rest);
 			if (kind == 1)
-				return pos < s.Length && s[pos] == node.Literal ? Rest(pos + 1, rest) : -1;
+			{
+				table[node.Literal] = 1;
+				return false;
+			}
 			if (kind == 2)
-				return pos < s.Length && node.Table[s[pos]] != 0 ? Rest(pos + 1, rest) : -1;
+			{
+				loop (i32 i = 0..256)
+				{
+					if (node.Table[i] != 0)
+						table[i] = 1;
+				}
+				return false;
+			}
 			if (kind == 3)
-				return pos < s.Length && s[pos] != 10 ? Rest(pos + 1, rest) : -1;
+			{
+				loop (i32 i = 0..256)
+				{
+					if (i != 10)
+						table[i] = 1;
+				}
+				return false;
+			}
 			if (kind == 4)
 			{
-				RegexCont? chain = rest;
+				loop (RegexNode child in node.Children)
+				{
+					if (!Scan(child, table))
+						return false;
+				}
+				return true;
+			}
+			if (kind == 5)
+			{
+				bool empty = false;
+				loop (RegexNode option in node.Children)
+				{
+					if (Scan(option, table))
+						empty = true;
+				}
+				return empty;
+			}
+			if (kind == 6)
+				return Scan(node.Child, table);
+			if (kind == 8)
+				return Scan(node.Child, table) || node.Min == 0;
+			return true;
+		}
+
+		/// Links a parsed node to what follows it (`next`): its entry, the node matching starts it with.
+		Link(RegexNode node, RegexNode next) : RegexNode
+		{
+			i32 kind = node.Kind;
+			if (kind == 4)
+			{
+				RegexNode entry = next;
 				i32 i = node.Children.Count - 1;
 				loop (i >= 0)
 				{
-					chain = new RegexCont(node.Children[i], chain);
+					entry = Link(node.Children[i], entry);
 					i--;
 				}
-				return Rest(pos, chain);
+				return entry;
 			}
+			node.Next = next;
+			if (kind == 5)
+			{
+				loop (i32 i = 0..node.Children.Count)
+					node.Children[i] = Link(node.Children[i], next);
+			}
+			else if (kind == 6)
+			{
+				RegexNode close = new RegexNode(7);
+				close.Index = node.Index;
+				close.Next = next;
+				node.Child = Link(node.Child, close);
+			}
+			else if (kind == 8)
+			{
+				i32 atom = node.Child.Kind;
+				node.Units = atom == 1 || atom == 2 || atom == 3;
+				if (!node.Units)
+				{
+					bool simple = node.Min <= 1 && (node.Max == -1 || node.Max == 1);
+					if (!simple || Scan(node.Child, new u8[256]))
+						memoizable = false;
+					node.Count = repeats;
+					repeats++;
+					RegexNode tail = new RegexNode(9);
+					tail.Repeat = node;
+					tail.Index = tails;
+					tails++;
+					node.Child = Link(node.Child, tail);
+				}
+			}
+			return node;
+		}
+
+		Run(RegexNode start, i32 at) : i32
+		{
+			RegexNode node = start;
+			i32 pos = at;
+			// Nodes that take a unit or check a position go on to the next one in this loop; the others call.
+			loop (true)
+			{
+				i32 kind = node.Kind;
+				if (kind == 1)
+				{
+					if (pos >= s.Length || s[pos] != node.Literal)
+						return -1;
+					pos++;
+				}
+				else if (kind == 2)
+				{
+					if (pos >= s.Length || node.Table[s[pos]] == 0)
+						return -1;
+					pos++;
+				}
+				else if (kind == 3)
+				{
+					if (pos >= s.Length || s[pos] == 10)
+						return -1;
+					pos++;
+				}
+				else if (kind == 10)
+				{
+					if (pos != 0)
+						return -1;
+				}
+				else if (kind == 11)
+				{
+					if (pos != s.Length)
+						return -1;
+				}
+				else if (kind == 12 || kind == 13)
+				{
+					bool before = pos > 0 && RegexParser.IsWord(s[pos - 1]);
+					bool after = pos < s.Length && RegexParser.IsWord(s[pos]);
+					if ((before != after) != (kind == 12))
+						return -1;
+				}
+				else
+					return Branch(node, pos);
+				node = node.Next;
+			}
+		}
+
+		/// The nodes that may try more than one way on: the end, alternatives, groups and repeats.
+		Branch(RegexNode node, i32 pos) : i32
+		{
+			i32 kind = node.Kind;
+			if (kind == 0)
+				return pos;
 			if (kind == 5)
 			{
 				loop (RegexNode option in node.Children)
 				{
-					i32 r = Run(option, pos, rest);
+					i32 r = Run(option, pos);
 					if (r >= 0)
 						return r;
 				}
@@ -465,9 +607,7 @@ into namespace System.Text
 				i32 oldStart = starts[node.Index];
 				i32 oldEnd = ends[node.Index];
 				starts[node.Index] = pos;
-				RegexNode close = new RegexNode(7);
-				close.Index = node.Index;
-				i32 r = Run(node.Child, pos, new RegexCont(close, rest));
+				i32 r = Run(node.Child, pos);
 				if (r < 0)
 				{
 					starts[node.Index] = oldStart;
@@ -479,24 +619,33 @@ into namespace System.Text
 			{
 				i32 old = ends[node.Index];
 				ends[node.Index] = pos;
-				i32 r = Rest(pos, rest);
+				i32 r = Run(node.Next, pos);
 				if (r < 0)
 					ends[node.Index] = old;
 				return r;
 			}
 			if (kind == 8)
-				return RunRepeat(node, pos, 0, -1, rest);
-			if (kind == 9)
-				return RunRepeat(node.Repeat, pos, node.Count, node.Index, rest);
-			if (kind == 10)
-				return pos == 0 ? Rest(pos, rest) : -1;
-			if (kind == 11)
-				return pos == s.Length ? Rest(pos, rest) : -1;
-			if (kind == 12 || kind == 13)
 			{
-				bool before = pos > 0 && RegexParser.IsWord(s[pos - 1]);
-				bool after = pos < s.Length && RegexParser.IsWord(s[pos]);
-				return (before != after) == (kind == 12) ? Rest(pos, rest) : -1;
+				if (node.Units)
+					return RunUnits(node, pos);
+				return Iterate(node, pos, 0, -1);
+			}
+			if (kind == 9)
+			{
+				RegexNode repeat = node.Repeat;
+				i64 bit = 0;
+				if (remember)
+				{
+					if (failed.Length == 0)
+						failed = new u64[(i32)(((i64)tails * (i64)(s.Length + 1) + 63) / 64)];
+					bit = (i64)node.Index * (i64)(s.Length + 1) + (i64)pos;
+					if (((failed[(i32)(bit >> 6)] >> (u64)(bit & 63)) & 1) != 0)
+						return -1;
+				}
+				i32 r = Iterate(repeat, pos, counts[repeat.Count] + 1, iterationStarts[repeat.Count]);
+				if (r < 0 && remember)
+					failed[(i32)(bit >> 6)] = failed[(i32)(bit >> 6)] | ((u64)1 << (u64)(bit & 63));
+				return r;
 			}
 			return -1;
 		}
@@ -514,10 +663,12 @@ into namespace System.Text
 
 		/// A repeat of a single-unit atom, as a loop over the run of units it takes rather than a call per unit (a
 		/// long text would exhaust the stack): greedy takes the longest run and backs off one unit at a time while
-		/// the rest fails; lazy starts from the minimum and takes one more unit at a time.
-		RunUnits(RegexNode node, i32 pos, RegexCont? rest) : i32
+		/// the rest fails (only to where the next literal is, when a literal follows); lazy starts from the minimum
+		/// and takes one more unit at a time.
+		RunUnits(RegexNode node, i32 pos) : i32
 		{
 			RegexNode atom = node.Child;
+			RegexNode next = node.Next;
 			i32 limit = s.Length - pos;
 			if (node.Max >= 0 && node.Max < limit)
 				limit = node.Max;
@@ -526,11 +677,16 @@ into namespace System.Text
 			{
 				loop (n < limit && Takes(atom, pos + n))
 					n++;
+				bool literal = next.Kind == 1;
 				loop (n >= node.Min)
 				{
-					i32 r = Rest(pos + n, rest);
-					if (r >= 0)
-						return r;
+					i32 at = pos + n;
+					if (!literal || at < s.Length && s[at] == next.Literal)
+					{
+						i32 r = Run(next, at);
+						if (r >= 0)
+							return r;
+					}
 					n--;
 				}
 				return -1;
@@ -543,7 +699,7 @@ into namespace System.Text
 			}
 			loop (true)
 			{
-				i32 r = Rest(pos + n, rest);
+				i32 r = Run(next, pos + n);
 				if (r >= 0)
 					return r;
 				if (n >= limit || !Takes(atom, pos + n))
@@ -552,41 +708,47 @@ into namespace System.Text
 			}
 		}
 
-		/// `count` iterations of a repeat are done; `lastPos` is where the last one started (-1 at first).
-		RunRepeat(RegexNode node, i32 pos, i32 count, i32 lastPos, RegexCont? rest) : i32
+		/// A repeat of more than one unit at `pos`: `count` iterations are done; `last` is where the last one started
+		/// (-1 at first).
+		Iterate(RegexNode node, i32 pos, i32 count, i32 last) : i32
 		{
-			i32 atom = node.Child.Kind;
-			if (atom == 1 || atom == 2 || atom == 3)
-				return RunUnits(node, pos, rest);
 			// Another iteration is allowed under the maximum, and only if the last one made progress (an empty match
 			// could repeat forever).
-			bool more = (node.Max < 0 || count < node.Max) && !(count > node.Min && lastPos == pos);
+			bool more = (node.Max < 0 || count < node.Max) && !(count > node.Min && last == pos);
 			if (!node.Lazy)
 			{
 				if (more)
 				{
-					i32 r = Run(node.Child, pos, new RegexCont(Again(node, count, pos), rest));
+					i32 r = Again(node, pos, count);
 					if (r >= 0)
 						return r;
 				}
-				return count >= node.Min ? Rest(pos, rest) : -1;
+				return count >= node.Min ? Run(node.Next, pos) : -1;
 			}
 			if (count >= node.Min)
 			{
-				i32 r = Rest(pos, rest);
+				i32 r = Run(node.Next, pos);
 				if (r >= 0)
 					return r;
 			}
-			return more ? Run(node.Child, pos, new RegexCont(Again(node, count, pos), rest)) : -1;
+			return more ? Again(node, pos, count) : -1;
 		}
 
-		static Again(RegexNode repeat, i32 count, i32 pos) : RegexNode
+		/// One more iteration of a repeat from `pos`, after `count` (put back when it fails).
+		Again(RegexNode node, i32 pos, i32 count) : i32
 		{
-			RegexNode again = new RegexNode(9);
-			again.Repeat = repeat;
-			again.Count = count + 1;
-			again.Index = pos;
-			return again;
+			i32 slot = node.Count;
+			i32 oldCount = counts[slot];
+			i32 oldStart = iterationStarts[slot];
+			counts[slot] = count;
+			iterationStarts[slot] = pos;
+			i32 r = Run(node.Child, pos);
+			if (r < 0)
+			{
+				counts[slot] = oldCount;
+				iterationStarts[slot] = oldStart;
+			}
+			return r;
 		}
 
 		/// The first match from `from` on: its start (-1 when none); its end in matchEnd.
@@ -595,19 +757,36 @@ into namespace System.Text
 			s = text;
 			starts = new i32[groups + 1];
 			ends = new i32[groups + 1];
-			loop (i32 start = from..=text.Length)
+			if (text != failedText)
 			{
+				failedText = text;
+				failed = new u64[0];
+			}
+			remember = memoizable && (i64)tails * (i64)(text.Length + 1) <= 268435456;
+			i32 last = anchored ? (from == 0 ? 0 : -1) : text.Length;
+			i32 start = from;
+			loop (start <= last)
+			{
+				if (prefilter)
+				{
+					// Every match takes a unit first: skip to one it can start with.
+					loop (start < text.Length && first[text[start]] == 0)
+						start++;
+					if (start >= text.Length)
+						break;
+				}
 				loop (i32 g = 0..starts.Length)
 				{
 					starts[g] = -1;
 					ends[g] = -1;
 				}
-				i32 r = Run(root, start, null);
+				i32 r = Run(root, start);
 				if (r >= 0)
 				{
 					matchEnd = r;
 					return start;
 				}
+				start++;
 			}
 			matchEnd = -1;
 			return -1;
@@ -618,8 +797,24 @@ into namespace System.Text
 			{
 				this.pattern = pattern;
 				RegexParser parser = new RegexParser(pattern.Units());
-				root = parser.Parse();
+				RegexNode parsed = parser.Parse();
 				groups = parser.Groups;
+				first = new u8[256];
+				bool empty = Scan(parsed, first);
+				i32 kinds = 0;
+				loop (i32 i = 0..256)
+				{
+					if (first[i] != 0)
+						kinds++;
+				}
+				prefilter = !empty && kinds < 256;
+				memoizable = true;
+				root = Link(parsed, new RegexNode(0));
+				anchored = root.Kind == 10;
+				counts = new i32[repeats];
+				iterationStarts = new i32[repeats];
+				failed = new u64[0];
+				failedText = new u8[0];
 				s = new u8[0];
 				starts = new i32[0];
 				ends = new i32[0];

@@ -161,7 +161,7 @@ into namespace System
 		extern("f64.from_bits") FromBitsOf(i64 bits) : f64;
 
 		/// Digits, an optional point and more digits, an optional exponent: what ParseBits reads.
-		static IsNumber(u8[] text) : bool
+		static IsNumber(str text) : bool
 		{
 			i32 i = 0;
 			i32 n = text.Length;
@@ -214,6 +214,78 @@ into namespace System
 			return 0;
 		}
 
+		/// The value of a text IsNumber accepts, read in place: up to 15 significant digits times a power of ten up
+		/// to 10^22 are both exact in an f64, so one multiplication or division rounds the result correctly; the
+		/// other texts go to ParseBits.
+		static ReadNumber(str text) : f64
+		{
+			i32 n = text.Length;
+			i32 i = 0;
+			bool negative = text[0] == '-';
+			if (negative || text[0] == '+')
+				i++;
+			u64 digits = 0;
+			i32 significant = 0;
+			i32 exponent = 0;
+			bool point = false;
+			loop (i < n)
+			{
+				u32 c = text[i];
+				if (c == '.')
+					point = true;
+				else if (c >= '0' && c <= '9')
+				{
+					if (digits != 0 || c != '0')
+					{
+						significant++;
+						if (significant > 15)
+							return ReadBits(text);
+						digits = digits * 10 + (u64)(c - '0');
+					}
+					if (point)
+						exponent--;
+				}
+				else
+					break;
+				i++;
+			}
+			if (i < n)
+			{
+				// The exponent: `e`, a sign, digits (more than four of them go to ParseBits).
+				i++;
+				bool below = text[i] == '-';
+				if (below || text[i] == '+')
+					i++;
+				if (n - i > 4)
+					return ReadBits(text);
+				i32 power = 0;
+				loop (i < n)
+				{
+					power = power * 10 + (i32)(text[i] - '0');
+					i++;
+				}
+				exponent += below ? -power : power;
+			}
+			if (digits == 0)
+				return negative ? ReadBits(text) : 0.0;
+			if (exponent < -22 || exponent > 22)
+				return ReadBits(text);
+			f64 scale = 1.0;
+			loop (i32 k = 0..(exponent < 0 ? -exponent : exponent))
+				scale = scale * 10.0;
+			f64 value = exponent < 0 ? (f64)digits / scale : (f64)digits * scale;
+			return negative ? -value : value;
+		}
+
+		/// What ParseBits reads from a text IsNumber accepts (ASCII: its units widened as they are).
+		static ReadBits(str text) : f64
+		{
+			u16[] wide = new u16[text.Length];
+			loop (i32 i = 0..wide.Length)
+				wide[i] = text[i];
+			return FromBitsOf(ParseBits(wide));
+		}
+
 		public:
 			/// As text by a format: F, N, E, P, G, R and a precision (`(2.5).ToString("F2")` is "2.50").
 			ToString(str format) : str => NumberFormat.FormatDouble(this, format);
@@ -258,23 +330,23 @@ into namespace System
 			static Parse(str text) : f64
 			{
 				str trimmed = text.Trim();
+				if (IsNumber(trimmed))
+					return ReadNumber(trimmed);
 				i32 special = Special(trimmed);
 				if (special != 0)
 					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
-				if (!IsNumber(trimmed.Units()))
-					throw new FormatError("not a number: " + text);
-				return FromBitsOf(ParseBits(Unicode.ToUtf16(trimmed)));
+				throw new FormatError("not a number: " + text);
 			}
 
 			/// The number `text` writes, or null when it writes none.
 			static TryParse(str text) : f64?
 			{
 				str trimmed = text.Trim();
+				if (IsNumber(trimmed))
+					return ReadNumber(trimmed);
 				if (Special(trimmed) != 0)
 					return Parse(trimmed);
-				if (!IsNumber(trimmed.Units()))
-					return null;
-				return FromBitsOf(ParseBits(Unicode.ToUtf16(trimmed)));
+				return null;
 			}
 	}
 
@@ -780,7 +852,7 @@ into namespace System
 				i32 special = Float64.Special(trimmed);
 				if (special != 0)
 					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
-				if (!Float64.IsNumber(trimmed.Units()))
+				if (!Float64.IsNumber(trimmed))
 					throw new FormatError("not a number: " + text);
 				return Read(trimmed.Units());
 			}
@@ -791,7 +863,7 @@ into namespace System
 				str trimmed = text.Trim();
 				if (Float64.Special(trimmed) != 0)
 					return Parse(trimmed);
-				if (!Float64.IsNumber(trimmed.Units()))
+				if (!Float64.IsNumber(trimmed))
 					return null;
 				return Read(trimmed.Units());
 			}
@@ -941,7 +1013,7 @@ into namespace System
 				i32 special = Float64.Special(trimmed);
 				if (special != 0)
 					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
-				if (!Float64.IsNumber(trimmed.Units()))
+				if (!Float64.IsNumber(trimmed))
 					throw new FormatError("not a number: " + text);
 				return Read(trimmed.Units());
 			}
@@ -952,7 +1024,7 @@ into namespace System
 				str trimmed = text.Trim();
 				if (Float64.Special(trimmed) != 0)
 					return Parse(trimmed);
-				if (!Float64.IsNumber(trimmed.Units()))
+				if (!Float64.IsNumber(trimmed))
 					return null;
 				return Read(trimmed.Units());
 			}

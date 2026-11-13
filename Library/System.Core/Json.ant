@@ -13,17 +13,19 @@ into namespace System.Text
 		bool boolean;
 		f64 number;
 		str text;
-		List<JsonValue> items;
-		List<str> keys;
-		List<JsonValue> values;
+		// An array's items, or an object's member values (made when the first one comes).
+		List<JsonValue>? items;
+		// An object's keys, in order, and from IndexFrom members on, where each one is.
+		List<str>? keys;
+		Dictionary<str, i32>? index;
+
+		/// Objects up to this many members find a key by looking at each one; bigger ones keep an index.
+		const i32 IndexFrom = 8;
 
 		new(JsonKind kind)
 		{
 			this.kind = kind;
 			text = "";
-			items = new List<JsonValue>();
-			keys = new List<str>();
-			values = new List<JsonValue>();
 		}
 
 		Expect(JsonKind wanted, str what)
@@ -32,13 +34,64 @@ into namespace System.Text
 				throw new FormatError("the JSON value is not " + what);
 		}
 
+		Items() : List<JsonValue>
+		{
+			if (items is List<JsonValue> list)
+				return list;
+			List<JsonValue> made = new List<JsonValue>();
+			items = made;
+			return made;
+		}
+
+		Keys() : List<str>
+		{
+			if (keys is List<str> list)
+				return list;
+			List<str> made = new List<str>();
+			keys = made;
+			return made;
+		}
+
+		/// Where an object's member `key` is, or -1.
+		Find(str key) : i32
+		{
+			if (index is Dictionary<str, i32> map)
+				return map.TryGet(key, -1);
+			if (keys is List<str> list)
+			{
+				i32 count = list.Count;
+				if (count < IndexFrom)
+				{
+					loop (i32 i = 0..count)
+					{
+						if (list[i] == key)
+							return i;
+					}
+					return -1;
+				}
+				Dictionary<str, i32> made = new Dictionary<str, i32>();
+				loop (i32 i = 0..count)
+					made.Set(list[i], i);
+				index = made;
+				return made.TryGet(key, -1);
+			}
+			return -1;
+		}
+
+		/// `value` in quotes, escaped: the units that need no escape go in as runs.
 		static WriteText(StringBuilder sb, str value)
 		{
-			sb.Append("\"");
-			u8[] units = value.Units();
-			loop (i32 i = 0..units.Length)
+			sb.Append((u16)'"');
+			i32 n = value.Length;
+			i32 run = 0;
+			loop (i32 i = 0..n)
 			{
-				u32 c = units[i];
+				u32 c = value[i];
+				if (c >= 32 && c != '"' && c != '\\')
+					continue;
+				if (i > run)
+					sb.Append(value, run, i - run);
+				run = i + 1;
 				if (c == '"')
 					sb.Append("\\\"");
 				else if (c == '\\')
@@ -53,15 +106,19 @@ into namespace System.Text
 					sb.Append("\\b");
 				else if (c == 12)
 					sb.Append("\\f");
-				else if (c < 32)
-					sb.Append("\\u00" + Hex(c >> 4) + Hex(c & 15));
 				else
-					sb.Append(new String<u8>([units[i]]));
+				{
+					sb.Append("\\u00");
+					sb.Append(Hex(c >> 4));
+					sb.Append(Hex(c & 15));
+				}
 			}
-			sb.Append("\"");
+			if (n > run)
+				sb.Append(value, run, n - run);
+			sb.Append((u16)'"');
 		}
 
-		static Hex(u32 digit) : str => new String<u8>([(u8)(digit < 10 ? '0' + digit : 'a' + digit - 10)]);
+		static Hex(u32 digit) : u16 => (u16)(digit < 10 ? '0' + digit : 'a' + digit - 10);
 
 		Write(StringBuilder sb)
 		{
@@ -75,7 +132,7 @@ into namespace System.Text
 					throw new FormatError("JSON has no value for " + number.ToString());
 				i64 whole = (i64)number;
 				if ((f64)whole == number && number > -9007199254740992.0 && number < 9007199254740992.0)
-					sb.Append(whole.ToString());
+					sb.Append(whole);
 				else
 					sb.Append(number.ToString());
 			}
@@ -83,27 +140,33 @@ into namespace System.Text
 				WriteText(sb, text);
 			else if (kind == JsonKind.Array)
 			{
-				sb.Append("[");
-				loop (i32 i = 0..items.Count)
+				sb.Append((u16)'[');
+				if (items is List<JsonValue> list)
 				{
-					if (i > 0)
-						sb.Append(",");
-					items[i].Write(sb);
+					loop (i32 i = 0..list.Count)
+					{
+						if (i > 0)
+							sb.Append((u16)',');
+						list[i].Write(sb);
+					}
 				}
-				sb.Append("]");
+				sb.Append((u16)']');
 			}
 			else
 			{
-				sb.Append("{");
-				loop (i32 i = 0..keys.Count)
+				sb.Append((u16)'{');
+				if (keys is List<str> names && items is List<JsonValue> values)
 				{
-					if (i > 0)
-						sb.Append(",");
-					WriteText(sb, keys[i]);
-					sb.Append(":");
-					values[i].Write(sb);
+					loop (i32 i = 0..names.Count)
+					{
+						if (i > 0)
+							sb.Append((u16)',');
+						WriteText(sb, names[i]);
+						sb.Append((u16)':');
+						values[i].Write(sb);
+					}
 				}
-				sb.Append("}");
+				sb.Append((u16)'}');
 			}
 		}
 
@@ -145,20 +208,31 @@ into namespace System.Text
 			str AsString { get { Expect(JsonKind.String, "a string"); return text; } }
 
 			/// Items of an array, or members of an obj.
-			i32 Count { get => kind == JsonKind.Array ? items.Count : kind == JsonKind.Object ? keys.Count : 0; }
+			i32 Count
+			{
+				get
+				{
+					if (kind == JsonKind.Array || kind == JsonKind.Object)
+					{
+						if (items is List<JsonValue> list)
+							return list.Count;
+					}
+					return 0;
+				}
+			}
 
 			/// An array's item.
 			At(i32 index) : JsonValue
 			{
 				Expect(JsonKind.Array, "an array");
-				return items[index];
+				return Items()[index];
 			}
 
 			/// Appends to an array (returns this, to chain).
 			Add(JsonValue item) : JsonValue
 			{
 				Expect(JsonKind.Array, "an array");
-				items.Add(item);
+				Items().Add(item);
 				return this;
 			}
 
@@ -166,55 +240,45 @@ into namespace System.Text
 			KeyAt(i32 index) : str
 			{
 				Expect(JsonKind.Object, "an obj");
-				return keys[index];
+				return Keys()[index];
 			}
 
 			/// The i-th member's value.
 			ValueAt(i32 index) : JsonValue
 			{
 				Expect(JsonKind.Object, "an obj");
-				return values[index];
+				return Items()[index];
 			}
 
-			Has(str key) : bool
-			{
-				if (kind != JsonKind.Object)
-					return false;
-				loop (i32 i = 0..keys.Count)
-				{
-					if (keys[i] == key)
-						return true;
-				}
-				return false;
-			}
+			Has(str key) : bool => kind == JsonKind.Object && Find(key) >= 0;
 
 			/// An obj's member, or null when there is none.
 			Get(str key) : JsonValue?
 			{
 				if (kind != JsonKind.Object)
 					return null;
-				loop (i32 i = 0..keys.Count)
-				{
-					if (keys[i] == key)
-						return values[i];
-				}
-				return null;
+				i32 at = Find(key);
+				if (at < 0)
+					return null;
+				return Items()[at];
 			}
 
 			/// Sets an obj's member (replacing one with that key; returns this, to chain).
 			Set(str key, JsonValue value) : JsonValue
 			{
 				Expect(JsonKind.Object, "an obj");
-				loop (i32 i = 0..keys.Count)
+				i32 at = Find(key);
+				List<JsonValue> values = Items();
+				if (at >= 0)
 				{
-					if (keys[i] == key)
-					{
-						values[i] = value;
-						return this;
-					}
+					values[at] = value;
+					return this;
 				}
-				keys.Add(key);
+				List<str> names = Keys();
+				names.Add(key);
 				values.Add(value);
+				if (index is Dictionary<str, i32> map)
+					map.Set(key, names.Count - 1);
 				return this;
 			}
 
@@ -243,6 +307,11 @@ into namespace System.Text
 		u8[] p;
 		i32 at;
 		i32 depth;
+		// The units of a string with escapes, as they are read (reused from one string to the next).
+		u8[] scratch;
+		i32 used;
+		// The keys read last, by a hash of their units: objects of one shape share their keys' strings.
+		str?[] keys;
 
 		Enter()
 		{
@@ -251,12 +320,26 @@ into namespace System.Text
 				Fail("nesting deeper than " + MaxDepth);
 		}
 
+		Put(u32 unit)
+		{
+			if (used == scratch.Length)
+			{
+				u8[] bigger = new u8[scratch.Length * 2];
+				Array.Copy(scratch, 0, bigger, 0, used);
+				scratch = bigger;
+			}
+			scratch[used] = (u8)unit;
+			used++;
+		}
+
 		public:
 			const i32 MaxDepth = 256; // deep enough for any sane document, shallow enough for a 1 MB stack with reference counting
 
 			new(u8[] units)
 			{
 				p = units;
+				scratch = new u8[64];
+				keys = new str?[64];
 			}
 
 			bool AtEnd { get => at >= p.Length; }
@@ -307,13 +390,13 @@ into namespace System.Text
 
 			ExpectWord(str word)
 			{
-				u8[] w = word.Units();
-				loop (i32 i = 0..w.Length)
+				i32 n = word.Length;
+				loop (i32 i = 0..n)
 				{
-					if (at + i >= p.Length || p[at + i] != w[i])
+					if (at + i >= p.Length || p[at + i] != word[i])
 						Fail("expected " + word);
 				}
-				at += w.Length;
+				at += n;
 			}
 
 			/// A number by the JSON grammar: `-`?, `0` or digits not starting with one, a fraction `.` digits, an
@@ -321,12 +404,23 @@ into namespace System.Text
 			ReadNumber() : JsonValue
 			{
 				i32 start = at;
-				if (p[at] == '-')
+				bool negative = p[at] == '-';
+				if (negative)
 					at++;
 				if (at < p.Length && p[at] == '0')
 					at++;
 				else if (Digits() == 0)
 					Fail("bad number");
+				// An integer of up to 15 digits is exact in an f64: no text to parse (-0 keeps its sign through it).
+				i32 whole = at - start - (negative ? 1 : 0);
+				bool integer = !(at < p.Length && (p[at] == '.' || p[at] == 'e' || p[at] == 'E'));
+				if (integer && whole <= 15 && !(negative && whole == 1 && p[at - 1] == '0'))
+				{
+					i64 value = 0;
+					loop (i32 i = at - whole..at)
+						value = value * 10 + (i64)(p[i] - '0');
+					return JsonValue.Of((f64)(negative ? -value : value));
+				}
 				if (at < p.Length && p[at] == '.')
 				{
 					at++;
@@ -341,9 +435,7 @@ into namespace System.Text
 					if (Digits() == 0)
 						Fail("bad number");
 				}
-				u8[] digits = new u8[at - start];
-				Array.Copy(p, start, digits, 0, at - start);
-				f64? parsed = Float64.TryParse(new String<u8>(digits));
+				f64? parsed = Float64.TryParse(new String<u8>(p, start, at - start));
 				if (parsed == null)
 					Fail("bad number");
 				return JsonValue.Of(parsed ?? 0.0);
@@ -361,7 +453,20 @@ into namespace System.Text
 			ReadText() : str
 			{
 				at++;
-				List<u8> bytes = new List<u8>();
+				// Most strings have no escape: they are a part of the text as it is.
+				i32 start = at;
+				loop (at < p.Length && p[at] != '"' && p[at] != '\\')
+					at++;
+				if (at >= p.Length)
+					Fail("unterminated string");
+				if (p[at] == '"')
+				{
+					at++;
+					return new String<u8>(p, start, at - 1 - start);
+				}
+				used = 0;
+				loop (i32 i = start..at)
+					Put(p[i]);
 				loop (true)
 				{
 					if (at >= p.Length)
@@ -372,7 +477,7 @@ into namespace System.Text
 						break;
 					if (c != '\\')
 					{
-						bytes.Add((u8)c);
+						Put(c);
 						continue;
 					}
 					if (at >= p.Length)
@@ -380,17 +485,17 @@ into namespace System.Text
 					u32 e = p[at];
 					at++;
 					if (e == 'n')
-						bytes.Add(10);
+						Put(10);
 					else if (e == 't')
-						bytes.Add(9);
+						Put(9);
 					else if (e == 'r')
-						bytes.Add(13);
+						Put(13);
 					else if (e == 'b')
-						bytes.Add(8);
+						Put(8);
 					else if (e == 'f')
-						bytes.Add(12);
+						Put(12);
 					else if (e == '"' || e == '\\' || e == '/')
-						bytes.Add((u8)e);
+						Put(e);
 					else if (e == 'u')
 					{
 						// A surrogate pair makes one character; a surrogate on its own (or a high one whose next escape
@@ -415,17 +520,67 @@ into namespace System.Text
 						}
 						else if (code >= 0xDC00 && code < 0xE000)
 							code = 0xFFFD;
-						u8[] encoded = Unicode.Encode<u8>([code]);
-						loop (i32 i = 0..encoded.Length)
-							bytes.Add(encoded[i]);
+						// The character's UTF-8 bytes.
+						if (code < 0x80)
+							Put(code);
+						else if (code < 0x800)
+						{
+							Put(0xC0 | code >> 6);
+							Put(0x80 | code & 0x3F);
+						}
+						else if (code < 0x10000)
+						{
+							Put(0xE0 | code >> 12);
+							Put(0x80 | code >> 6 & 0x3F);
+							Put(0x80 | code & 0x3F);
+						}
+						else
+						{
+							Put(0xF0 | code >> 18);
+							Put(0x80 | code >> 12 & 0x3F);
+							Put(0x80 | code >> 6 & 0x3F);
+							Put(0x80 | code & 0x3F);
+						}
 					}
 					else
 						Fail("bad escape");
 				}
-				u8[] units = new u8[bytes.Count];
-				loop (i32 i = 0..bytes.Count)
-					units[i] = bytes[i];
-				return new String<u8>(units);
+				return new String<u8>(scratch, 0, used);
+			}
+
+			/// An object's key: the string of an earlier key with the same units when there is one.
+			ReadKey() : str
+			{
+				i32 start = at + 1;
+				i32 end = start;
+				u32 h = 0;
+				loop (end < p.Length && p[end] != '"' && p[end] != '\\')
+				{
+					h = h * 31 + p[end];
+					end++;
+				}
+				if (end >= p.Length || p[end] != '"' || end - start > 32)
+					return ReadText();
+				i32 count = end - start;
+				i32 slot = (i32)(h & 63);
+				at = end + 1;
+				if (keys[slot] is str known && known.Length == count)
+				{
+					bool same = true;
+					loop (i32 i = 0..count)
+					{
+						if (known[i] != p[start + i])
+						{
+							same = false;
+							break;
+						}
+					}
+					if (same)
+						return known;
+				}
+				str key = new String<u8>(p, start, count);
+				keys[slot] = key;
+				return key;
 			}
 
 			ReadHex4() : u32
@@ -491,7 +646,7 @@ into namespace System.Text
 					SkipSpace();
 					if (at >= p.Length || p[at] != '"')
 						Fail("expected a key");
-					str key = ReadText();
+					str key = ReadKey();
 					SkipSpace();
 					if (at >= p.Length || p[at] != ':')
 						Fail("expected :");
