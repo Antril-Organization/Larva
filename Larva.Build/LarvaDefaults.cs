@@ -74,26 +74,56 @@ namespace Larva.Build
             }
         }
 
-        /// <summary>The values the file sets (none when there is no file, or it cannot be read).</summary>
+        /// <summary>
+        /// The values the file sets (none when there is no file, or it cannot be read: a build goes on with the built-in
+        /// defaults, and a file that is not JSON is reported once, on standard error).
+        /// </summary>
         public static Dictionary<string, string> Configured()
         {
             var values = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (ReadFile(out var json, out string? problem) && json is not null)
+            {
+                foreach (var (key, value) in json)
+                {
+                    if (Keys.Contains(key) && value is JsonValue v && v.TryGetValue(out string? text))
+                        values[key] = text;
+                }
+            }
+            else if (problem is not null && !reported)
+            {
+                reported = true;
+                Console.Error.WriteLine($"larva: {problem} (the built-in defaults apply; `larva config --reset` writes a new file)");
+            }
+            return values;
+        }
+
+        private static bool reported;
+
+        /// <summary>
+        /// Reads the file as it is: <paramref name="json"/> is its object (null when there is no file), or
+        /// <paramref name="problem"/> says why it could not be read (<c>path: error</c>). True when it was read.
+        /// </summary>
+        public static bool ReadFile(out JsonObject? json, out string? problem)
+        {
+            json = null;
+            problem = null;
             try
             {
-                if (File.Exists(ConfigPath) && JsonNode.Parse(File.ReadAllText(ConfigPath)) is JsonObject json)
+                if (!File.Exists(ConfigPath))
+                    return true;
+                if (JsonNode.Parse(File.ReadAllText(ConfigPath)) is JsonObject read)
                 {
-                    foreach (var (key, value) in json)
-                    {
-                        if (Keys.Contains(key) && value is JsonValue v && v.TryGetValue(out string? text))
-                            values[key] = text;
-                    }
+                    json = read;
+                    return true;
                 }
+                problem = $"{ConfigPath}: not a JSON object of settings";
+                return false;
             }
             catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException)
             {
-                // An unreadable file is no defaults: builds go on with the built-in ones.
+                problem = $"{ConfigPath}: {e.Message}";
+                return false;
             }
-            return values;
         }
 
         /// <summary>The values in effect: the file's, then the built-in ones for what it does not set.</summary>
@@ -105,11 +135,23 @@ namespace Larva.Build
             return values;
         }
 
-        public static void Save(IReadOnlyDictionary<string, string> values)
+        /// <summary>
+        /// Writes the settings: the file's other keys (a newer larva's, a tool's) are kept as they are, so nothing is lost
+        /// by writing one key. A file that cannot be read is not written over (<see cref="InvalidDataException"/> with the
+        /// problem) unless <paramref name="reset"/>: then a new file replaces it.
+        /// </summary>
+        public static void Save(IReadOnlyDictionary<string, string> values, bool reset = false)
         {
-            var json = new JsonObject();
-            foreach (var key in Keys.Where(values.ContainsKey))
-                json[key] = values[key];
+            if (!ReadFile(out var json, out string? problem) && !reset)
+                throw new InvalidDataException($"{problem}: not written over (fix it, or `larva config --reset` to start a new file)");
+            json ??= new JsonObject();
+            foreach (var key in Keys)
+            {
+                if (values.TryGetValue(key, out var value))
+                    json[key] = value;
+                else
+                    json.Remove(key);
+            }
             Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath)!);
             File.WriteAllText(ConfigPath, json.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + "\n");
         }
