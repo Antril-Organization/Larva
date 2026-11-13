@@ -715,11 +715,11 @@ namespace Larva.Build
             bool scan = Values("SOURCES", "scan").LastOrDefault() is not QueenBool { Value: false };
             var patterns = Ignore.Select(p => p.Replace('\\', '/').Trim('/')).Where(p => p.Length > 0).ToList();
             if (scan)
-                Walk(Folder);
+                Walk(Folder, top: true);
             var seen = new HashSet<string>(Sources, StringComparer.OrdinalIgnoreCase);
             foreach (var include in Values("SOURCES", "include"))
             {
-                var found = Expand(Folder, include.Display).Where(IsSource).ToList();
+                var found = Expand(Folder, include.Display, trees).Where(IsSource).ToList();
                 if (found.Count == 0)
                     Report(diagnostics, "QN130", $"`include: {include.Display}` names no source file ({string.Join(", ", SourceExtensions)})", include, error: false);
                 foreach (var file in found.Where(f => !Ignored(Relative(f)) && seen.Add(f)))
@@ -727,53 +727,35 @@ namespace Larva.Build
             }
             return;
 
-            void Walk(string folder)
+            void Walk(string folder, bool top)
             {
-                // A folder this user may not read (a protected system folder under a home directory) holds nothing of the project.
-                string[] files, subs;
+                // Each folder listed once (its files, its subfolders and whether they are links). A folder this user may
+                // not read (a protected system folder under a home directory) holds nothing of the project.
+                List<(string Path, bool Folder, bool Link)> entries;
                 try
                 {
-                    files = Directory.GetFiles(folder);
-                    subs = Directory.GetDirectories(folder);
+                    entries = [.. new System.IO.Enumeration.FileSystemEnumerable<(string, bool, bool)>(folder,
+                        (ref System.IO.Enumeration.FileSystemEntry e) => (e.ToFullPath(), e.IsDirectory, (e.Attributes & FileAttributes.ReparsePoint) != 0),
+                        new EnumerationOptions { RecurseSubdirectories = false, IgnoreInaccessible = false, AttributesToSkip = 0 })];
                 }
                 catch (Exception e) when (e is UnauthorizedAccessException or IOException)
                 {
                     return;
                 }
-                foreach (var file in files.Where(IsSource).OrderBy(f => f, StringComparer.Ordinal))
+                // A nested project (a subfolder with its own project file) is not part of this one.
+                if (!top && entries.Any(e => !e.Folder && e.Path.EndsWith(Extension, StringComparison.OrdinalIgnoreCase)))
+                    return;
+                foreach (var (file, _, _) in entries.Where(e => !e.Folder && IsSource(e.Path)).OrderBy(e => e.Path, StringComparer.Ordinal))
                 {
                     if (!Ignored(Relative(file)))
                         Sources.Add(Path.GetFullPath(file));
                 }
-                foreach (var sub in subs.OrderBy(f => f, StringComparer.Ordinal))
+                foreach (var (sub, _, link) in entries.Where(e => e.Folder).OrderBy(e => e.Path, StringComparer.Ordinal))
                 {
-                    string name = Path.GetFileName(sub);
-                    // Hidden folders, build output, links to other folders and nested projects are not part of this one.
-                    if (name.StartsWith('.') || name is "bin" or "obj" || Ignored(Relative(sub)) || IsLink(sub) || HasProject(sub))
+                    // Hidden folders, build output, packages, and links to other folders are not part of this one.
+                    if (Pruned(Path.GetFileName(sub)) || link || Ignored(Relative(sub)))
                         continue;
-                    Walk(sub);
-                }
-            }
-            static bool IsLink(string folder)
-            {
-                try
-                {
-                    return (System.IO.File.GetAttributes(folder) & FileAttributes.ReparsePoint) != 0;
-                }
-                catch (Exception e) when (e is UnauthorizedAccessException or IOException)
-                {
-                    return true;
-                }
-            }
-            bool HasProject(string folder)
-            {
-                try
-                {
-                    return Directory.GetFiles(folder, "*" + Extension).Length > 0;
-                }
-                catch (Exception e) when (e is UnauthorizedAccessException or IOException)
-                {
-                    return true;
+                    Walk(sub, top: false);
                 }
             }
             string Relative(string path) => Path.GetRelativePath(Folder, path).Replace('\\', '/');
@@ -796,7 +778,7 @@ namespace Larva.Build
             var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var copy in Values("FILES", "copy"))
             {
-                var found = Expand(Folder, copy.Display);
+                var found = Expand(Folder, copy.Display, trees);
                 if (found.Count == 0)
                     Report(diagnostics, "QN130", $"`copy: {copy.Display}` names no file", copy, error: false);
                 foreach (var file in found)
@@ -817,7 +799,7 @@ namespace Larva.Build
                 var items = entry.Value is QueenList list ? list.Items : [entry.Value];
                 foreach (var item in items)
                 {
-                    var found = Expand(Folder, item.Display);
+                    var found = Expand(Folder, item.Display, trees);
                     if (found.Count == 0)
                     {
                         Report(diagnostics, "QN130", $"`{entry.Key}: {item.Display}` names no file", item);
@@ -847,19 +829,26 @@ namespace Larva.Build
         /// The files a path or pattern names, relative to <paramref name="folder"/> (or absolute): a file, every file under a
         /// folder, or a pattern where <c>*</c> and <c>?</c> stay within a folder and <c>**</c> crosses folders. Sorted.
         /// </summary>
-        public static List<string> Expand(string folder, string pattern)
+        public static List<string> Expand(string folder, string pattern) => Expand(folder, pattern, null);
+
+        /// <summary>The folders this project's patterns walked (each once, whatever the number of patterns under it).</summary>
+        private readonly FileTrees trees = new();
+
+        private static List<string> Expand(string folder, string pattern, FileTrees? trees)
         {
+            trees ??= new FileTrees();
             pattern = pattern.Replace('\\', '/').Trim();
             if (pattern.Length == 0)
                 return [];
+            // Packages (`node_modules`) are only searched by a pattern that names them.
+            bool packages = pattern.Contains("node_modules", StringComparison.OrdinalIgnoreCase);
             if (pattern.IndexOfAny(['*', '?']) < 0)
             {
                 string path = Path.GetFullPath(Path.Combine(folder, pattern));
                 if (System.IO.File.Exists(path))
                     return [path];
                 if (Directory.Exists(path))
-                    return [.. Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
-                        .Where(f => !Hidden(Path.GetRelativePath(path, f))).Select(Path.GetFullPath).OrderBy(f => f, StringComparer.Ordinal)];
+                    return [.. trees.Under(path, packages).Select(f => f.File).OrderBy(f => f, StringComparer.Ordinal)];
                 return [];
             }
             // The fixed folders before the first wildcard are where the search starts.
@@ -872,14 +861,55 @@ namespace Larva.Build
             var regex = new System.Text.RegularExpressions.Regex("^" + System.Text.RegularExpressions.Regex.Escape(rest)
                 .Replace("\\*\\*/", "(.*/)?").Replace("\\*\\*", ".*").Replace("\\*", "[^/]*").Replace("\\?", "[^/]") + "$",
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            return [.. Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
-                .Select(f => (File: f, Relative: Path.GetRelativePath(root, f).Replace('\\', '/')))
-                .Where(f => !Hidden(f.Relative) && regex.IsMatch(f.Relative))
-                .Select(f => Path.GetFullPath(f.File)).OrderBy(f => f, StringComparer.Ordinal)];
+            return [.. trees.Under(root, packages).Where(f => regex.IsMatch(f.Relative)).Select(f => f.File).OrderBy(f => f, StringComparer.Ordinal)];
+        }
 
-            // Hidden files and folders, and build output, are never picked up by a folder or a pattern.
-            static bool Hidden(string relative) =>
-                relative.Replace('\\', '/').Split('/').Any(p => p.StartsWith('.') || p is "bin" or "obj");
+        /// <summary>
+        /// A folder a walk or a pattern never enters: hidden folders, build output (<c>bin</c>, <c>obj</c>) and, unless
+        /// <paramref name="packages"/>, packages (<c>node_modules</c>).
+        /// </summary>
+        private static bool Pruned(string name, bool packages = false) =>
+            name.StartsWith('.') || name is "bin" or "obj" || !packages && name.Equals("node_modules", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// The files under folders, each folder walked once, without what <see cref="Pruned"/> leaves out (nor hidden files,
+        /// nor files named <c>bin</c> or <c>obj</c>): a folder inside one already walked is read from that walk.
+        /// </summary>
+        private sealed class FileTrees
+        {
+            private readonly List<(string Root, bool Packages, List<string> Files)> walked = [];
+
+            /// <summary>The files under <paramref name="root"/> (a full path), with their paths relative to it (with <c>/</c>).</summary>
+            public IEnumerable<(string File, string Relative)> Under(string root, bool packages)
+            {
+                string prefix = WithSeparator(root);
+                foreach (var (top, withPackages, files) in walked)
+                {
+                    string topPrefix = WithSeparator(top);
+                    if (withPackages != packages || !prefix.StartsWith(topPrefix, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    // A folder below one walked: its files are in that walk, unless a folder between was left out.
+                    string between = prefix[topPrefix.Length..].Replace('\\', '/').Trim('/');
+                    if (between.Length > 0 && between.Split('/').Any(p => Pruned(p, packages)))
+                        continue;
+                    return files.Where(f => f.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).Select(f => (f, f[prefix.Length..].Replace('\\', '/')));
+                }
+                var found = new System.IO.Enumeration.FileSystemEnumerable<string>(root, (ref System.IO.Enumeration.FileSystemEntry e) => e.ToFullPath(),
+                    new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = false, AttributesToSkip = 0 })
+                {
+                    ShouldIncludePredicate = (ref System.IO.Enumeration.FileSystemEntry e) => !e.IsDirectory && !Hidden(e.FileName),
+                    ShouldRecursePredicate = (ref System.IO.Enumeration.FileSystemEntry e) => !Pruned(e.FileName.ToString(), packages),
+                }.ToList();
+                walked.Add((root, packages, found));
+                return found.Select(f => (f, f[prefix.Length..].Replace('\\', '/')));
+            }
+
+            // Hidden files, and files named as build output, are never picked up by a folder or a pattern.
+            private static bool Hidden(ReadOnlySpan<char> name) =>
+                name.StartsWith('.') || name.SequenceEqual("bin") || name.SequenceEqual("obj");
+
+            private static string WithSeparator(string folder) =>
+                folder.EndsWith(Path.DirectorySeparatorChar) || folder.EndsWith(Path.AltDirectorySeparatorChar) ? folder : folder + Path.DirectorySeparatorChar;
         }
 
         /// <summary>A path (relative to the project) matches an ignore pattern: the same path, or a <c>*</c> wildcard over it.</summary>

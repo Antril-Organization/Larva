@@ -125,6 +125,37 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
         Check("FILES into: a folder under the build's is fine", project is not null && project.CopiedFiles.Any(f => f.Target == "data/conf/Main.ant"), string.Join("; ", diagnostics));
     }
 
+    /// <summary>
+    /// FILES patterns share one walk of each folder: a pattern below one walked reads that walk; hidden folders, build
+    /// output and packages are not entered, unless a pattern names the packages; a folder named itself is copied whole.
+    /// </summary>
+    [Fact]
+    public void FILES_patterns_skip_hidden_folders_build_output_and_packages()
+    {
+        string root = Path.Combine(projects.Root, "Patterns");
+        void Write(string relative)
+        {
+            string path = Path.Combine(root, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path, relative);
+        }
+        foreach (var file in new[] { "a.txt", "docs/b.txt", "docs/deep/c.txt", ".hidden/d.txt", "bin/e.txt", "obj/f.txt",
+                     "node_modules/pkg/g.txt", "docs/node_modules/h.txt", "docs/.cache/i.txt", "assets/j.txt", "assets/sub/k.txt", "assets/.l.txt" })
+            Write(file);
+        File.WriteAllText(Path.Combine(root, "Patterns.queen"),
+            "queen 1.0;\nchunk PROJ:\n   name: Patterns\nchunk BUILD:\n   stdlib: none\nchunk FILES:\n   copy: [**/*.txt, docs/**/*.txt, docs/*.txt, node_modules/**/*.txt, assets, .hidden/*.txt]\n");
+        var diagnostics = new List<QueenDiagnostic>();
+        var project = QueenProject.Load(Path.Combine(root, "Patterns.queen"), null, diagnostics);
+        var copied = project?.CopiedFiles.Select(f => f.Target).Order(StringComparer.Ordinal).ToList() ?? [];
+        string[] expected = [".hidden/d.txt", "a.txt", "assets/j.txt", "assets/sub/k.txt", "docs/b.txt", "docs/deep/c.txt", "node_modules/pkg/g.txt"];
+        Check("each pattern's files, once", copied.SequenceEqual(expected), string.Join(", ", copied) + " | " + string.Join("; ", diagnostics));
+        // Each pattern on its own (a fresh walk) finds what it found in the shared one.
+        Check("a pattern below a walked folder finds the same files on its own",
+            QueenProject.Expand(root, "docs/**/*.txt").Select(f => Path.GetRelativePath(root, f).Replace('\\', '/')).SequenceEqual(["docs/b.txt", "docs/deep/c.txt"]));
+        Check("packages are searched by a pattern that names them",
+            QueenProject.Expand(root, "**/node_modules/*.txt").Select(f => Path.GetRelativePath(root, f).Replace('\\', '/')).SequenceEqual(["docs/node_modules/h.txt"]));
+    }
+
     private void ExpectLoad(string name, string path, string code)
     {
         var diagnostics = new List<QueenDiagnostic>();
