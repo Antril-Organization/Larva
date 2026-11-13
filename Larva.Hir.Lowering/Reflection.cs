@@ -247,22 +247,73 @@ namespace Larva.Hir.Lowering
         /// Whether some body (outside the reflection library itself) says <c>typeof</c> or calls <c>Object.GetType()</c>, and
         /// whether one asks for members.
         /// </summary>
+        /// <remarks>
+        /// When methods are lowered only when reached (<see cref="LoweringOptions.ReachedOnly"/>), those assemblies' bodies
+        /// are read here only if the others use reflection; else each is looked at when it is lowered, and one that uses
+        /// reflection has the whole lowering done again reading them all here (<see cref="readAllForReflection"/>), so the
+        /// result is the same as reading every body first, without decoding the library's bodies a program never runs.
+        /// </remarks>
         private (bool Types, bool Members) UsesReflection(ReflectionKit kit, H.MemberToken? getType, HashSet<int> named)
         {
             int activator = Assembly.Types.FindIndex(t => t.FullName == "System.Activator");
-            var walker = new ReflectionUse(Assembly, kit.Type, activator, getType, named);
-            for (int t = 0; t < Assembly.Types.Count; t++)
+            bool Skipped(int t)
             {
                 var type = Assembly.Types[t];
-                if (type.Name.EndsWith(".$Describer", StringComparison.Ordinal) || t == kit.Type || t == activator || type.Namespace == "System.Reflection")
-                    continue;
-                foreach (var method in type.Methods)
+                return type.Name.EndsWith(".$Describer", StringComparison.Ordinal) || t == kit.Type || t == activator || type.Namespace == "System.Reflection";
+            }
+            var walker = new ReflectionUse(Assembly, kit.Type, activator, getType, named);
+            void Read(int t)
+            {
+                foreach (var method in Assembly.Types[t].Methods)
                 {
                     if (method.Body is { } body)
                         walker.Visit(body.Block);
                 }
             }
+            bool later = LowersReachedOnly && !readAllForReflection;
+            for (int t = 0; t < Assembly.Types.Count; t++)
+            {
+                if (!Skipped(t) && !(later && Prunable(t)))
+                    Read(t);
+            }
+            if (later && walker.Types)
+            {
+                // The program uses reflection: what the libraries name in theirs counts too, as when every body is read.
+                for (int t = 0; t < Assembly.Types.Count; t++)
+                {
+                    if (!Skipped(t) && Prunable(t))
+                        Read(t);
+                }
+            }
+            else if (later)
+            {
+                reflectionProbe = body =>
+                {
+                    var probe = new ReflectionUse(Assembly, kit.Type, activator, getType, []);
+                    probe.Visit(body.Block);
+                    return probe.Types;
+                };
+                reflectionProbeSkips = Skipped;
+            }
             return (walker.Types, walker.Members);
+        }
+
+        /// <summary>Set on a lowering done again because a library body reached late used reflection: every body is read first.</summary>
+        private bool readAllForReflection;
+
+        /// <summary>Whether a library body uses reflection (set when its assemblies' bodies were not read up front), and which types it does not ask about.</summary>
+        private Func<H.HirBody, bool>? reflectionProbe;
+        private Func<int, bool>? reflectionProbeSkips;
+
+        /// <summary>A body lowered late used reflection the program was lowered without (see <see cref="UsesReflection"/>).</summary>
+        private volatile bool reflectionMissed;
+
+        /// <summary>Looks at a body of a library lowered only when reached, for reflection the up-front reading did not see.</summary>
+        internal void ProbeReflection(MethodPlan plan, H.MethodDef method)
+        {
+            if (reflectionProbe is { } probe && plan.Synthetic is null && method.Body is { } body && Prunable(plan.Type)
+                && reflectionProbeSkips?.Invoke(plan.Type) == false && probe(body))
+                reflectionMissed = true;
         }
 
         private sealed class ReflectionUse(H.HirAssembly assembly, int typeClass, int activator, H.MemberToken? getType, HashSet<int> named) : H.HirWalker
