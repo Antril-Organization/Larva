@@ -586,32 +586,51 @@ into namespace System.Threading
 				if (chunk < 1)
 					chunk = 1;
 				AtomicI32 next = new AtomicI32(fromInclusive);
-				CountdownEvent finished = new CountdownEvent(threads - 1);
 				Shared<any?> failure = new Shared<any?>(null);
-				func run = () =>
+				// The loop is done when no chunk is left to take and none is being run on a pool thread. The caller never waits
+				// for the helpers queued on the pool to be scheduled: when the pool is busy (its workers inside loops of their
+				// own, or this loop called from pool work), the caller runs the remaining chunks itself, and a helper that runs
+				// late finds nothing to take. `active` counts the helpers between taking a chunk and finishing it; the last one
+				// to stop once nothing is left sets `idle`.
+				AtomicI32 active = new AtomicI32();
+				ManualResetEvent idle = new ManualResetEvent(false);
+				func : bool run = () =>
 				{
+					i32 start = next.Add(chunk) - chunk;
+					if (start >= toExclusive)
+						return false;
 					try
 					{
-						loop (true)
-						{
-							i32 start = next.Add(chunk) - chunk;
-							if (start >= toExclusive)
-								break;
-							i32 end = toExclusive - start < chunk ? toExclusive : start + chunk;
-							loop (i32 i = start..end)
-								body(i);
-						}
+						i32 end = toExclusive - start < chunk ? toExclusive : start + chunk;
+						loop (i32 i = start..end)
+							body(i);
 					}
 					catch (any error)
 					{
 						failure.Value = error;
 						next.Store(toExclusive);
 					}
+					return true;
+				};
+				func help = () =>
+				{
+					loop (true)
+					{
+						active.Increment();
+						bool took = run();
+						if (active.Decrement() == 0 && next.Load() >= toExclusive)
+							idle.Set();
+						if (!took)
+							break;
+					}
 				};
 				loop (i32 t = 1..threads)
-					ThreadPool.QueueUserWorkItem(() => { run(); finished.Signal(); });
-				run();
-				finished.Wait();
+					ThreadPool.QueueUserWorkItem(help);
+				loop (run()) { }
+				// No chunk is left: wait for the chunks being run elsewhere (a helper that takes one increments `active` before
+				// it looks, so one seen at 0 here means none is running and none will be).
+				loop (active.Load() != 0)
+					idle.WaitOne();
 				if (failure.Value is any error)
 					throw error;
 			}

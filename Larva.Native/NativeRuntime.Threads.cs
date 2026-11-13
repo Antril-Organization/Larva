@@ -49,6 +49,7 @@ namespace Larva.Native
         private static void ResetThreads()
         {
             turns = null;
+            sliceLeft = TurnSlice;
             threadsAlive = 1;
             nextThread = 1;
             threadNumber = 0;
@@ -73,11 +74,23 @@ namespace Larva.Native
             }
         }
 
-        /// <summary>At a safepoint: the turn goes to a waiting thread first.</summary>
+        /// <summary>
+        /// Polls a thread keeps the turn for while others want it: a handoff is a host context switch, so one per poll
+        /// runs a program with a few runnable threads (a pool's workers spinning for work) at the switch rate. A slice keeps
+        /// turns long enough to run at speed and short enough to stay fair; waits in the runtime still give the turn at
+        /// once (<see cref="Blocking"/>). One thread runs Larva code at a time, so a static counter is that thread's.
+        /// </summary>
+        private const int TurnSlice = 1000;
+        private static int sliceLeft = TurnSlice;
+
+        /// <summary>At a safepoint: the turn goes to a waiting thread once this one's slice is used up.</summary>
         private static void TakeTurns()
         {
             if (turns is { Wanted: true } held)
             {
+                if (--sliceLeft > 0)
+                    return;
+                sliceLeft = TurnSlice;
                 held.Give();
                 held.Take();
             }

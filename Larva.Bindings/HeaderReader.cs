@@ -116,7 +116,7 @@ namespace Larva.Bindings
                 }
             }
             currentFile = null;
-            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(Decorations.Replace(d, " "), "(*").Trim())
+            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(Decorations.Replace(LayoutAttributes(d), " "), "(*").Trim())
                 .Where(d => d.Length > 0).ToList();
             // Types first, prototypes after: a prototype may use a typedef written below it in another header.
             foreach (string declaration in declarations)
@@ -296,7 +296,7 @@ namespace Larva.Bindings
             // `UINT64_C(0x20)`, `SDL_UINT64_C(0x20)`: the literal of a constant-making macro.
             if (System.Text.RegularExpressions.Regex.Match(body, @"^[A-Za-z_]\w*_C\s*\(\s*([^()]+?)\s*\)$") is { Success: true } wrapped)
                 body = wrapped.Groups[1].Value;
-            if (Integer(body) is { } value && IsIdentifier(parts[1]))
+            if (IsIdentifier(parts[1]) && Evaluate(body) is { } value)
                 Constant(parts[1], value);
         }
 
@@ -408,6 +408,94 @@ namespace Larva.Bindings
             @"\(\s*(?:(?:__cdecl|__stdcall|__fastcall|__vectorcall|WINAPI|CALLBACK|APIENTRY|SDLCALL)\s*)*\*\s*",
             System.Text.RegularExpressions.RegexOptions.Compiled);
 
+        /// <summary>
+        /// A layout attribute kept as a word where it was written, for the struct it belongs to: `__attribute__((packed))`
+        /// and `__attribute__((aligned(n)))` / `__declspec(align(n))` (n: 0 when it is not a literal). The other
+        /// attributes are dropped here, with balanced parentheses (`aligned(16)` has its own).
+        /// </summary>
+        private const string PackedMarker = "__larva_packed__";
+        private const string AlignedMarker = "__larva_aligned_";
+
+        private static string LayoutAttributes(string declaration)
+        {
+            if (!declaration.Contains("__attribute__") && !declaration.Contains("__declspec"))
+                return declaration;
+            var text = new StringBuilder();
+            for (int i = 0; i < declaration.Length;)
+            {
+                int keyword = declaration.IndexOf("__", i, StringComparison.Ordinal);
+                if (keyword < 0 || !(Starts(keyword, "__attribute__") || Starts(keyword, "__declspec")))
+                {
+                    text.Append(declaration, i, (keyword < 0 ? declaration.Length : keyword + 2) - i);
+                    i = keyword < 0 ? declaration.Length : keyword + 2;
+                    continue;
+                }
+                bool attribute = Starts(keyword, "__attribute__");
+                int open = declaration.IndexOf('(', keyword), close = open < 0 ? -1 : MatchingParenthesis(declaration, open);
+                if (close < 0)
+                {
+                    text.Append(declaration, i, declaration.Length - i);
+                    break;
+                }
+                text.Append(declaration, i, keyword - i);
+                string inside = declaration[(open + 1)..close].Trim();
+                if (attribute && inside.StartsWith('(') && inside.EndsWith(')'))
+                    inside = inside[1..^1];
+                foreach (string item in BindingDescription.SplitTopLevel(inside))
+                {
+                    string a = item.Trim();
+                    if (a is "packed" or "__packed__")
+                        text.Append(' ').Append(PackedMarker).Append(' ');
+                    else if (a is "aligned" or "__aligned__" || a.StartsWith("aligned") || a.StartsWith("__aligned__") || !attribute && a.StartsWith("align"))
+                    {
+                        int argument = a.IndexOf('(');
+                        long n = argument >= 0 && a.EndsWith(')') ? Integer(a[(argument + 1)..^1]) ?? 0 : 0;
+                        text.Append(' ').Append(AlignedMarker).Append(n).Append("__ ");
+                    }
+                }
+                text.Append(' ');
+                i = close + 1;
+            }
+            return text.ToString();
+
+            bool Starts(int at, string word) => string.CompareOrdinal(declaration, at, word, 0, word.Length) == 0;
+        }
+
+        /// <summary>
+        /// The layout attributes of a struct: taken out of the text around its body (not out of the body: those belong to
+        /// its fields or nested structs).
+        /// </summary>
+        private static string TakeLayout(string text, out bool packed, out int? aligned)
+        {
+            packed = false;
+            aligned = null;
+            if (!text.Contains("__larva_"))
+                return text;
+            int open = text.IndexOf('{'), close = text.LastIndexOf('}');
+            string head = open < 0 ? text : text[..open], body = open < 0 ? "" : text[open..(close + 1)], tail = open < 0 ? "" : text[(close + 1)..];
+            bool isPacked = false;
+            int? alignment = null;
+            string result = Take(head) + body + Take(tail);
+            packed = isPacked;
+            aligned = alignment;
+            return result;
+
+            string Take(string part)
+            {
+                var kept = new StringBuilder();
+                foreach (string word in part.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    if (word == PackedMarker)
+                        isPacked = true;
+                    else if (word.StartsWith(AlignedMarker, StringComparison.Ordinal) && int.TryParse(word[AlignedMarker.Length..].TrimEnd('_'), out int n))
+                        alignment = Math.Max(alignment ?? 0, n);
+                    else
+                        kept.Append(word).Append(' ');
+                }
+                return kept.ToString();
+            }
+        }
+
         /// <summary>`push[, n]`, `pop`, `n` or nothing: the pack in force from here on (0: natural alignment).</summary>
         private void Pragma(string arguments)
         {
@@ -454,12 +542,13 @@ namespace Larva.Bindings
             }
             if (IsTypeDeclaration(t))
             {
+                t = TakeLayout(t, out bool packed, out int? aligned);
                 int brace = t.IndexOf('{');
                 string tag = (brace < 0 ? t : t[..brace]).Split(' ', StringSplitOptions.RemoveEmptyEntries).ElementAtOrDefault(1) ?? "";
                 if (tag.Length == 0)
                     return;
                 if (brace >= 0)
-                    DefineStruct(tag, tag, t[(brace + 1)..t.LastIndexOf('}')], t.StartsWith("union "));
+                    DefineStruct(tag, tag, t[(brace + 1)..t.LastIndexOf('}')], t.StartsWith("union "), packed, aligned);
                 else if (!structNames.ContainsKey(tag))
                     opaque.Add(tag); // a forward declaration: opaque unless a body follows
                 return;
@@ -493,6 +582,8 @@ namespace Larva.Bindings
             if (brace >= 0)
             {
                 // typedef struct [Tag] { … } Name, *PName;  /  typedef enum { … } Name;
+                t = TakeLayout(t, out bool packed, out int? aligned);
+                brace = t.IndexOf('{');
                 int close = t.LastIndexOf('}');
                 var declarators = Declarators(t[(close + 1)..]);
                 string head = t[..brace].Trim();
@@ -508,7 +599,7 @@ namespace Larva.Bindings
                 string structName = declarators.FirstOrDefault(d => d.Stars == 0).Name ?? tag;
                 if (structName.Length == 0)
                     return;
-                DefineStruct(structName, tag, t[(brace + 1)..close], head.StartsWith("union"));
+                DefineStruct(structName, tag, t[(brace + 1)..close], head.StartsWith("union"), packed, aligned);
                 foreach (var (name, stars) in declarators)
                 {
                     if (name != structName)
@@ -572,9 +663,16 @@ namespace Larva.Bindings
             return list;
         }
 
-        private void DefineStruct(string name, string tag, string body, bool isUnion = false)
+        /// <summary>
+        /// A struct with a body. <paramref name="packed"/> (<c>__attribute__((packed))</c>) packs it to 1 whatever
+        /// <c>#pragma pack</c> says; <paramref name="aligned"/> (<c>aligned(n)</c>, <c>__declspec(align(n))</c>) is an
+        /// alignment the description cannot carry: the struct is opaque, with the reason (never a wrong layout).
+        /// </summary>
+        private void DefineStruct(string name, string tag, string body, bool isUnion = false, bool packed = false, int? aligned = null)
         {
-            var raw = new RawStruct { Name = name, Fields = [], IsUnion = isUnion, Pack = pack };
+            var raw = new RawStruct { Name = name, Fields = [], IsUnion = isUnion, Pack = packed ? 1 : pack };
+            if (aligned is { } alignment)
+                raw.Why = $"aligned({(alignment > 0 ? alignment.ToString() : "…")}): an alignment the bindings cannot carry";
             if (currentFile is not null)
                 Origins.TryAdd(name, currentFile);
             int anonymous = 0;
@@ -587,16 +685,24 @@ namespace Larva.Bindings
                     if (declaration.Contains('{'))
                     {
                         // a nested `struct { … } a, *b;` or `union { … };`: its own definition, named after the outer one
+                        declaration = TakeLayout(declaration, out bool nestedPacked, out int? nestedAligned);
                         int open = declaration.IndexOf('{'), close = declaration.LastIndexOf('}');
                         bool nestedUnion = declaration.StartsWith("union");
                         var declarators = Declarators(declaration[(close + 1)..]);
                         if (declarators.Count == 0)
                             declarators.Add(($"anon{anonymous++}", 0));
                         string nested = $"{name}_{declarators[0].Name}";
-                        DefineStruct(nested, "", declaration[(open + 1)..close], nestedUnion);
+                        DefineStruct(nested, "", declaration[(open + 1)..close], nestedUnion, nestedPacked, nestedAligned);
                         foreach (var (fieldName, stars) in declarators)
                             raw.Fields.Add(Field(nested, stars, declaration[(close + 1)..], fieldName));
                         continue;
+                    }
+                    if (declaration.Contains("__larva_"))
+                    {
+                        // `int x __attribute__((aligned(8)));`, a packed field: a layout of its own the description cannot carry
+                        string written = System.Text.RegularExpressions.Regex.Replace(declaration.Replace(PackedMarker, "packed"), AlignedMarker + @"(\d+)__", "aligned($1)");
+                        raw.Why = $"field `{written}`: an attribute on a field (packed, aligned) the bindings cannot carry";
+                        break;
                     }
                     if (declaration.Contains(':'))
                     {
@@ -672,7 +778,7 @@ namespace Larva.Bindings
                 foreach (var m in System.Text.RegularExpressions.Regex.Matches(declaration, @"\[([^\]]*)\]").Cast<System.Text.RegularExpressions.Match>())
                 {
                     string inside = m.Groups[1].Value.Trim();
-                    long? n = Integer(inside) ?? (constantValues.TryGetValue(inside, out long known) ? known : null);
+                    long? n = Evaluate(inside);
                     if (n is null || n <= 0 || n > MaxArrayFields)
                     {
                         count = -1; // unknown or too long: the struct stays opaque
@@ -750,8 +856,11 @@ namespace Larva.Bindings
                         Origins.TryAdd(name, currentFile);
                 }
             }
-            long next = 0;
-            foreach (string piece in t[(open + 1)..close].Split(','))
+            // The next value: null after a member whose expression could not be evaluated (the members numbered after
+            // it are unknown too, until one says its value); each is skipped with the reason, never given a wrong value.
+            long? next = 0;
+            string? unknown = null;
+            foreach (string piece in SplitMembers(t[(open + 1)..close]))
             {
                 string entry = piece.Trim();
                 if (entry.Length == 0)
@@ -763,17 +872,42 @@ namespace Larva.Bindings
                 if (equals >= 0)
                 {
                     string expression = entry[(equals + 1)..].Trim();
-                    if (Integer(expression) is { } given)
-                        next = given;
-                    else if (constantValues.TryGetValue(expression, out long known))
-                        next = known;
-                    else
-                        continue; // an expression: not followed
+                    next = Evaluate(expression);
+                    if (next is null)
+                    {
+                        Skipped.Add((name, $"enum member: its value `{expression}` could not be evaluated"));
+                        unknown = name;
+                        continue;
+                    }
                 }
-                Constant(name, next);
-                members.Add((name, next));
+                else if (next is null)
+                {
+                    Skipped.Add((name, $"enum member: numbered after `{unknown}`, whose value could not be evaluated"));
+                    continue;
+                }
+                Constant(name, next.Value);
+                members.Add((name, next.Value));
                 next++;
             }
+        }
+
+        /// <summary>An enum's members, split at the commas outside parentheses (`A = MAX(1, 2)`; `<<` is no bracket).</summary>
+        private static List<string> SplitMembers(string body)
+        {
+            var pieces = new List<string>();
+            int depth = 0, start = 0;
+            for (int i = 0; i < body.Length; i++)
+            {
+                if (body[i] == '(') depth++;
+                else if (body[i] == ')') depth--;
+                else if (body[i] == ',' && depth == 0)
+                {
+                    pieces.Add(body[start..i]);
+                    start = i + 1;
+                }
+            }
+            pieces.Add(body[start..]);
+            return pieces;
         }
 
         private void Prototype(string t)
@@ -896,13 +1030,30 @@ namespace Larva.Bindings
                 // A pointer to a function pointer (an out parameter that receives one): an untyped pointer.
                 return stars > 0 ? Pointers("void", stars) : functionType;
             }
+            // Whether the pointee is const (`const char*`, `char const*`, `LPCSTR`): a `const` before the first `*` of a
+            // level qualifies that level's base type, which is the pointee unless a typedef below it adds the pointer
+            // (`const LPSTR` is `char* const`: a const pointer to writable chars).
+            bool constPointee = ConstBase(Tokens(c), out _);
             // typedef aliases, followed to the end
             for (int guard = 0; guard < 16 && words.Count == 1 && typedefs.TryGetValue(words[0], out string? target); guard++)
             {
                 var targetWords = Tokens(target);
                 stars += targetWords.Count(w => w == "*");
+                bool constTarget = ConstBase(targetWords, out bool starBelow);
+                if (starBelow)
+                    constPointee = constTarget; // the const seen so far qualified this pointer, not what it points to
+                else
+                    constPointee |= constTarget;
                 words = targetWords.Where(w => w is not ("const" or "volatile" or "*")).ToList();
                 baseText = string.Join(' ', words);
+            }
+            // Windows' string pointer names when no header defined them: `const char*` / `char*` (and wide).
+            if (words.Count == 1 && words[0] is "LPCSTR" or "PCSTR" or "LPSTR" or "PSTR" or "LPCWSTR" or "PCWSTR" or "LPWSTR" or "PWSTR")
+            {
+                stars++;
+                constPointee = words[0] is "LPCSTR" or "PCSTR" or "LPCWSTR" or "PCWSTR";
+                words = [words[0].EndsWith("WSTR", StringComparison.Ordinal) ? "wchar_t" : "char"];
+                baseText = words[0];
             }
             string tagOrName = words[0] is "struct" or "union" ? words[^1] : words[0];
             if (StructName(tagOrName) is { } structName)
@@ -931,10 +1082,11 @@ namespace Larva.Bindings
             }
             if (primitive == "char" || primitive == "wchar")
             {
-                // char* as a parameter is a C string (a copy with its terminator; null when C takes NULL), as a result a
+                // `const char*` as a parameter is a C string (a copy with its terminator; null when C takes NULL);
+                // `char*` a buffer C writes into (bytes the caller owns: a copy would lose what C wrote); as a result a
                 // pointer to bytes.
                 if (stars == 1 && parameter)
-                    return primitive == "char" ? "str?" : "String<u16>?";
+                    return constPointee ? primitive == "char" ? "str?" : "String<u16>?" : primitive == "char" ? "u8*" : "u16*";
                 return Pointers(primitive == "char" ? "i8" : "u16", stars);
             }
             if (primitive == "void" && stars == 0 && (parameter || field))
@@ -943,6 +1095,17 @@ namespace Larva.Bindings
                 return null;
             }
             return Pointers(primitive, stars);
+        }
+
+        /// <summary>
+        /// Whether a `const` qualifies the base type of one level of a C type (before its first `*`, or anywhere when it
+        /// has none), and whether the level has a `*` of its own.
+        /// </summary>
+        private static bool ConstBase(List<string> tokens, out bool hasStar)
+        {
+            int star = tokens.IndexOf("*");
+            hasStar = star >= 0;
+            return tokens.Take(hasStar ? star : tokens.Count).Contains("const");
         }
 
         /// <summary>The struct with layout behind a tag or typedef name (aliases followed), or null when it has none.</summary>
@@ -1017,8 +1180,6 @@ namespace Larva.Bindings
             "float" or "FLOAT" => "f32", "double" or "DOUBLE" or "long double" => "f64",
             "bool" or "_Bool" or "BOOLEAN" => "bool",
             "HANDLE" or "HMODULE" or "HINSTANCE" or "HWND" or "FARPROC" or "LPVOID" or "PVOID" or "HGLOBAL" or "HLOCAL" or "HDC" => "void*",
-            "LPCSTR" or "LPSTR" or "PCSTR" or "PSTR" => "char*",
-            "LPCWSTR" or "LPWSTR" or "PCWSTR" or "PWSTR" => "wchar*",
             _ => null,
         };
 
@@ -1062,6 +1223,176 @@ namespace Larva.Bindings
         }
 
         private static bool IsIdentifier(string w) => w.Length > 0 && (char.IsLetter(w[0]) || w[0] == '_') && w.All(c => char.IsLetterOrDigit(c) || c == '_');
+
+        /// <summary>
+        /// A C integer constant expression over literals (integer, character) and the constants read so far (`#define`s,
+        /// enum members): arithmetic, shifts, bitwise and logical operators, comparisons, `?:`, parentheses and casts to
+        /// integer types. Null when it is anything else (a string, a float, `sizeof`, an unknown name).
+        /// </summary>
+        private long? Evaluate(string expression)
+        {
+            if (Integer(expression) is { } literal)
+                return literal;
+            var evaluator = new ConstantExpression(expression, constantValues);
+            return evaluator.Evaluate();
+        }
+
+        /// <summary>A recursive-descent evaluator of C integer constant expressions (C precedence, 64-bit arithmetic).</summary>
+        private sealed class ConstantExpression(string text, Dictionary<string, long> constants)
+        {
+            private int at;
+            private bool failed;
+
+            public long? Evaluate()
+            {
+                long value = Conditional();
+                SkipSpaces();
+                return failed || at < text.Length ? null : value;
+            }
+
+            private void SkipSpaces()
+            {
+                while (at < text.Length && char.IsWhiteSpace(text[at]))
+                    at++;
+            }
+
+            private bool Take(string op)
+            {
+                SkipSpaces();
+                if (string.CompareOrdinal(text, at, op, 0, op.Length) != 0)
+                    return false;
+                // `<` is not `<<` or `<=`, `&` not `&&`, `|` not `||`, `=` only as `==`
+                char next = at + op.Length < text.Length ? text[at + op.Length] : '\0';
+                if (op is "<" or ">" && (next == op[0] || next == '=') || op is "&" or "|" && next == op[0] || op is "!" && next == '=')
+                    return false;
+                at += op.Length;
+                return true;
+            }
+
+            private long Conditional()
+            {
+                long condition = Binary(0);
+                if (!Take("?"))
+                    return condition;
+                long whenTrue = Conditional();
+                if (!Take(":"))
+                    failed = true;
+                long whenFalse = Conditional();
+                return condition != 0 ? whenTrue : whenFalse;
+            }
+
+            private static readonly string[][] Levels =
+            [
+                ["||"], ["&&"], ["|"], ["^"], ["&"], ["==", "!="], ["<=", ">=", "<", ">"], ["<<", ">>"], ["+", "-"], ["*", "/", "%"],
+            ];
+
+            private long Binary(int level)
+            {
+                if (level == Levels.Length)
+                    return Unary();
+                long left = Binary(level + 1);
+                while (true)
+                {
+                    string? op = Levels[level].FirstOrDefault(Take);
+                    if (op is null)
+                        return left;
+                    long right = Binary(level + 1);
+                    left = op switch
+                    {
+                        "||" => left != 0 || right != 0 ? 1 : 0,
+                        "&&" => left != 0 && right != 0 ? 1 : 0,
+                        "|" => left | right,
+                        "^" => left ^ right,
+                        "&" => left & right,
+                        "==" => left == right ? 1 : 0,
+                        "!=" => left != right ? 1 : 0,
+                        "<=" => left <= right ? 1 : 0,
+                        ">=" => left >= right ? 1 : 0,
+                        "<" => left < right ? 1 : 0,
+                        ">" => left > right ? 1 : 0,
+                        "<<" => right is >= 0 and < 64 ? left << (int)right : Fail(),
+                        ">>" => right is >= 0 and < 64 ? left >> (int)right : Fail(),
+                        "+" => left + right,
+                        "-" => left - right,
+                        "*" => left * right,
+                        "/" => right != 0 ? left / right : Fail(),
+                        _ => right != 0 ? left % right : Fail(),
+                    };
+                }
+            }
+
+            private long Fail()
+            {
+                failed = true;
+                return 0;
+            }
+
+            private long Unary()
+            {
+                if (Take("-"))
+                    return -Unary();
+                if (Take("+"))
+                    return Unary();
+                if (Take("~"))
+                    return ~Unary();
+                if (Take("!"))
+                    return Unary() == 0 ? 1 : 0;
+                SkipSpaces();
+                if (at < text.Length && text[at] == '(')
+                {
+                    int close = MatchingParenthesis(text, at);
+                    if (close < 0)
+                        return Fail();
+                    string inside = text[(at + 1)..close].Trim();
+                    // a cast to an integer type: `(DWORD)`, `(unsigned long)`, `(int32_t)`
+                    if (inside.Length > 0 && inside.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(w => IsTypeWord(w) || IsIdentifier(w) && !constants.ContainsKey(w)) && !inside.Contains('*'))
+                    {
+                        at = close + 1;
+                        return Unary();
+                    }
+                    at++;
+                    long value = Conditional();
+                    if (!Take(")"))
+                        return Fail();
+                    return value;
+                }
+                return Primary();
+            }
+
+            private long Primary()
+            {
+                SkipSpaces();
+                if (at >= text.Length)
+                    return Fail();
+                char c = text[at];
+                if (c == '\'')
+                {
+                    int end = text.IndexOf('\'', at + 1);
+                    if (end < 0 || end == at + 1)
+                        return Fail();
+                    string inside = text[(at + 1)..end];
+                    at = end + 1;
+                    return inside.Length == 1 ? inside[0] : inside is ['\\', var escaped] ? escaped switch { 'n' => '\n', 't' => '\t', 'r' => '\r', '0' => '\0', _ => escaped } : Fail();
+                }
+                int start = at;
+                while (at < text.Length && (char.IsLetterOrDigit(text[at]) || text[at] == '_'))
+                    at++;
+                string word = text[start..at];
+                if (word.Length == 0)
+                    return Fail();
+                if (char.IsDigit(word[0]))
+                    return Integer(word) ?? Fail();
+                if (constants.TryGetValue(word, out long known))
+                    return known;
+                // a constant-making macro around a literal: `UINT64_C(0x20)`
+                if (word.EndsWith("_C", StringComparison.Ordinal) && Take("("))
+                {
+                    long value = Conditional();
+                    return Take(")") ? value : Fail();
+                }
+                return Fail(); // sizeof, a type, an unknown name
+            }
+        }
 
         /// <summary>An integer literal (decimal, hex, with C suffixes, in parentheses, negated), or null.</summary>
         private static long? Integer(string text)

@@ -117,8 +117,12 @@ into namespace System.Net
 	public static class HttpClient
 	{
 		public:
+			/// GET of an `http://host[:port][/path]` URL (port 80 when none). An `https://` URL is an ArgumentError: TLS
+			/// is not supported; so is a URL without a host or with a port that is no number.
 			static Get(str url) : HttpResponse
 			{
+				if (url.StartsWith("https://"))
+					throw new ArgumentError("HttpClient: https is not supported (no TLS): " + url);
 				str rest = url;
 				if (rest.StartsWith("http://"))
 					rest = rest.Substring(7);
@@ -127,7 +131,16 @@ into namespace System.Net
 				str path = slash < 0 ? "/" : rest.Substring(slash);
 				i32 colon = authority.IndexOf(":");
 				str host = colon < 0 ? authority : authority.Substring(0, colon);
-				i32 port = colon < 0 ? 80 : Int32.Parse(authority.Substring(colon + 1));
+				i32 port = 80;
+				if (colon >= 0)
+				{
+					i32? given = Int32.TryParse(authority.Substring(colon + 1));
+					if (given == null)
+						throw new ArgumentError("HttpClient: bad port in the URL: " + url);
+					port = given.Value;
+				}
+				if (host.Length == 0)
+					throw new ArgumentError("HttpClient: no host in the URL: " + url);
 				TcpClient client = TcpClient.Connect(host, port);
 				client.Write("GET " + path + " HTTP/1.0\r\nHost: " + authority + "\r\nConnection: close\r\n\r\n");
 				StringBuilder received = new StringBuilder();

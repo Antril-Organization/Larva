@@ -179,6 +179,218 @@ public sealed class ProgramTests : CheckedTest
         }
     }
 
+    /// <summary>
+    /// A reference to a local must not outlive the frame: not stored behind a <c>&amp;mut</c> argument (directly, or by a
+    /// callee that may keep it there, judged by the callee's signature), not in a <c>gc</c> object or a global; and what a
+    /// call may keep behind a <c>&amp;mut</c> argument keeps the borrowed local alive in the caller.
+    /// </summary>
+    [Fact]
+    public void Borrow_checker_rejects_references_escaping_the_frame()
+    {
+        // Holder { &i32 }: a struct that can hold a reference; Plain { i32 } cannot.
+        StructDef[] structs = [.. BorrowStructs, new StructDef("Holder", IrType.Ref(IrType.I32)), new StructDef("Plain", IrType.I32)];
+        var holder = IrType.Struct(BorrowStructs.Length);
+        var plain = IrType.Struct(BorrowStructs.Length + 1);
+
+        // Callees, judged by their signatures only (their bodies are empty).
+        IrFunction Callee(string name, IrType result, params IrType[] parameters)
+        {
+            var c = Fn(name, result);
+            foreach (var parameter in parameters)
+                c.Argument(parameter);
+            c.Return();
+            return c.Build();
+        }
+        IrFunction[] callees =
+        [
+            Callee("keep", IrType.Unit, IrType.RefMut(holder), IrType.Ref(IrType.I32)),      // 0: may store its `&i32` into the holder
+            Callee("pick", IrType.Ref(IrType.I32), IrType.Ref(IrType.I32)),                 // 1: may return its argument
+            Callee("both", IrType.Unit, IrType.RefMut(IrType.I32), IrType.RefMut(IrType.I32)), // 2: numbers hold no references
+            Callee("fill", IrType.Unit, IrType.RefMut(plain), IrType.Ref(IrType.I32)),      // 3: a Plain cannot hold the `&i32`
+        ];
+
+        void ExpectWith(FunctionBuilder f, BorrowErrorKind? expected)
+        {
+            var function = f.Build();
+            var module = new IrModule(structs, [.. callees, function]) { Globals = [new GlobalDef("kept", holder)] };
+            var errors = BorrowChecker.Check(function, module);
+            bool pass = expected is null ? errors.Count == 0 : errors.Count == 1 && errors[0].Kind == expected;
+            Check($"{function.Name}: expected {expected?.ToString() ?? "no errors"}", pass,
+                $"got {errors.Count}: " + string.Join(" | ", errors.Select(e => e.ToString())));
+        }
+
+        { // the callee stores a reference to its own local behind its &mut argument: the frame dies at the return
+            var f = Fn("store_local_through_arg", IrType.Unit);
+            int h = f.Argument(IrType.RefMut(holder), "h");
+            int temp = f.Local(IrType.I32, "temp");
+            f.Assign(temp, Int(42)).Assign(new Place(h).Deref().Field(0), Rvalue.Ref(temp)).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // ...but a reference into what another argument lends is the caller's business
+            var f = Fn("store_arg_through_arg", IrType.Unit);
+            int h = f.Argument(IrType.RefMut(holder), "h");
+            int v = f.Argument(IrType.Ref(IrType.I32), "v");
+            f.Assign(new Place(h).Deref().Field(0), Rvalue.Ref(new Place(v).Deref())).Return();
+            ExpectWith(f, null);
+        }
+        { // a call that may keep the reference behind its &mut argument: the local borrowed must outlive the holder
+            var f = Fn("keep_through_call", IrType.I32);
+            int h = f.Local(holder, "h", mutable: true);
+            int local = f.Local(IrType.I32, "local");
+            int r = f.Temp(IrType.RefMut(holder));
+            int v = f.Temp(IrType.Ref(IrType.I32));
+            int unit = f.Temp(IrType.Unit);
+            int after = f.NewBlock();
+            f.Assign(h, Rvalue.ZeroFiller(holder)).StorageLive(local).Assign(local, Int(1)).Assign(r, Rvalue.RefMut(h)).Assign(v, Rvalue.Ref(local));
+            f.Call(0, [Move(r), Move(v)], new Place(unit), after);
+            f.At(after).StorageDead(local).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(h).Field(0).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.DroppedWhileBorrowed);
+        }
+        { // the same call, lending the caller's holder: the escape is reported at the call
+            var f = Fn("keep_through_call_into_caller", IrType.Unit);
+            int h = f.Argument(IrType.RefMut(holder), "h");
+            int local = f.Local(IrType.I32, "local");
+            int r = f.Temp(IrType.RefMut(holder));
+            int v = f.Temp(IrType.Ref(IrType.I32));
+            int unit = f.Temp(IrType.Unit);
+            int after = f.NewBlock();
+            f.Assign(local, Int(1)).Assign(r, Rvalue.RefMut(new Place(h).Deref())).Assign(v, Rvalue.Ref(local));
+            f.Call(0, [Move(r), Move(v)], new Place(unit), after);
+            f.At(after).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // a call whose result may alias its argument, stored where it outlives the local
+            var f = Fn("pick_outlives_local", IrType.I32);
+            int h = f.Local(holder, "h", mutable: true);
+            int other = f.Local(IrType.I32, "other");
+            int v = f.Temp(IrType.Ref(IrType.I32));
+            int after = f.NewBlock();
+            f.StorageLive(other).Assign(other, Int(1)).Assign(v, Rvalue.Ref(other));
+            f.Call(1, [Move(v)], new Place(h).Field(0), after);
+            f.At(after).StorageDead(other).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(h).Field(0).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.DroppedWhileBorrowed);
+        }
+        { // &mut arguments whose pointee cannot hold a reference keep nothing: the loans stay apart
+            foreach (var (name, callee, lent) in new[] { ("both_numbers", 2, IrType.I32), ("fill_plain", 3, (IrType)plain) })
+            {
+                var f = Fn(name, IrType.I32);
+                int a = f.Local(lent, "a", mutable: true);
+                int b = f.Local(IrType.I32, "b", mutable: true);
+                int ra = f.Temp(IrType.RefMut(lent));
+                int rb = f.Temp(callee == 2 ? IrType.RefMut(IrType.I32) : IrType.Ref(IrType.I32));
+                int unit = f.Temp(IrType.Unit);
+                int after = f.NewBlock();
+                f.StorageLive(b).Assign(a, callee == 2 ? Int(1) : Rvalue.ZeroFiller(lent)).Assign(b, Int(2))
+                 .Assign(ra, Rvalue.RefMut(a)).Assign(rb, callee == 2 ? Rvalue.RefMut(b) : Rvalue.Ref(b));
+                f.Call(callee, [Move(ra), Move(rb)], new Place(unit), after);
+                f.At(after).StorageDead(b).Assign(FunctionBuilder.ReturnPlace, callee == 2 ? Copy(a) : Copy(new Place(a).Field(0))).Return();
+                ExpectWith(f, null);
+            }
+        }
+        { // a reference in a gc object: nothing it could borrow lives as long
+            var f = new FunctionBuilder("ref_into_gc", IrType.Unit) { Unsafe = true };
+            int g = f.Argument(IrType.Gc(holder), "g");
+            int v = f.Argument(IrType.Ref(IrType.I32), "v");
+            f.Assign(new Place(g).Deref().Field(0), Rvalue.Ref(new Place(v).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // a gc object made from a value that borrows
+            var f = Fn("gc_of_borrowing_value", IrType.Unit);
+            int x = f.Local(IrType.I32, "x");
+            int h = f.Local(holder, "h");
+            int g = f.Local(IrType.Gc(holder), "g");
+            f.Assign(x, Int(1)).Assign(new Place(h).Field(0), Rvalue.Ref(x)).Assign(g, Rvalue.Gc(Move(h))).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // a reference in a global
+            var f = Fn("ref_into_global", IrType.Unit);
+            int v = f.Argument(IrType.Ref(IrType.I32), "v");
+            int h = f.Local(holder, "h");
+            f.Assign(new Place(h).Field(0), Rvalue.Ref(new Place(v).Deref())).StoreGlobal(0, Move(h)).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // a box the function owns dies with the frame: storing a reference to a local in it is fine
+            var f = Fn("ref_into_own_box", IrType.I32);
+            int x = f.Local(IrType.I32, "x");
+            int empty = f.Local(holder, "empty");
+            int b = f.Local(IrType.Box(holder), "b", mutable: true);
+            f.Assign(x, Int(1)).Assign(empty, Rvalue.ZeroFiller(holder)).Assign(b, Rvalue.Box(Move(empty)))
+             .Assign(new Place(b).Deref().Field(0), Rvalue.Ref(x))
+             .Assign(FunctionBuilder.ReturnPlace, Copy(new Place(b).Deref().Field(0).Deref())).Return();
+            ExpectWith(f, null);
+        }
+    }
+
+    /// <summary>
+    /// A reference to a reference (or to a struct holding one) carries the loans of what it points at: what is read back
+    /// through it (<c>*rr</c>, <c>(*h).field</c>) still borrows the original place, which can neither change nor die meanwhile.
+    /// </summary>
+    [Fact]
+    public void Borrow_checker_keeps_loans_through_references_to_references()
+    {
+        StructDef[] structs = [.. BorrowStructs, new StructDef("Holder", IrType.Ref(IrType.I32))];
+        var holder = IrType.Struct(BorrowStructs.Length);
+
+        void ExpectWith(FunctionBuilder f, BorrowErrorKind? expected)
+        {
+            var function = f.Build();
+            var errors = BorrowChecker.Check(function, new IrModule(structs, [function]) { Globals = [new GlobalDef("kept", IrType.Ref(IrType.I32))] });
+            bool pass = expected is null ? errors.Count == 0 : errors.Count == 1 && errors[0].Kind == expected;
+            Check($"{function.Name}: expected {expected?.ToString() ?? "no errors"}", pass,
+                $"got {errors.Count}: " + string.Join(" | ", errors.Select(e => e.ToString())));
+        }
+
+        { // x = 1; r = &x; rr = &r; p = *rr; x = 2; return *p
+            var f = Fn("write_through_ref_to_ref", IrType.I32);
+            int x = f.Local(IrType.I32, "x", mutable: true);
+            int r = f.Local(IrType.Ref(IrType.I32), "r");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.Assign(x, Int(1)).Assign(r, Rvalue.Ref(x)).Assign(rr, Rvalue.Ref(r)).Assign(p, Copy(new Place(rr).Deref()))
+             .Assign(x, Int(2)).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.ConflictingBorrow);
+        }
+        { // the same, with x's storage ending while *rr is still used
+            var f = Fn("dead_through_ref_to_ref", IrType.I32);
+            int x = f.Local(IrType.I32, "x");
+            int r = f.Local(IrType.Ref(IrType.I32), "r");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.StorageLive(x).Assign(x, Int(1)).Assign(r, Rvalue.Ref(x)).Assign(rr, Rvalue.Ref(r)).Assign(p, Copy(new Place(rr).Deref()))
+             .StorageDead(x).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.DroppedWhileBorrowed);
+        }
+        { // through a struct: h.0 = &x; rh = &h; p = (*rh).0; x dies; *p
+            var f = Fn("dead_through_ref_to_holder", IrType.I32);
+            int x = f.Local(IrType.I32, "x");
+            int h = f.Local(holder, "h");
+            int rh = f.Local(IrType.Ref(holder), "rh");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.StorageLive(x).Assign(x, Int(1)).Assign(new Place(h).Field(0), Rvalue.Ref(x)).Assign(rh, Rvalue.Ref(h))
+             .Assign(p, Copy(new Place(rh).Deref().Field(0)))
+             .StorageDead(x).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Deref())).Return();
+            ExpectWith(f, BorrowErrorKind.DroppedWhileBorrowed);
+        }
+        { // a reference read back through a reference to a reference still cannot be kept in a global
+            var f = Fn("global_through_ref_to_ref", IrType.Unit);
+            int v = f.Argument(IrType.Ref(IrType.I32), "v");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int p = f.Local(IrType.Ref(IrType.I32), "p");
+            f.Assign(rr, Rvalue.Ref(v)).Assign(p, Copy(new Place(rr).Deref())).StoreGlobal(0, Copy(p)).Return();
+            ExpectWith(f, BorrowErrorKind.EscapingReference);
+        }
+        { // a reference to a reference is used, and the original place changes only after both are dead
+            var f = Fn("ref_to_ref_then_write", IrType.I32);
+            int x = f.Local(IrType.I32, "x", mutable: true);
+            int r = f.Local(IrType.Ref(IrType.I32), "r");
+            int rr = f.Local(IrType.Ref(IrType.Ref(IrType.I32)), "rr");
+            int y = f.Local(IrType.I32, "y");
+            f.Assign(x, Int(1)).Assign(r, Rvalue.Ref(x)).Assign(rr, Rvalue.Ref(r)).Assign(y, Copy(new Place(rr).Deref().Deref()))
+             .Assign(x, Int(2)).Assign(FunctionBuilder.ReturnPlace, Copy(y)).Return();
+            ExpectWith(f, null);
+        }
+    }
+
     [Fact]
     public void Borrow_check_mode_decides_between_error_warning_and_nothing()
     {

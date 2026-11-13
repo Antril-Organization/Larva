@@ -278,40 +278,59 @@ namespace Larva.Build
             }
         }
 
+        /// <summary>How deep lists may nest: a value is read by recursion, and a file is not allowed to exhaust the stack.</summary>
+        public const int MaxListDepth = 32;
+
+        private int listDepth;
+
         private QueenValue Value(bool inList)
         {
             int valueLine = line, valueColumn = column;
             if (Current == '[' && !(Peek(-1) == '$'))
             {
-                Advance();
-                var items = new List<QueenValue>();
-                while (true)
+                if (listDepth >= MaxListDepth)
                 {
-                    SkipTrivia();
-                    if (Current == ']')
+                    Error("QN017", $"lists nest more than {MaxListDepth} deep", valueLine, valueColumn);
+                    SkipList();
+                    return new QueenList([], valueLine, valueColumn);
+                }
+                Advance();
+                listDepth++;
+                var items = new List<QueenValue>();
+                try
+                {
+                    while (true)
                     {
-                        Advance();
-                        break;
+                        SkipTrivia();
+                        if (Current == ']')
+                        {
+                            Advance();
+                            break;
+                        }
+                        if (AtEnd)
+                        {
+                            Error("QN012", "a list closes with `]`", valueLine, valueColumn);
+                            break;
+                        }
+                        items.Add(Value(inList: true));
+                        SkipTrivia();
+                        if (Current == ',')
+                            Advance();
+                        else if (AtEnd)
+                        {
+                            Error("QN012", "a list closes with `]`", valueLine, valueColumn);
+                            break;
+                        }
+                        else if (Current != ']')
+                        {
+                            Error("QN013", "list items are separated by `,`", line, column);
+                            break;
+                        }
                     }
-                    if (AtEnd)
-                    {
-                        Error("QN012", "a list closes with `]`", valueLine, valueColumn);
-                        break;
-                    }
-                    items.Add(Value(inList: true));
-                    SkipTrivia();
-                    if (Current == ',')
-                        Advance();
-                    else if (AtEnd)
-                    {
-                        Error("QN012", "a list closes with `]`", valueLine, valueColumn);
-                        break;
-                    }
-                    else if (Current != ']')
-                    {
-                        Error("QN013", "list items are separated by `,`", line, column);
-                        break;
-                    }
+                }
+                finally
+                {
+                    listDepth--;
                 }
                 return new QueenList([.. items], valueLine, valueColumn);
             }
@@ -432,6 +451,32 @@ namespace Larva.Build
             if (IsName(raw))
                 return new QueenIdentifier(raw, line, column);
             return new QueenText(raw, line, column);
+        }
+
+        /// <summary>Past a list that is too deep to read: its brackets counted (not recursed), quoted text skipped, to its close or the end.</summary>
+        private void SkipList()
+        {
+            int depth = 0;
+            while (!AtEnd)
+            {
+                char c = Current;
+                if (c == '"' || c == '\'')
+                {
+                    Advance();
+                    while (!AtEnd && Current != c && Current != '\n')
+                        Advance();
+                }
+                else if (c == '[')
+                {
+                    depth++;
+                }
+                else if (c == ']' && --depth == 0)
+                {
+                    Advance();
+                    return;
+                }
+                Advance();
+            }
         }
 
         private static bool IsName(string raw) =>

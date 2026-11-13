@@ -10,12 +10,19 @@ into namespace System
 			/// The value the last `yield` gave.
 			T current;
 
+			/// Set by `Dispose()`: the next step runs the `finally` blocks around the last `yield` and ends.
+			bool disposing;
+
 		public:
 			/// The value `Next()` moved to.
 			T Current { get => current; }
 
 			/// Runs on to the next value: false when the function has ended (and from then on).
 			Next() : bool;
+
+			/// Ends the iterator before its last value: the `finally` blocks around the `yield` it paused at run (as they
+			/// do when it ends on its own), and `Next()` gives false from then on. Nothing happens to one that has ended.
+			Dispose() { disposing = true; Next(); }
 
 			/// Itself: `loop (T x in iterator)` walks what is left of it.
 			Iterator() : Iterator<T> => this;

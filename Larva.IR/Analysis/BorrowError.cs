@@ -28,6 +28,12 @@ namespace Larva.IR.Analysis
         DroppedWhileBorrowed,
         /// <summary>Returning a reference to a local of the returning function.</summary>
         ReturnsLocalReference,
+        /// <summary>
+        /// Storing a reference where it outlives what it borrows: a reference to a local into memory the caller owns
+        /// (behind a <c>&amp;mut</c> or <c>*mut</c> argument, directly or through a callee), or any reference into a
+        /// <c>gc</c> object or a global.
+        /// </summary>
+        EscapingReference,
     }
 
     public enum Severity : byte

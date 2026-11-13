@@ -222,6 +222,9 @@ public sealed class BindingsTests : CheckedTest
             && realDescription.Contains("GetSystemTime(SYSTEMTIME* ") && realDescription.Contains("GetSystemTimeAsFileTime(FILETIME* ")
             && realDescription.Contains("union LARGE_INTEGER {") && realDescription.Contains("QueryPerformanceCounter(LARGE_INTEGER* "),
             $"{realParsed.Structs.Count} structs, {realParsed.Functions.Count} functions, {real.Skipped.Count} skipped, {real.Opaque.Count} opaque, {watch.ElapsedMilliseconds} ms");
+        Check("a buffer kernel32 writes into (LPSTR) is a u8* parameter, a name it reads (LPCSTR) a str?",
+            realDescription.Contains(" hModule, u8* lpFilename, u32 nSize) : u32\n") && realDescription.Contains("GetModuleHandleA(str? lpModuleName) : ")
+            && realDescription.Contains("GetEnvironmentVariableA(str? lpName, u8* lpBuffer, u32 nSize) : u32\n"));
         var known = new HashSet<string>(Exports.Read(System32("kernel32.dll")));
         int exported = realParsed.Functions.Count(f => known.Contains(f.Entry));
         Check("hundreds of its functions are kernel32 exports", exported > 300, $"{exported} of {realParsed.Functions.Count}; e.g. {string.Join(" | ", real.Opaque.Take(4).Select(o => $"{o.Name}: {o.Why}"))}");
@@ -266,6 +269,114 @@ public sealed class BindingsTests : CheckedTest
             BindingDescription.Layout("Packed", parsed.Structs) == (7, 1) && BindingDescription.Layout("Packed2", parsed.Structs) == (10, 2) && BindingDescription.Layout("Natural", parsed.Structs) == (16, 8) &&
             BindingDescription.Layout("LARGE_INTEGER", parsed.Structs) == (8, 8) && BindingDescription.Layout("Value", parsed.Structs) == (8, 8)
             && BindingDescription.Layout("Tagged", parsed.Structs) == (16, 8) && BindingDescription.Layout("Small", parsed.Structs) == (2, 2) && BindingDescription.Layout("Pair", parsed.Structs) == (4, 2));
+    }
+
+    /// <summary>`const char*` is an input string; a writable `char*` is a buffer C fills (bytes), never a string copied in and lost.</summary>
+    [Fact]
+    public void Char_buffers_are_byte_pointers_and_const_chars_are_strings()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            typedef char CHAR;
+            typedef CHAR* LPSTR;
+            typedef const CHAR* LPCSTR;
+            typedef const char CCHAR;
+            typedef unsigned long DWORD;
+            DWORD GetModuleFileNameA(void* hModule, LPSTR lpFilename, DWORD nSize);
+            void* GetModuleHandleA(LPCSTR lpModuleName);
+            int Fill(char* buffer, int n);
+            int FillW(wchar_t* buffer, int n);
+            int Read(const char* text);
+            int ReadW(const wchar_t* text);
+            int ReadAfter(char const* text);
+            int ReadAlias(CCHAR* text);
+            int ConstPointer(const LPSTR buffer);
+            int FillPointer(char* const buffer);
+            char* Dup(const char* s);
+            int Many(char** list);
+            """, "kernel32.dll", "K32");
+        Log(description);
+        Check("a writable char* (also through LPSTR, also a const pointer to it) is a u8* buffer; a wchar_t* a u16* one",
+            description.Contains("GetModuleFileNameA(void* hModule, u8* lpFilename, u32 nSize) : u32\n") && description.Contains("Fill(u8* buffer, i32 n) : i32\n")
+            && description.Contains("FillW(u16* buffer, i32 n) : i32\n") && description.Contains("ConstPointer(u8* buffer) : i32\n") && description.Contains("FillPointer(u8* buffer) : i32\n"));
+        Check("a const char* (written before or after, through LPCSTR, through a const typedef) is a str?; a const wchar_t* a String<u16>?",
+            description.Contains("GetModuleHandleA(str? lpModuleName) : void*\n") && description.Contains("Read(str? text) : i32\n") && description.Contains("ReadW(String<u16>? text) : i32\n")
+            && description.Contains("ReadAfter(str? text) : i32\n") && description.Contains("ReadAlias(str? text) : i32\n"));
+        Check("results and deeper pointers stay pointers to bytes", description.Contains("Dup(str? s) : i8*\n") && description.Contains("Many(i8** list) : i32\n"));
+        var withoutTypedefs = new HeaderReader(longIs64: false).Read("int A(LPSTR s); int B(LPCSTR s); int C(LPWSTR s); int D(LPCWSTR s);", "kernel32.dll", "K32");
+        Check("Windows' string names without their typedefs: the const ones strings, the others buffers",
+            withoutTypedefs.Contains("A(u8* s) : i32\n") && withoutTypedefs.Contains("B(str? s) : i32\n") && withoutTypedefs.Contains("C(u16* s) : i32\n") && withoutTypedefs.Contains("D(String<u16>? s) : i32\n"), withoutTypedefs);
+    }
+
+    /// <summary>`__attribute__((packed))` packs; `aligned(n)` and `__declspec(align(n))`, which the description cannot carry, make the struct opaque with the reason.</summary>
+    [Fact]
+    public void Packed_and_aligned_attributes_are_honoured_or_refused_with_a_reason()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            struct __attribute__((packed)) P1 { unsigned char tag; unsigned int value; };
+            typedef struct { unsigned char tag; unsigned int value; } __attribute__((packed)) P2;
+            typedef struct { unsigned char tag; unsigned int value; } __attribute__((__packed__, deprecated)) P3;
+            typedef struct { unsigned char tag; unsigned int value; } __attribute__((aligned(16))) A1;
+            struct __declspec(align(16)) A2 { unsigned char tag; unsigned int value; };
+            typedef struct { unsigned char tag; unsigned int value __attribute__((aligned(8))); } F1;
+            typedef struct { unsigned char tag; struct { unsigned char a; unsigned int b; } __attribute__((packed)) inner; } Outer;
+            #pragma pack(push, 4)
+            struct __attribute__((packed)) P4 { unsigned char tag; unsigned int value; };
+            #pragma pack(pop)
+            typedef struct { unsigned char tag; unsigned int value; } N1;
+            __attribute__((noreturn)) void Stop(void);
+            int Use(struct P1* a, P2* b, P3* c, A1* d, struct A2* e, F1* f, Outer* g, struct P4* h, N1* i);
+            """, "mylib.dll", "My");
+        Log(description);
+        Check("packed on the tag, after the body, among other attributes, inside a #pragma pack, on a nested struct: pack 1",
+            description.Contains("struct P1 pack 1 { u8 tag; u32 value }\n") && description.Contains("struct P2 pack 1 { u8 tag; u32 value }\n") && description.Contains("struct P3 pack 1 { u8 tag; u32 value }\n")
+            && description.Contains("struct P4 pack 1 { u8 tag; u32 value }\n") && description.Contains("struct Outer_inner pack 1 { u8 a; u32 b }\n") && description.Contains("struct Outer { u8 tag; Outer_inner inner }\n")
+            && description.Contains("struct N1 { u8 tag; u32 value }\n"));
+        Check("aligned(16), __declspec(align(16)) and an attribute on a field: opaque with the reason, not a wrong layout",
+            !description.Contains("struct A1") && !description.Contains("struct A2") && !description.Contains("struct F1")
+            && reader.Opaque.Any(o => o.Name == "A1" && o.Why.Contains("aligned(16)")) && reader.Opaque.Any(o => o.Name == "A2" && o.Why.Contains("aligned(16)"))
+            && reader.Opaque.Any(o => o.Name == "F1" && o.Why.Contains("field") && o.Why.Contains("aligned(8)")),
+            string.Join("; ", reader.Opaque.Select(o => $"{o.Name}: {o.Why}")));
+        Check("the functions: pointers to the packed structs, void* to the opaque ones, an attribute on a prototype dropped",
+            description.Contains("Use(P1* a, P2* b, P3* c, void* d, void* e, void* f, Outer* g, P4* h, N1* i) : i32\n") && description.Contains("Stop()\n"));
+        var parsed = BindingDescription.Parse(description);
+        Check("layouts: the packed structs 5/1, the natural one 8/4",
+            BindingDescription.Layout("P1", parsed.Structs) == (5, 1) && BindingDescription.Layout("P4", parsed.Structs) == (5, 1) && BindingDescription.Layout("N1", parsed.Structs) == (8, 4));
+    }
+
+    /// <summary>Enum members and #defines with constant expressions: evaluated, and the numbering continues from the result; what cannot be evaluated is skipped with the reason.</summary>
+    [Fact]
+    public void Enum_members_continue_from_an_evaluated_expression()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #define BASE 10
+            #define SHIFTED (1 << 4)
+            #define BOTH (BASE + SHIFTED)
+            #define MASK ~0u
+            #define CAST ((unsigned long)0x10)
+            #define LETTER 'A'
+            #define PICK (BASE > 5 ? 1 : 2)
+            #define TEXT "no"
+            #define REAL 1.5
+            enum Flags { A = 1 << 1, B, C, D = BASE + 2, E, F = (A | D) * 2, G, H = sizeof(int), I, J = 40, K };
+            typedef struct { int items[BASE + 2]; } Sized;
+            """, "mylib.dll", "My");
+        Log(description);
+        Check("#defines with expressions over earlier constants, casts, char literals and ?: are constants; strings and floats are not",
+            description.Contains("const SHIFTED = 16\n") && description.Contains("const BOTH = 26\n") && description.Contains("const MASK = -1\n") && description.Contains("const CAST = 16\n")
+            && description.Contains("const LETTER = 65\n") && description.Contains("const PICK = 1\n") && !description.Contains("TEXT") && !description.Contains("REAL"));
+        Check("enum members after an expression continue from its value",
+            description.Contains("const A = 2\n") && description.Contains("const B = 3\n") && description.Contains("const C = 4\n") && description.Contains("const D = 12\n")
+            && description.Contains("const E = 13\n") && description.Contains("const F = 28\n") && description.Contains("const G = 29\n") && description.Contains("const J = 40\n") && description.Contains("const K = 41\n"));
+        Check("a member that cannot be evaluated (sizeof) and the ones numbered after it are skipped with the reason, never given a value",
+            !description.Contains("const H = ") && !description.Contains("const I = ")
+            && reader.Skipped.Any(s => s.Name == "H" && s.Why.Contains("sizeof(int)")) && reader.Skipped.Any(s => s.Name == "I" && s.Why.Contains("after `H`")),
+            string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+        Check("an array length from an expression", description.Contains("struct Sized { i32[12] items }\n"));
+        var members = reader.Enums.Single().Members;
+        Check("the enum's members: the evaluated ones, in order", members.Count == 9 && members[0] == ("A", 2) && members[6] == ("G", 29) && members[8] == ("K", 41), string.Join(", ", members));
     }
 
     // ── SDL3 ──
