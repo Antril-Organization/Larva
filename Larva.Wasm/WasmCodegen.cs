@@ -11,13 +11,15 @@ namespace Larva.Wasm
     /// <summary>
     /// WebAssembly code generation without LLVM: a baseline compiler in the spirit of the direct x86-64 back end.
     /// <list type="bullet">
-    /// <item>Frames live in linear memory (a shadow stack growing down from <c>$sp</c>): every IR local has its slot there, so
-    /// every value has an address and the collector finds every root by scanning the stack, conservatively.</item>
+    /// <item>Frames live in linear memory (a shadow stack growing down from <c>$sp</c>): every IR local that may hold a handle
+    /// (or whose address is taken) has its slot there, so the collector finds every root by scanning the stack,
+    /// conservatively. Integers, bools and floats whose address is never taken, and the temps of such values, are wasm
+    /// locals.</item>
     /// <item>One calling convention for all Larva functions, <c>(args: i32, ret: i32) -&gt; ()</c>: the caller lays the
     /// arguments out in its frame and passes where they are and where the result goes. Indirect calls (function values,
     /// finalizers) are then a <c>call_indirect</c> of that one type through the exported table.</item>
-    /// <item>Control flow: each function is a dispatch loop over its basic blocks (<c>br_table</c> on a state local), which
-    /// takes any IR control-flow graph as it is.</item>
+    /// <item>Control flow: structured (blocks, loops and ifs) when the function's graph is reducible; else a dispatch loop
+    /// over its basic blocks (<c>br_table</c> on a state local), which takes any control-flow graph as it is.</item>
     /// <item>Exceptions: <c>throw</c> stores the payload (a heap cell) and its type id in two globals and goes to the site's
     /// handlers; after every call a pending exception does the same, or the frame cleans up and returns with it.</item>
     /// <item>Pointers are 32-bit but kept in 8-byte slots (zero-extended), so struct layouts are the native ones.</item>

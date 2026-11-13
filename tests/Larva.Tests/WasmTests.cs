@@ -184,6 +184,48 @@ public sealed class WasmTests : CheckedTest
         }
     }
 
+    /// <summary>
+    /// Integers, bools and floats whose address is never taken live in wasm locals: a store gives them their type's width
+    /// (an i32 wraps, an i8 and a u8 too) as a store to a frame slot does, a single keeps its bits. A scalar whose address
+    /// is taken stays in the frame, and a write through the pointer is seen; handles stay in the frame, where a
+    /// collection finds them.
+    /// </summary>
+    [Fact]
+    public void Scalars_in_locals_keep_their_width_and_addressed_ones_stay_in_memory()
+    {
+        var f = new FunctionBuilder("main", IrType.Unit) { Unsafe = true };
+        int wide = f.Local(IrType.I32, "wide", mutable: true), small = f.Local(IrType.I8, "small", mutable: true), bytes = f.Local(IrType.U8, "bytes", mutable: true);
+        int single = f.Local(IrType.F32, "single", mutable: true), bits = f.Local(IrType.I64, "bits", mutable: true), flag = f.Local(IrType.Bool, "flag", mutable: true);
+        int y = f.Local(IrType.I64, "y", mutable: true), p = f.Local(IrType.PtrMut(IrType.I64), "p");
+        int box = f.Local(IrType.Gc(IrType.I64), "box"), garbage = f.Local(IrType.Gc(IrType.I64), "garbage", mutable: true), unit = f.Temp(IrType.Unit);
+        f.Assign(wide, Int(int.MaxValue)).Assign(wide, Rvalue.Binary(BinaryOp.Add, Copy(wide), Int(1)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(wide), IrType.I64));                                             // -2147483648
+        f.Assign(small, Int(127, IrType.I8)).Assign(small, Rvalue.Binary(BinaryOp.Add, Copy(small), Int(1, IrType.I8)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(small), IrType.I64));                                            // -128
+        f.Assign(bytes, Int(250, IrType.U8)).Assign(bytes, Rvalue.Binary(BinaryOp.Mul, Copy(bytes), Int(3, IrType.U8)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(bytes), IrType.I64));                                            // 750 % 256 = 238
+        f.Assign(bits, Int(BitConverter.DoubleToInt64Bits(1.5), IrType.I64));
+        int asDouble = f.Temp(IrType.F64);
+        f.Assign(asDouble, new IntrinsicRvalue("f64.from_bits", [Copy(bits)]))
+         .Assign(single, Rvalue.Cast(Copy(asDouble), IrType.F32))
+         .Assign(single, Rvalue.Binary(BinaryOp.Mul, Copy(single), Float32(3f)))
+         .Assign(single, Rvalue.Unary(UnaryOp.Neg, Copy(single)));
+        Print(f, "print.f64", Rvalue.Cast(Copy(single), IrType.F64));                                           // -4.5
+        f.Assign(flag, Rvalue.Binary(BinaryOp.Lt, Copy(small), Int(0, IrType.I8))).Assign(flag, Rvalue.Unary(UnaryOp.Not, Copy(flag)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(flag), IrType.I64));                                             // 0
+        f.Assign(y, Int(5, IrType.I64)).Assign(p, Rvalue.RefMut(new Place(y)))
+         .Assign(new Place(p).Deref(), Int(9, IrType.I64));
+        Print(f, "print.i64", new UseRvalue(Copy(y)));                                                          // 9
+        f.Assign(box, Rvalue.Gc(Int(77, IrType.I64)));
+        for (int i = 0; i < 3; i++)
+            f.Assign(garbage, Rvalue.Gc(Int(i, IrType.I64))).Assign(unit, new IntrinsicRvalue("gc.request", []));
+        Print(f, "print.i64", new UseRvalue(Copy(new Place(box).Deref())));                                      // 77
+        f.Return();
+        var (exit, output, errors) = Node(new IrModule([], [f.Build()]) { Name = "locals" });
+        Check("the program runs", exit == 0, errors);
+        Check("-2147483648 -128 238 -4.5 0 9 77", Lines(output).SequenceEqual(["-2147483648", "-128", "238", "-4.5", "0", "9", "77"]), string.Join(" ", Lines(output)));
+    }
+
     /// <summary>Float `%` is fmod (the dividend's sign), through the runtime's `larva_f64_rem`; singles go through doubles exactly.</summary>
     [Fact]
     public void Float_remainder_is_fmod()

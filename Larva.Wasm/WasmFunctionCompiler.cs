@@ -5,13 +5,18 @@ using static Larva.Wasm.WasmCodegen;
 
 namespace Larva.Wasm
 {
-    /// <summary>Compiles one function: frame slots in linear memory; structured control flow, or a dispatch loop over the blocks.</summary>
+    /// <summary>
+    /// Compiles one function: frame slots in linear memory (wasm locals for plain scalars); structured control flow, or a
+    /// dispatch loop over the blocks.
+    /// </summary>
     internal sealed class WasmFunctionCompiler
     {
         // Wasm locals: the two parameters, then the frame pointer, the dispatch state, an address, the caller's stack
-        // pointer and two i64 scratch values.
+        // pointer and two i64 scratch values; then the i64 locals of the function's scalars (see `registers`) and of
+        // its scalar temps.
         private const int Args = 0, Ret = 1, Fp = 2, State = 3, Addr = 4, Saved = 5, A = 6, B = 7;
-        private static readonly ValType[] Locals = [ValType.I32, ValType.I32, ValType.I32, ValType.I32, ValType.I64, ValType.I64];
+        private static readonly ValType[] FixedLocals = [ValType.I32, ValType.I32, ValType.I32, ValType.I32, ValType.I64, ValType.I64];
+        private int localCount = 2 + FixedLocals.Length;
 
         private readonly WasmCodegen cg;
         /// <summary>The GC of the function's domain (the program's, with one domain).</summary>
@@ -25,10 +30,19 @@ namespace Larva.Wasm
         private readonly BoundsAnalysis? bounds;
 
         private readonly int[] slots;
+        /// <summary>
+        /// The wasm local of each IR local kept out of the frame (-1: in its frame slot): integers, bools and floats whose
+        /// address is never taken. They hold no handles, so the collector (which scans the frames) has nothing to miss.
+        /// </summary>
+        private readonly int[] registers;
         private readonly Dictionary<Place, int> flags = [];
         private readonly Dictionary<Location, int> pins = [];
         private readonly List<(int Offset, int Size)> temps = [];
         private int tempCursor;
+        // Temps of scalars that are no handles live in wasm locals (a temp below zero is local -1 - temp), the others
+        // in the frame (where the collector sees them).
+        private readonly List<int> scalarTemps = [];
+        private int scalarCursor;
         private int frame;
         private Location current;
 
@@ -50,6 +64,34 @@ namespace Larva.Wasm
             moves = new MoveAnalysis(function, module);
             bounds = cg.EliminateBoundsChecks ? BoundsAnalysis.Run(function, module) : null;
             slots = new int[function.Locals.Length];
+            registers = new int[function.Locals.Length];
+        }
+
+        /// <summary>A value a wasm local can hold: an integer of at most 64 bits, a bool or a float (never a handle).</summary>
+        private bool Plain(IrType type) =>
+            type is PrimitiveType { Kind: Primitive.Bool or Primitive.F32 or Primitive.F64 } or PrimitiveType { IsInteger: true, BitWidth: <= 64 };
+
+        private int NewLocal() => localCount++;
+
+        /// <summary>A temp for an i64 value (canonical bits; a float's bits) in a wasm local.</summary>
+        private int ScalarTemp()
+        {
+            if (scalarCursor == scalarTemps.Count)
+                scalarTemps.Add(NewLocal());
+            return -1 - scalarTemps[scalarCursor++];
+        }
+
+        /// <summary>A temp for a value of <paramref name="type"/>: a wasm local for a plain scalar, else a frame slot.</summary>
+        private int TempFor(IrType type) => Plain(type) ? ScalarTemp() : Temp(Math.Max(8, cg.Shape(type).Size));
+
+        private static bool IsLocal(int temp) => temp < 0;
+        private static int LocalOf(int temp) => -1 - temp;
+
+        /// <summary>Where the temps stand (to give back the ones taken after it).</summary>
+        private (int Memory, int Scalar) Cursor
+        {
+            get => (tempCursor, scalarCursor);
+            set => (tempCursor, scalarCursor) = value;
         }
 
         private int Slot(int size, int align)
@@ -78,12 +120,24 @@ namespace Larva.Wasm
 
         public (ValType[] Locals, Code Code) Compile()
         {
+            var addressed = new bool[function.Locals.Length];
+            foreach (var statement in function.Blocks.SelectMany(b => b.Statements))
+            {
+                if (statement is AssignStatement { Value: RefRvalue reference })
+                    addressed[reference.Place.Local] = true;
+            }
             for (int l = 0; l < function.Locals.Length; l++)
             {
                 var type = function.Locals[l].Type;
+                cg.Shape(type);
+                registers[l] = -1;
+                if (Plain(type) && !addressed[l])
+                {
+                    registers[l] = NewLocal();
+                    continue;
+                }
                 var layout = type.IsUnit ? null : Layouts.Of(type, module);
                 slots[l] = layout is null ? 0 : Slot(layout.Size, Math.Min(16, Math.Max(8, layout.Align)));
-                cg.Shape(type);
             }
             foreach (var path in Enumerable.Range(0, function.Locals.Length).SelectMany(l => Owned(function.Locals[l].Type, []).Select(o => new Place(l, o.Path))))
                 flags[path] = Slot(1, 1);
@@ -166,7 +220,16 @@ namespace Larva.Wasm
                 var (kind, size, _) = cg.Shape(function.Locals[l].Type);
                 if (kind == Kind.Unit)
                     continue;
-                Copy(p, () => { p.LocalGet(Fp); p.I32(slots[l]); p.I32Add(); }, () => { p.LocalGet(Args); p.I32(offset); p.I32Add(); }, size);
+                if (registers[l] >= 0)
+                {
+                    p.LocalGet(Args);
+                    p.I64LoadSized(size, cg.Shape(function.Locals[l].Type).Signed, offset);
+                    p.LocalSet(registers[l]);
+                }
+                else
+                {
+                    Copy(p, () => { p.LocalGet(Fp); p.I32(slots[l]); p.I32Add(); }, () => { p.LocalGet(Args); p.I32(offset); p.I32Add(); }, size);
+                }
                 offset += Align(size, 8);
             }
             foreach (var (place, flag) in flags)
@@ -195,7 +258,10 @@ namespace Larva.Wasm
                 p.I64Store(regionDepth);
             }
             p.Append(c);
-            return (Locals, p);
+            var locals = new ValType[localCount - 2];
+            Array.Fill(locals, ValType.I64);
+            FixedLocals.CopyTo(locals, 0);
+            return (locals, p);
         }
 
         /// <summary>The code of one state: a block's statements and terminator, a catch landing, or the cleanup landing.</summary>
@@ -210,11 +276,11 @@ namespace Larva.Wasm
                 for (int s = 0; s < block.Statements.Length; s++)
                 {
                     current = new Location(state, s);
-                    tempCursor = 0;
+                    Cursor = (0, 0);
                     Statement(block.Statements[s]);
                 }
                 current = new Location(state, block.Statements.Length);
-                tempCursor = 0;
+                Cursor = (0, 0);
                 Terminator(block.Terminator);
             }
             else if (state != cleanupLanding)
@@ -235,7 +301,7 @@ namespace Larva.Wasm
             }
             else
             {
-                tempCursor = 0;
+                Cursor = (0, 0);
                 for (int l = 0; l < function.Locals.Length; l++)
                     ReleaseOwned(new Place(l), []);
                 if (handles)
@@ -491,9 +557,9 @@ namespace Larva.Wasm
                 throw new IrreducibleException();
             }
             // Only this jump enters the target: its code goes here, and the code around it carries on as it was.
-            var (savedCurrent, savedCursor, savedCase, savedDepth) = (current, tempCursor, caseIndex, depth);
+            var (savedCurrent, savedCursor, savedCase, savedDepth) = (current, Cursor, caseIndex, depth);
             DoTree(state);
-            (current, tempCursor, caseIndex, depth) = (savedCurrent, savedCursor, savedCase, savedDepth);
+            (current, Cursor, caseIndex, depth) = (savedCurrent, savedCursor, savedCase, savedDepth);
         }
 
         // ── Control ────────────────────────────────────────────
@@ -531,8 +597,16 @@ namespace Larva.Wasm
             if (withResult)
             {
                 var (kind, size, _) = cg.Shape(function.ReturnType);
-                if (kind != Kind.Unit)
+                if (kind != Kind.Unit && registers[0] >= 0)
+                {
+                    c.LocalGet(Ret);
+                    c.LocalGet(registers[0]);
+                    c.I64StoreSized(size);
+                }
+                else if (kind != Kind.Unit)
+                {
                     Copy(c, () => c.LocalGet(Ret), () => { c.LocalGet(Fp); c.I32(slots[0]); c.I32Add(); }, size);
+                }
             }
             c.LocalGet(Saved);
             c.GlobalSet(Sp);
@@ -628,7 +702,7 @@ namespace Larva.Wasm
                         c.I64Load();
                         c.I64Store(old);
                     }
-                    Copy(c, () => c.I32(cg.GlobalAddress[store.Global]), () => FrameAddress(value), size);
+                    CopyTemp(() => c.I32(cg.GlobalAddress[store.Global]), value, size);
                     if (old != int.MinValue)
                     {
                         LoadTemp(old);
@@ -640,8 +714,7 @@ namespace Larva.Wasm
                 case FreeStatement free:
                 {
                     int pointer = Load(free.Pointer);
-                    c.LocalGet(Fp);
-                    c.I64Load(pointer);
+                    LoadTemp(pointer);
                     c.I32WrapI64();
                     c.Call(cg.Runtime("larva_free"));
                     break;
@@ -674,11 +747,11 @@ namespace Larva.Wasm
             var moved = moves.MovedBy(MoveAnalysis.Operands(value), current).ToList();
             // What the target owned is released after the new value is stored: a destructor that runs in the
             // release sees the owner's field already changed, not the dying object still in it.
-            int saved = tempCursor;
+            var saved = Cursor;
             var old = LoadOwned(target, moved);
             Store(target, result);
             ReleaseLoaded(old);
-            tempCursor = saved;
+            Cursor = saved;
             UpdateFlags(moved, target);
         }
 
@@ -701,16 +774,18 @@ namespace Larva.Wasm
                 throw new WasmBackendException($"`{intrinsic.Name}` takes {slots.Length} argument(s); the runtime's `{info.Symbol}` takes {signature.Parameters.Length}");
             for (int i = 0; i < slots.Length; i++)
             {
-                c.LocalGet(Fp);
                 if (info.Parameters[i] == IrType.Bool)
                 {
-                    c.I32Load8U(slots[i]);
-                    if (signature.Parameters[i] == ValType.I64)
-                        c.I64ExtendI32U();
+                    // A bool is its low byte.
+                    LoadTemp(slots[i]);
+                    c.I64(0xFF);
+                    c.I64And();
+                    if (signature.Parameters[i] == ValType.I32)
+                        c.I32WrapI64();
                 }
                 else
                 {
-                    c.I64Load(slots[i]);
+                    LoadTemp(slots[i]);
                     switch (signature.Parameters[i])
                     {
                         case ValType.I32: c.I32WrapI64(); break;
@@ -747,6 +822,8 @@ namespace Larva.Wasm
 
         private void FrameAddress(int offset)
         {
+            if (IsLocal(offset))
+                throw new WasmBackendException($"`{function.Name}`: a temp in a wasm local has no address");
             c.LocalGet(Fp);
             if (offset != 0)
             {
@@ -758,11 +835,50 @@ namespace Larva.Wasm
         /// <summary>Stores temp <paramref name="value"/> into a place.</summary>
         private void Store(Place target, int value)
         {
+            if (target.Projections.Length == 0 && registers[target.Local] >= 0)
+            {
+                var (_, registerSize, registerSigned) = cg.Shape(function.Locals[target.Local].Type);
+                LoadTemp(value);
+                CanonicalizeTop(registerSize, registerSigned);
+                c.LocalSet(registers[target.Local]);
+                return;
+            }
             var type = Address(target);
             var (kind, size, _) = cg.Shape(type);
             if (kind == Kind.Unit)
                 return;
-            Copy(c, () => c.LocalGet(Addr), () => FrameAddress(value), size);
+            CopyTemp(() => c.LocalGet(Addr), value, size);
+        }
+
+        /// <summary>The i64 on the stack made what loading its low <paramref name="size"/> bytes would give.</summary>
+        private void CanonicalizeTop(int size, bool signed)
+        {
+            if (size >= 8)
+                return;
+            if (signed)
+            {
+                c.Raw(size switch { 1 => (byte)0xC2, 2 => (byte)0xC3, _ => (byte)0xC4 }); // i64.extend8/16/32_s
+            }
+            else
+            {
+                c.I64(size switch { 1 => 0xFF, 2 => 0xFFFF, _ => 0xFFFF_FFFFL });
+                c.I64And();
+            }
+        }
+
+        /// <summary>Copies <paramref name="size"/> bytes of temp <paramref name="value"/> to an address.</summary>
+        private void CopyTemp(Action destination, int value, int size)
+        {
+            if (!IsLocal(value))
+            {
+                Copy(c, destination, () => FrameAddress(value), size);
+                return;
+            }
+            if (size <= 0)
+                return;
+            destination();
+            c.LocalGet(LocalOf(value));
+            c.I64StoreSized(size);
         }
 
         /// <summary>Copies <paramref name="size"/> bytes (loads and stores for small sizes, <c>memory.copy</c> otherwise).</summary>
@@ -796,8 +912,7 @@ namespace Larva.Wasm
                 case IfTerminator branch:
                 {
                     int condition = Operand(branch.Condition);
-                    c.LocalGet(Fp);
-                    c.I64Load(condition);
+                    LoadTemp(condition);
                     c.I64Eqz();
                     OpenIf();
                     JumpTo(branch.Else);
@@ -810,8 +925,7 @@ namespace Larva.Wasm
                     int value = Operand(@switch.Value);
                     for (int i = 0; i < @switch.Targets.Length; i++)
                     {
-                        c.LocalGet(Fp);
-                        c.I64Load(value);
+                        LoadTemp(value);
                         c.I64(i);
                         c.I64Op(0x51); // i64.eq
                         OpenIf();
@@ -848,7 +962,7 @@ namespace Larva.Wasm
                     c.I32(layout.Align);
                     c.Call(cg.Runtime("larva_alloc"));
                     c.LocalSet(Addr);
-                    Copy(c, () => c.LocalGet(Addr), () => FrameAddress(value), cg.Shape(type).Size);
+                    CopyTemp(() => c.LocalGet(Addr), value, cg.Shape(type).Size);
                     c.LocalGet(Addr);
                     c.GlobalSet(InFlight);
                     c.I32(cg.TypeId(type));
@@ -923,7 +1037,7 @@ namespace Larva.Wasm
             foreach (var (temp, size) in values)
             {
                 int at = area + offset;
-                Copy(c, () => FrameAddress(at), () => FrameAddress(temp), size);
+                CopyTemp(() => FrameAddress(at), temp, size);
                 offset += Align(size, 8);
             }
             var moved = moves.MovedBy(call.Arguments, current).ToList();
@@ -939,8 +1053,7 @@ namespace Larva.Wasm
             }
             else
             {
-                c.LocalGet(Fp);
-                c.I64Load(calleeTemp);
+                LoadTemp(calleeTemp);
                 c.I32WrapI64();
                 c.CallIndirect(cg.Uniform);
             }
@@ -971,6 +1084,12 @@ namespace Larva.Wasm
         /// <summary>Stores the i64 in local <see cref="A"/> into temp <paramref name="temp"/>.</summary>
         private void StoreA(int temp)
         {
+            if (IsLocal(temp))
+            {
+                c.LocalGet(A);
+                c.LocalSet(LocalOf(temp));
+                return;
+            }
             c.LocalGet(Fp);
             c.LocalGet(A);
             c.I64Store(temp);
@@ -978,8 +1097,70 @@ namespace Larva.Wasm
 
         private void LoadTemp(int temp)
         {
+            if (IsLocal(temp))
+            {
+                c.LocalGet(LocalOf(temp));
+                return;
+            }
             c.LocalGet(Fp);
             c.I64Load(temp);
+        }
+
+        /// <summary>Before the i64 to store into temp <paramref name="temp"/> is pushed (see <see cref="EndStore"/>).</summary>
+        private void BeginStore(int temp)
+        {
+            if (!IsLocal(temp))
+                c.LocalGet(Fp);
+        }
+
+        /// <summary>Stores the i64 on the stack into temp <paramref name="temp"/>.</summary>
+        private void EndStore(int temp)
+        {
+            if (IsLocal(temp))
+                c.LocalSet(LocalOf(temp));
+            else
+                c.I64Store(temp);
+        }
+
+        /// <summary>Pushes a float temp's value (an f32 or an f64).</summary>
+        private void LoadFloat(int temp, bool f32)
+        {
+            if (!IsLocal(temp))
+            {
+                c.LocalGet(Fp);
+                if (f32) c.F32Load(temp); else c.F64Load(temp);
+                return;
+            }
+            c.LocalGet(LocalOf(temp));
+            if (f32)
+            {
+                c.I32WrapI64();
+                c.Raw(0xBE);    // f32.reinterpret_i32
+            }
+            else
+            {
+                c.Raw(0xBF);    // f64.reinterpret_i64
+            }
+        }
+
+        /// <summary>Stores the float on the stack into a temp (see <see cref="BeginStore"/>); a single's bits zero-extended.</summary>
+        private void EndStoreFloat(int temp, bool f32)
+        {
+            if (!IsLocal(temp))
+            {
+                if (f32) c.F32Store(temp); else c.F64Store(temp);
+                return;
+            }
+            if (f32)
+            {
+                c.Raw(0xBC);    // i32.reinterpret_f32
+                c.I64ExtendI32U();
+            }
+            else
+            {
+                c.Raw(0xBD);    // i64.reinterpret_f64
+            }
+            c.LocalSet(LocalOf(temp));
         }
 
         private int Operand(Operand operand)
@@ -1012,10 +1193,10 @@ namespace Larva.Wasm
                 }
                 case ConstOperand constant:
                 {
-                    int temp = Temp();
-                    c.LocalGet(Fp);
+                    int temp = TempFor(constant.Type);
+                    BeginStore(temp);
                     c.I64(Canonical(constant));
-                    c.I64Store(temp);
+                    EndStore(temp);
                     return temp;
                 }
                 default:
@@ -1025,10 +1206,25 @@ namespace Larva.Wasm
 
         private int Load(Place place)
         {
+            if (place.Projections.Length == 0 && registers[place.Local] >= 0)
+            {
+                int register = ScalarTemp();
+                c.LocalGet(registers[place.Local]);
+                c.LocalSet(LocalOf(register));
+                return register;
+            }
             var type = Address(place);
             if (type is ArrayType)
                 throw new WasmBackendException($"`{place}` is an unsized array; index it or take Len");
             var (kind, size, signed) = cg.Shape(type);
+            if (kind is Kind.Scalar or Kind.Float && Plain(type))
+            {
+                int scalar = ScalarTemp();
+                c.LocalGet(Addr);
+                c.I64LoadSized(size, signed);
+                c.LocalSet(LocalOf(scalar));
+                return scalar;
+            }
             int temp = Temp(size);
             if (kind == Kind.Scalar)
             {
@@ -1076,10 +1272,9 @@ namespace Larva.Wasm
                 }
                 case SizeOfRvalue size:
                 {
-                    int temp = Temp();
-                    c.LocalGet(Fp);
+                    int temp = ScalarTemp();
                     c.I64(Layouts.Of(size.Type, module)!.Size);
-                    c.I64Store(temp);
+                    EndStore(temp);
                     return temp;
                 }
                 case AllocRvalue alloc:
@@ -1091,7 +1286,7 @@ namespace Larva.Wasm
                     c.I32(layout.Align);
                     c.Call(cg.Runtime(alloc.Kind == AllocKind.Gc ? "larva_gc_new" : "larva_alloc"));
                     c.LocalSet(Addr);
-                    Copy(c, () => c.LocalGet(Addr), () => FrameAddress(value), cg.Shape(valueType).Size);
+                    CopyTemp(() => c.LocalGet(Addr), value, cg.Shape(valueType).Size);
                     int cell = Temp();
                     c.LocalGet(Fp);
                     c.LocalGet(Addr);
@@ -1126,6 +1321,7 @@ namespace Larva.Wasm
                         var trailing = Layouts.Trailing(owner, module) ?? throw new WasmBackendException($"`{owner}` does not end with an array");
                         (header, stride, managed) = (trailing.Header, trailing.Stride, array.Kind == AllocKind.Gc ? 1 | 4 : 4);
                     }
+                    int handle = Temp();                       // in the frame: the collector sees the new array
                     c.LocalGet(Fp);
                     LoadTemp(length);
                     c.I32(header);
@@ -1133,8 +1329,8 @@ namespace Larva.Wasm
                     c.I32(managed);
                     c.Call(cg.Runtime("larva_array_new"));
                     c.I64ExtendI32U();
-                    c.I64Store(length);
-                    return length;
+                    c.I64Store(handle);
+                    return handle;
                 }
                 case FunctionRefRvalue reference:
                 {
@@ -1161,26 +1357,25 @@ namespace Larva.Wasm
                 case IsNullRvalue test:
                 {
                     int value = Load(test.Value);
-                    int temp = Temp();
-                    c.LocalGet(Fp);
+                    int temp = ScalarTemp();
                     LoadTemp(value);
                     c.I64Eqz();
                     c.I64ExtendI32U();
-                    c.I64Store(temp);
+                    EndStore(temp);
                     return temp;
                 }
                 case GlobalRvalue global:
                 {
                     var type = module.Globals[global.Global].Type;
                     int size = Layouts.Of(type, module)!.Size;
-                    int temp = Temp(size);
                     var (kind, _, signed) = cg.Shape(type);
-                    if (kind == Kind.Scalar)
+                    int temp = kind is Kind.Scalar or Kind.Float && Plain(type) ? ScalarTemp() : Temp(size);
+                    if (kind == Kind.Scalar || IsLocal(temp))
                     {
-                        c.LocalGet(Fp);
+                        BeginStore(temp);
                         c.I32(cg.GlobalAddress[global.Global]);
                         c.I64LoadSized(size, signed);
-                        c.I64Store(temp);
+                        EndStore(temp);
                     }
                     else
                     {
@@ -1215,19 +1410,18 @@ namespace Larva.Wasm
                 case LenRvalue len:
                 {
                     Address(len.Array);
-                    int temp = Temp();
-                    c.LocalGet(Fp);
+                    int temp = ScalarTemp();
                     c.LocalGet(Addr);
                     c.I64Load();
-                    c.I64Store(temp);
+                    EndStore(temp);
                     return temp;
                 }
                 case IntrinsicRvalue intrinsic:
                 {
-                    int temp = Temp();
-                    c.LocalGet(Fp);
+                    int temp = TempFor(Intrinsics.Find(intrinsic.Name)!.Result);
+                    BeginStore(temp);
                     Intrinsic(intrinsic);
-                    c.I64Store(temp);
+                    EndStore(temp);
                     return temp;
                 }
                 default:
@@ -1543,26 +1737,22 @@ namespace Larva.Wasm
         private int FloatBinary(BinaryOp op, int left, int right, int size)
         {
             bool f32 = size == 4;
-            void LoadF(int temp)
-            {
-                c.LocalGet(Fp);
-                if (f32) c.F32Load(temp); else c.F64Load(temp);
-            }
+            void LoadF(int temp) => LoadFloat(temp, f32);
             switch (op)
             {
                 case BinaryOp.Add or BinaryOp.Sub or BinaryOp.Mul or BinaryOp.Div:
-                    c.LocalGet(Fp);
+                    BeginStore(left);
                     LoadF(left);
                     LoadF(right);
                     int index = op switch { BinaryOp.Add => 0, BinaryOp.Sub => 1, BinaryOp.Mul => 2, _ => 3 };
                     c.Raw((byte)((f32 ? 0x92 : 0xA0) + index));
-                    if (f32) c.F32Store(left); else c.F64Store(left);
+                    EndStoreFloat(left, f32);
                     return left;
                 case BinaryOp.Rem:
                     // fmod (the remainder of the truncating division, with the dividend's sign): the runtime's
                     // `larva_f64_rem` (JavaScript's `%` on doubles, exact), on the bits of doubles; a single is promoted
                     // and demoted around it, which is exact (the remainder of two singles is a single).
-                    c.LocalGet(Fp);
+                    BeginStore(left);
                     LoadF(left);
                     if (f32) c.Raw(0xBB);     // f64.promote_f32
                     c.Raw(0xBD);              // i64.reinterpret_f64
@@ -1571,7 +1761,8 @@ namespace Larva.Wasm
                     c.Raw(0xBD);
                     c.Call(cg.Runtime("larva_f64_rem"));
                     c.Raw(0xBF);              // f64.reinterpret_i64
-                    if (f32) { c.Raw(0xB6); c.F32Store(left); } else c.F64Store(left); // f32.demote_f64
+                    if (f32) c.Raw(0xB6);     // f32.demote_f64
+                    EndStoreFloat(left, f32);
                     return left;
                 case BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Gt or BinaryOp.Le or BinaryOp.Ge:
                     LoadF(left);
@@ -1601,8 +1792,7 @@ namespace Larva.Wasm
                 if (fromKind == Kind.Float)
                 {
                     // x != 0.0 (true for NaN too)
-                    c.LocalGet(Fp);
-                    if (fromSize == 4) c.F32Load(value); else c.F64Load(value);
+                    LoadFloat(value, fromSize == 4);
                     if (fromSize == 4) { c.Raw(0x43); c.Raw(0); c.Raw(0); c.Raw(0); c.Raw(0); c.Raw(0x5C); }
                     else { c.Raw(0x44); for (int i = 0; i < 8; i++) c.Raw(0); c.Raw(0x62); }
                 }
@@ -1619,26 +1809,15 @@ namespace Larva.Wasm
             }
             if (fromKind == Kind.Float && toKind == Kind.Float)
             {
-                c.LocalGet(Fp);
-                c.LocalGet(Fp);
-                if (fromSize == 4)
-                {
-                    c.F32Load(value);
-                    c.Raw(0xBB);                // f64.promote_f32
-                    c.F64Store(value);
-                }
-                else
-                {
-                    c.F64Load(value);
-                    c.Raw(0xB6);                // f32.demote_f64
-                    c.F32Store(value);
-                }
+                BeginStore(value);
+                LoadFloat(value, fromSize == 4);
+                c.Raw(fromSize == 4 ? (byte)0xBB : (byte)0xB6); // f64.promote_f32, f32.demote_f64
+                EndStoreFloat(value, fromSize != 4);
                 return value;
             }
             if (fromKind == Kind.Float)
             {
-                c.LocalGet(Fp);
-                if (fromSize == 4) c.F32Load(value); else c.F64Load(value);
+                LoadFloat(value, fromSize == 4);
                 // Larva's rule for every back end: a value out of the target's range gives the nearest limit and NaN
                 // gives 0 (LLVM's fptosi.sat): i64.trunc_sat_f*_s/u saturates to 64 bits (0xFC 4..7), and a narrower
                 // target is clamped to its own range before the canonical wrap (which alone would turn i32 max into -1).
@@ -1656,11 +1835,11 @@ namespace Larva.Wasm
             }
             if (toKind == Kind.Float)
             {
-                c.LocalGet(Fp);
+                BeginStore(value);
                 LoadTemp(value);
                 bool unsigned = from == IrType.U64;
                 c.Raw(toSize == 4 ? (unsigned ? (byte)0xB5 : (byte)0xB4) : (unsigned ? (byte)0xBA : (byte)0xB9));
-                if (toSize == 4) c.F32Store(value); else c.F64Store(value);
+                EndStoreFloat(value, toSize == 4);
                 return value;
             }
             LoadTemp(value);
@@ -1758,6 +1937,8 @@ namespace Larva.Wasm
         /// <summary>The address of a place into local <see cref="Addr"/> (bounds-checked indices); returns its type.</summary>
         private IrType Address(Place place)
         {
+            if (registers[place.Local] >= 0)
+                throw new WasmBackendException($"`{function.Name}`: `{place}` is in a wasm local and has no address");
             FrameAddress(slots[place.Local]);
             c.LocalSet(Addr);
             IrType type = function.Locals[place.Local].Type;
@@ -1861,6 +2042,11 @@ namespace Larva.Wasm
 
         private void LoadIndex(int local, int size, bool signed)
         {
+            if (registers[local] >= 0)
+            {
+                c.LocalGet(registers[local]);
+                return;
+            }
             c.LocalGet(Fp);
             c.I64LoadSized(size, signed, slots[local]);
         }
@@ -1893,9 +2079,9 @@ namespace Larva.Wasm
 
         private void ReleaseOwned(Place place, IReadOnlyList<Place> movedNow)
         {
-            int saved = tempCursor;
+            var saved = Cursor;
             ReleaseLoaded(LoadOwned(place, movedNow));
-            tempCursor = saved;
+            Cursor = saved;
         }
 
         /// <summary>A resource of a place read into a temp before the place is overwritten, to be released after (see <see cref="ReleaseLoaded"/>).</summary>
