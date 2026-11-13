@@ -5347,6 +5347,9 @@ LARVA_API int64_t larva_parse_f64(const int64_t *text) {
 /* Open files by handle: 0, 1 and 2 are standard input, output and error. A slot is NULL once closed. */
 static FILE **stream_table;
 static int64_t stream_count, stream_capacity;
+/* What each file handle did last: 1 read, 2 wrote, 0 neither yet (or it seeked since). C asks for a seek between a
+ * read and a write; one only then keeps the file's buffer for reads and writes that go on in the same direction. */
+static uint8_t *stream_last;
 
 /* ── TCP (System.Net) ───────────────────────────────────────────────
  * Sockets share the stream handles: a socket handle has SOCKET_TAG set and indexes `sock_table`; stream.read/write/close
@@ -5734,13 +5737,17 @@ LARVA_API int64_t larva_stream_open(const int64_t *path, int64_t mode) {
     if (stream_count >= stream_capacity) {
         stream_capacity = stream_capacity ? stream_capacity * 2 : 16;
         FILE **grown = (FILE **)realloc(stream_table, (size_t)stream_capacity * sizeof(FILE *));
-        if (!grown) {
+        uint8_t *last = grown ? (uint8_t *)realloc(stream_last, (size_t)stream_capacity) : NULL;
+        if (grown)
+            stream_table = grown;
+        if (!last) {
             fclose(file);
             return -1;
         }
-        stream_table = grown;
+        stream_last = last;
     }
     stream_table[stream_count] = file;
+    stream_last[stream_count] = 0;
     return stream_count++;
 }
 
@@ -5785,8 +5792,11 @@ LARVA_API int64_t larva_stream_read(int64_t handle, int64_t *bytes, int64_t offs
         return -1;
     if (handle == 0)
         fflush(stdout);
-    else
-        fseek(file, 0, SEEK_CUR); /* a read may follow a write */
+    else if (handle >= 3) {
+        if (stream_last[handle] == 2)
+            fseek(file, 0, SEEK_CUR); /* a read after a write */
+        stream_last[handle] = 1;
+    }
     BLOCKING_ENTER();  /* the standard input waits for the user; a file for the disk */
     size_t read = fread((uint8_t *)(bytes + 1) + offset, 1, (size_t)count, file);
     blocking_leave();
@@ -5817,8 +5827,11 @@ LARVA_API int64_t larva_stream_write(int64_t handle, const int64_t *bytes, int64
     FILE *file = stream_of(handle);
     if (!file || handle == 0 || offset < 0 || count < 0 || offset + count > bytes[0])
         return -1;
-    if (handle >= 3)
-        fseek(file, 0, SEEK_CUR); /* a write may follow a read */
+    if (handle >= 3) {
+        if (stream_last[handle] == 1)
+            fseek(file, 0, SEEK_CUR); /* a write after a read */
+        stream_last[handle] = 2;
+    }
     BLOCKING_ENTER();
     size_t written = fwrite((const uint8_t *)(bytes + 1) + offset, 1, (size_t)count, file);
     blocking_leave();
@@ -5833,6 +5846,7 @@ LARVA_API int64_t larva_stream_seek(int64_t handle, int64_t offset, int64_t orig
     if (!file)
         return -1;
     int whence = origin == 0 ? SEEK_SET : origin == 1 ? SEEK_CUR : SEEK_END;
+    stream_last[handle] = 0;
 #ifdef _WIN32
     if (_fseeki64(file, offset, whence) != 0)
         return -1;

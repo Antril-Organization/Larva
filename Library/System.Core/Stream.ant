@@ -440,6 +440,12 @@ into namespace System.IO
 			{
 				if (readEnd > 0)
 					DropReads();
+				// Writes as large as the buffer go straight through when nothing waits in it (no copy).
+				if (writeEnd == 0 && count >= buffer.Length)
+				{
+					inner.Write(source, offset, count);
+					return;
+				}
 				if (writeEnd + count <= buffer.Length)
 				{
 					Array.Copy(source, offset, buffer, writeEnd, count);
