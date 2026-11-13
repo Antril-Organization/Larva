@@ -618,4 +618,54 @@ internal static class NativePrograms
         return new IrModule(GcPrograms.StructDefs, [fin.Build(), worker.Build(), garbage.Build(), main.Build()])
             { Globals = [new GlobalDef("finalized", IrType.I32)] };
     }
+
+    /// <summary>
+    /// Nested regions with the same number (functions 0..2; global 0 = seen: i32), in arena mode:
+    /// mark_seen(dead: gc Point) { seen += 1 } — the finalizer of outer's object;
+    /// region_inner() -> i32 { region 0 { let g = gc Point{1, 2}; g.x } };
+    /// region_nested() -> i32 { region 0 { let g = gc Point{40, 0} finalized mark_seen; let t = region_inner(); seen * 100 + g.x + t } }
+    /// — the region numbers are per function: inner's exit must close inner's region only, not outer's object too (→ 41).
+    /// </summary>
+    public static IrModule NestedRegionProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var fin = new FunctionBuilder("mark_seen", IrType.Unit);
+        fin.Argument(gcPoint, "dead");
+        int count = fin.Local(IrType.I32, "count", mutable: true);
+        fin.Assign(count, new GlobalRvalue(0)).Assign(count, Rvalue.Binary(BinaryOp.Add, Copy(count), Int(1))).StoreGlobal(0, Copy(count)).Return();
+
+        var inner = new FunctionBuilder("region_inner", IrType.I32);
+        int ip = inner.Local(Point, "p", mutable: true);
+        int ig = inner.Local(gcPoint, "g");
+        int iv = inner.Local(IrType.I32, "v");
+        inner.RegionEnter(0)
+             .Assign(new Place(ip).Field(0), Int(1)).Assign(new Place(ip).Field(1), Int(2))
+             .Assign(ig, Rvalue.Gc(Move(ip)))
+             .Assign(iv, Copy(new Place(ig).Deref().Field(0)))
+             .RegionExit(0)
+             .Assign(FunctionBuilder.ReturnPlace, Copy(iv))
+             .Return();
+
+        var outer = new FunctionBuilder("region_nested", IrType.I32);
+        int op = outer.Local(Point, "p", mutable: true);
+        int finalizer = outer.Local(new FunctionType([gcPoint], IrType.Unit), "finalizer", mutable: true);
+        int og = outer.Local(gcPoint, "g");
+        int t = outer.Local(IrType.I32, "t");
+        int seen = outer.Local(IrType.I32, "seen", mutable: true);
+        int sum = outer.Local(IrType.I32, "sum", mutable: true);
+        int after = outer.NewBlock();
+        outer.RegionEnter(0)
+             .Assign(new Place(op).Field(0), Int(40)).Assign(new Place(op).Field(1), Int(0))
+             .Assign(finalizer, Rvalue.FunctionRef(0))
+             .Assign(og, Rvalue.Gc(Move(op), Copy(finalizer)))
+             .Call(1, [], t, after);
+        outer.At(after)
+             .Assign(seen, new GlobalRvalue(0))
+             .Assign(sum, Rvalue.Binary(BinaryOp.Mul, Copy(seen), Int(100)))
+             .Assign(sum, Rvalue.Binary(BinaryOp.Add, Copy(sum), Copy(new Place(og).Deref().Field(0))))
+             .Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Add, Copy(sum), Copy(t)))
+             .RegionExit(0)
+             .Return();
+        return new IrModule(GcPrograms.StructDefs, [fin.Build(), inner.Build(), outer.Build()]) { Globals = [new GlobalDef("seen", IrType.I32)] };
+    }
 }

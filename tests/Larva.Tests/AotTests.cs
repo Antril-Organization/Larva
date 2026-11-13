@@ -184,6 +184,27 @@ public sealed unsafe class AotTests : CheckedTest
     }
 
     /// <summary>
+    /// Arena regions are numbered per function: a callee's region 0 opened inside its caller's region 0 is another region.
+    /// The runtime freed every object whose region had the closing number, so the callee's exit freed (and finalized) the
+    /// caller's object too; each open region is its own instance now, and an exit closes the innermost one.
+    /// </summary>
+    [Fact]
+    public void Llvm_a_callee_closing_its_region_keeps_the_callers_region_objects()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.NestedRegionProgram() with { Name = "nested" }, "nested.lvo", GcConfig.Arena);
+        string exe = Path.Combine(Directory, "nested-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "region_nested", "-o", exe, program);
+        Check("llvm: larva native --exe --entry region_nested (gc: arena)", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, stats: true);
+        Check("llvm: nested.exe = 41: the callee's region exit left the caller's object alive (not finalized), both regions freed their own",
+            exit == 0 && output.Trim() == "41" && errors.Contains("live gc 0,") && errors.Contains("errors 0"), $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
+    /// <summary>
     /// A handle stored through a `&mut` reference (or pointer) lands in memory whose owner the storing function cannot name:
     /// when that memory is an old object, the store must still be remembered (larva_gc_wb_at finds the owner), or the next
     /// minor collection leaves the old object pointing at the young object's former place.

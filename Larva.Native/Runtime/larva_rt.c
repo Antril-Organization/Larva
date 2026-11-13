@@ -2047,9 +2047,26 @@ static Table live;          /* payload / cell → size, kind (heap cells, large 
 static int large_index_stale = 1;  /* a large object was made or freed since index_large (a copy into one looks it up) */
 static Table frames;        /* function address → index into root_sets */
 static Table finalizers;    /* gc payload → its finalizer */
-static Table region_of;     /* gc payload → its arena region + 1 */
-static int32_t *regions;
+static Table region_of;     /* gc payload → the id of its open arena region (an instance, not the region's number) */
+
+/*
+ * An open arena region: compiled code names a region by its number in the function, so a callee's region 0 inside its
+ * caller's region 0 is another instance (with its own id). Each keeps the objects made in it, so closing it costs its own
+ * objects (an object freed before, by `delete`, has no entry in `region_of` with this id any more and is skipped).
+ */
+typedef struct Region {
+    int32_t number;
+    int64_t id;
+    void **objects;
+    size_t count, capacity;
+} Region;
+static Region *regions;
 static size_t region_count, region_capacity;
+static int64_t region_ids;
+/* Regions taken off the stack whose objects are being finalized and freed: still roots meanwhile. */
+static Region *closing_regions;
+static size_t closing_count, closing_capacity;
+static void push_pointer(void ***list, size_t *count, size_t *capacity, void *item);
 
 typedef struct { uint16_t reg; int32_t offset; int32_t size; } Root;
 typedef struct { Root *roots; size_t count; } RootSet;
@@ -2667,7 +2684,9 @@ static void *gc_allocate(const LarvaType *type, int64_t payload) {
     if (region_count > 0) {
         GcHeader *header = header_of(object);
         header->flags |= FLAG_REGION;
-        table_put(&region_of, (uintptr_t)object, regions[region_count - 1] + 1, 0);
+        Region *region = &regions[region_count - 1];
+        table_put(&region_of, (uintptr_t)object, region->id, 0);
+        push_pointer(&region->objects, &region->count, &region->capacity, object);
         regions_used = 1;
     }
     rt_leave(locked);
@@ -3068,29 +3087,10 @@ static void scan_pins(void (*visit)(uintptr_t)) {
 
 /* ── Arena regions ───────────────────────────────────────────────── */
 
-/* Closes a region: finalizers first (everything in it is still there for them), then frees. */
-static void free_region(int32_t region) {
-    size_t count = 0, capacity = 0;
-    void **dying = NULL;
-    for (size_t i = 0; i < region_of.capacity; i++) {
-        Entry *e = &region_of.entries[i];
-        if (e->key > 1 && e->value == region + 1) {
-            if (count == capacity) {
-                capacity = capacity ? capacity * 2 : 64;
-                dying = (void **)realloc(dying, capacity * sizeof(void *));
-                if (!dying)
-                    fail_alloc();
-            }
-            dying[count++] = (void *)e->key;
-        }
-    }
-    for (size_t i = 0; i < count; i++)
-        if (is_gc(dying[i]))
-            finalize(dying[i]);
-    for (size_t i = 0; i < count; i++)
-        if (is_gc(dying[i]))
-            gc_free(dying[i]);
-    free(dying);
+/* Whether an object a region recorded is still that region's (not freed since, its address not reused elsewhere). */
+static int region_member(void *object, int64_t id) {
+    Entry *e = table_find(&region_of, (uintptr_t)object);
+    return e && e->value == id;
 }
 
 /* Whether compiled code may allocate inline (in the nursery): not inside arena regions, with the program's own collector,
@@ -3109,22 +3109,70 @@ static void update_fast(void) {
 
 LARVA_API void larva_region_enter(int32_t region) {
     if (region_count == region_capacity) {
-        region_capacity = region_capacity ? region_capacity * 2 : 16;
-        regions = (int32_t *)realloc(regions, region_capacity * sizeof(int32_t));
-        if (!regions)
+        size_t capacity = region_capacity ? region_capacity * 2 : 16;
+        Region *grown = (Region *)realloc(regions, capacity * sizeof(Region));
+        if (!grown)
             fail_alloc();
+        memset(grown + region_capacity, 0, (capacity - region_capacity) * sizeof(Region));
+        regions = grown;
+        region_capacity = capacity;
     }
-    regions[region_count++] = region;
+    Region *opened = &regions[region_count++];  /* keeps the object list a region at this depth had (emptied) */
+    opened->number = region;
+    opened->id = ++region_ids;
+    opened->count = 0;
     update_fast();
 }
 
-LARVA_API void larva_region_exit(int32_t region) {
-    if (region_count == 0 || regions[region_count - 1] != region)
-        errors++;
-    else
-        region_count--;
+/* Closes the innermost open region: finalizers first (everything in it is still there for them), then frees. It is off
+   the stack first (a finalizer that allocates allocates in the enclosing region) and its objects stay roots meanwhile. */
+static void close_innermost_region(void) {
+    if (closing_count == closing_capacity) {
+        closing_capacity = closing_capacity ? closing_capacity * 2 : 8;
+        closing_regions = (Region *)realloc(closing_regions, closing_capacity * sizeof(Region));
+        if (!closing_regions)
+            fail_alloc();
+    }
+    size_t at = closing_count++;
+    size_t depth = --region_count;
+    closing_regions[at] = regions[depth];
+    regions[depth].objects = NULL;
+    regions[depth].count = regions[depth].capacity = 0;
     update_fast();
-    free_region(region);
+    /* By index: a finalizer may open and close regions of its own (both arrays may move). */
+    for (size_t i = 0; i < closing_regions[at].count; i++)
+        if (region_member(closing_regions[at].objects[i], closing_regions[at].id))
+            finalize(closing_regions[at].objects[i]);
+    for (size_t i = 0; i < closing_regions[at].count; i++)
+        if (region_member(closing_regions[at].objects[i], closing_regions[at].id))
+            gc_free(closing_regions[at].objects[i]);  /* removes the entry: an address recorded twice is freed once */
+    Region closed = closing_regions[at];
+    closing_count = at;
+    if (depth < region_capacity && !regions[depth].objects) {
+        regions[depth].objects = closed.objects;  /* the next region at this depth reuses the list */
+        regions[depth].capacity = closed.capacity;
+    } else {
+        free(closed.objects);
+    }
+    if (region_count == 0 && region_of.count == 0 && region_of.capacity > 1024) {
+        free(region_of.entries);  /* after a big region the table shrinks back instead of staying its largest size */
+        memset(&region_of, 0, sizeof region_of);
+    }
+}
+
+LARVA_API void larva_region_exit(int32_t region) {
+    /* The innermost open region with this number (the generated code closes its own regions innermost first). */
+    size_t at = region_count;
+    while (at > 0 && regions[at - 1].number != region)
+        at--;
+    if (at == 0) {
+        errors++;
+        return;
+    }
+    if (at != region_count)
+        errors++;  /* regions above it were left open: they close with it */
+    while (region_count >= at)
+        close_innermost_region();
 }
 
 LARVA_API int32_t larva_region_depth(void) { return (int32_t)region_count; }
@@ -3132,7 +3180,7 @@ LARVA_API int32_t larva_region_depth(void) { return (int32_t)region_count; }
 /* An exception leaves a frame: the regions it opened (above `depth`) close. */
 LARVA_API void larva_region_unwind(int32_t depth) {
     while ((int32_t)region_count > depth)
-        free_region(regions[--region_count]);
+        close_innermost_region();
     update_fast();
 }
 
@@ -4250,9 +4298,14 @@ static void collect_major(int walk_stack) {
         if (e->kind == KIND_ROOT || e->kind == KIND_PAYLOAD)
             scan_ambiguous((const uint8_t *)e->key, e->value);
     }
-    for (size_t i = 0; regions_used && i < region_of.capacity; i++)
-        if (region_of.entries[i].key > 1)
-            consider_ambiguous(region_of.entries[i].key);
+    for (size_t r = 0; regions_used && r < region_count; r++)
+        for (size_t i = 0; i < regions[r].count; i++)
+            if (region_member(regions[r].objects[i], regions[r].id))
+                consider_ambiguous((uintptr_t)regions[r].objects[i]);
+    for (size_t r = 0; regions_used && r < closing_count; r++)
+        for (size_t i = 0; i < closing_regions[r].count; i++)
+            if (region_member(closing_regions[r].objects[i], closing_regions[r].id))
+                consider_ambiguous((uintptr_t)closing_regions[r].objects[i]);
     scan_pins(consider_ambiguous);
     drain_marks();
     /* Unreachable objects with a finalizer survive this collection (with what they reach): their finalizers run after
