@@ -24,9 +24,12 @@ namespace Larva.Hir.Lowering
         private bool IsAsync => (method.Flags & H.MethodFlags.Async) != 0 && lambda < 0;
         private bool IsCoroutine => (method.Flags & (H.MethodFlags.Iterator | H.MethodFlags.Async)) != 0 && lambda < 0;
 
-        /// <summary>A step's fields: each parameter's, <c>this</c>'s, and (iterators) the base's <c>current</c>.</summary>
+        /// <summary>
+        /// A step's fields: each parameter's, <c>this</c>'s, and (iterators) the base's <c>current</c> and <c>disposing</c>
+        /// (-1 when the base has none: a frontend's own Iterator without <c>Dispose()</c>).
+        /// </summary>
         private int[] iteratorParameters = [];
-        private int iteratorThis = -1, iteratorCurrent = -1;
+        private int iteratorThis = -1, iteratorCurrent = -1, iteratorDisposing = -1;
 
         /// <summary>The pause function a yield calls (the coroutine pass's await).</summary>
         private int iteratorPause = -1;
@@ -72,6 +75,9 @@ namespace Larva.Hir.Lowering
                     if (f >= 0 && info.Definition.FullName == "System.Iterator")
                     {
                         iteratorCurrent = info.FieldIndex[f];
+                        int d = info.Definition.Fields.FindIndex(x => x.Name == "disposing");
+                        if (d >= 0)
+                            iteratorDisposing = info.FieldIndex[d];
                         break;
                     }
                 }
@@ -84,12 +90,8 @@ namespace Larva.Hir.Lowering
                 HirLowerer.DeclareGenerics(pause, plan.Generics);
                 pause.Argument(handle, "task", mutable: false);
                 pause.Return();
-                lock (lowerer.Functions)
-                {
-                    lowerer.Functions.Add(suspend.Build());
-                    iteratorPause = lowerer.Functions.Count;
-                    lowerer.Functions.Add(Awaiting(pause.Build()));
-                }
+                lowerer.AddFunction(suspend.Build());
+                iteratorPause = lowerer.AddFunction(Awaiting(pause.Build()));
                 return;
             }
             // Async: pause unless the awaited task is done (Task.Pause registers the frame to run again).
@@ -103,8 +105,7 @@ namespace Larva.Hir.Lowering
             suspend.Assign(asTask, Rvalue.HandleCast(Operand.Copy(frame), pauseThis))
                    .Call(pauseFunction, [Operand.Copy(asTask), Operand.Copy(awaited)], FunctionBuilder.ReturnPlace, done);
             suspend.At(done).Return();
-            lock (lowerer.Functions)
-                lowerer.Functions.Add(suspend.Build());
+            lowerer.AddFunction(suspend.Build());
         }
 
         private static IrFunction Awaiting(IrFunction function) =>
@@ -139,11 +140,33 @@ namespace Larva.Hir.Lowering
             Into(IteratorField(iteratorCurrent), value);
             b.Assign(FunctionBuilder.ReturnPlace, Operand.Bool(true));
             Pause();
+            EndIfDisposing();
         }
 
-        /// <summary>The end (or <c>yield break</c>): false, now and on every later step.</summary>
+        /// <summary>
+        /// Where a step resumes (and where it starts): an iterator being disposed of ends here, running the finally
+        /// blocks around this point first, as the end of its body would.
+        /// </summary>
+        private void EndIfDisposing()
+        {
+            if (iteratorDisposing < 0 || !open)
+                return;
+            int disposing = Temp(IrType.Bool);
+            b.Assign(disposing, Operand.Copy(IteratorField(iteratorDisposing)));
+            int stop = NewBlock(), go = NewBlock();
+            b.If(Operand.Copy(disposing), stop, go);
+            At(stop);
+            EndIterator();
+            At(go);
+        }
+
+        /// <summary>
+        /// The end (or <c>yield break</c>): the finally blocks of the tries it is inside run first; then false, now and on
+        /// every later step.
+        /// </summary>
         private void EndIterator()
         {
+            RunFinally(0);
             int end = NewBlock();
             Goto(end);
             At(end);
@@ -174,12 +197,7 @@ namespace Larva.Hir.Lowering
             f.Assign(receiver, Rvalue.HandleCast(Operand.Copy(argument), thisType))
              .Call(function, a.Type == H.HirType.Void ? [] : [resultType], [Operand.Copy(receiver)], FunctionBuilder.ReturnPlace, done);
             f.At(done).Return();
-            int index;
-            lock (lowerer.Functions)
-            {
-                index = lowerer.Functions.Count;
-                lowerer.Functions.Add(Awaiting(f.Build()));
-            }
+            int index = lowerer.AddFunction(Awaiting(f.Build()));
             Emit(index, OwnTypeArguments, [Operand.Copy(awaitedTask)], target);
         }
 

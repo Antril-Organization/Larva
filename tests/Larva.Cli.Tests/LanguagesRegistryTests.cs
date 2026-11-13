@@ -243,6 +243,69 @@ public sealed class LanguagesRegistryTests
         Assert.Contains("NOT USABLE", world.Larva.Fails("languages"));
     }
 
+    [Fact]
+    public void Packs_with_files_their_manifest_does_not_list_are_refused()
+    {
+        var world = new LanguageWorld("languages-unlisted");
+        string pack = world.LocalPack("Antril");
+        Assert.Contains("ok (files verified)", world.Larva.Ok("languages"));
+
+        // Not code, so the old check let it through: a pack carries only what its manifest hashes.
+        File.WriteAllText(Path.Combine(pack, "notes.txt"), "not listed");
+        Assert.Contains("notes.txt is not among its `files`", world.Larva.Fails("languages"));
+        File.WriteAllText(Path.Combine(world.Root, "Main.ant"), "Main() : i32 => 0;\n");
+        Assert.Contains("notes.txt is not among its `files`", world.Larva.Fails("build", "--check", "Main.ant"));
+        Directory.CreateDirectory(Path.Combine(pack, "sub"));
+        File.Move(Path.Combine(pack, "notes.txt"), Path.Combine(pack, "sub", "notes.txt"));
+        Assert.Contains("sub/notes.txt is not among its `files`", world.Larva.Fails("languages"));
+    }
+
+    [Fact]
+    public void Packs_with_malformed_manifests_are_skipped_with_a_warning()
+    {
+        var world = new LanguageWorld("languages-malformed");
+        world.LocalPack("Antril");
+        string bad = Path.Combine(world.Root, "packs", "Bad");
+        Directory.CreateDirectory(bad);
+        foreach (string manifest in new[] { """{"id":"bad","abi":"one","entry":"x.dll"}""", """{"id":"bad","abi":1,"entry":"x.dll","extensions":[1]}""", """{"id":"bad","files":["x.dll"]}""", """{"id":5}""", "[1, 2]", "{not json" })
+        {
+            File.WriteAllText(Path.Combine(bad, "language.json"), manifest);
+            string output = world.Larva.Ok("languages");
+            Assert.DoesNotContain("Unhandled exception", output);
+            Assert.Contains("warning: a language pack was skipped", output);
+            Assert.Contains("Antril", output);
+        }
+        // Builds go on with the packs that can be read.
+        File.WriteAllText(Path.Combine(world.Root, "Main.ant"), "Main() : i32 => 0;\n");
+        string built = world.Larva.Ok("build", "--check", "Main.ant");
+        Assert.Contains("warning: a language pack was skipped", built);
+        Assert.DoesNotContain("Unhandled exception", built);
+    }
+
+    /// <summary>A prerelease is older than its release: it is neither installed over it nor offered as an update to it.</summary>
+    [Fact]
+    public void Prereleases_sort_below_their_release()
+    {
+        var world = new LanguageWorld("languages-prerelease");
+        world.Approve("1.0.0-beta.1");
+        world.Approve("1.0.0");
+        var index = JsonNode.Parse(File.ReadAllText(Path.Combine(world.Registry, "antril", "index.json")))!;
+        Assert.Equal(["1.0.0-beta.1", "1.0.0"], index["versions"]!.AsArray().Select(v => (string?)v!["version"]).ToArray());
+        Assert.Contains("installed Antril 1.0.0", world.Larva.Ok("languages", "install", "antril", "--provider", world.Registry));
+
+        world.Approve("1.0.1-rc.2");
+        world.Approve("1.0.1-rc.10");
+        world.Approve("1.0.1-alpha");
+        index = JsonNode.Parse(File.ReadAllText(Path.Combine(world.Registry, "antril", "index.json")))!;
+        Assert.Equal(["1.0.0-beta.1", "1.0.0", "1.0.1-alpha", "1.0.1-rc.2", "1.0.1-rc.10"], index["versions"]!.AsArray().Select(v => (string?)v!["version"]).ToArray());
+        Assert.Contains("(was 1.0.0)", world.Larva.Ok("languages", "update", "antril", "--provider", world.Registry));
+        Assert.Equal("1.0.1-rc.10", (string?)LanguageWorld.Manifest(Path.Combine(world.User, "antril"))["version"]);
+        world.Approve("1.0.1");
+        Assert.Contains("(was 1.0.1-rc.10)", world.Larva.Ok("languages", "update", "antril", "--provider", world.Registry));
+        world.Approve("1.0.1-rc.11");
+        Assert.Contains("up to date", world.Larva.Ok("languages", "update", "antril", "--provider", world.Registry));
+    }
+
     private static int FreePort()
     {
         var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);

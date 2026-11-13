@@ -474,6 +474,8 @@ into namespace System.IO
 
 			override Seek(i64 offset, SeekOrigin origin) : i64
 			{
+				if (!inner.CanSeek)
+					throw new IOError("the stream cannot seek");
 				FlushWrites();
 				if (origin == SeekOrigin.Current)
 					offset -= readEnd - readAt;
@@ -520,6 +522,8 @@ into namespace System.IO
 		str name;
 		bool reads;
 		bool writes;
+		/// Whether the handle is a file (a position to move): the console, a pipe and a socket are not.
+		bool seeks;
 
 		Check()
 		{
@@ -528,19 +532,23 @@ into namespace System.IO
 		}
 
 		public:
-			new(i64 handle, str name, bool reads, bool writes)
+			/// A stream that cannot seek (the console, a pipe, a socket).
+			new(i64 handle, str name, bool reads, bool writes) : (handle, name, reads, writes, false) { }
+
+			new(i64 handle, str name, bool reads, bool writes, bool seeks)
 			{
 				this.handle = handle;
 				this.name = name;
 				this.reads = reads;
 				this.writes = writes;
+				this.seeks = seeks;
 			}
 
 			override bool CanRead { get => handle >= 0 && reads; }
 
 			override bool CanWrite { get => handle >= 0 && writes; }
 
-			override bool CanSeek { get => handle >= 3; }
+			override bool CanSeek { get => handle >= 0 && seeks; }
 
 			override i64 Length
 			{
@@ -583,6 +591,8 @@ into namespace System.IO
 			override Seek(i64 offset, SeekOrigin origin) : i64
 			{
 				Check();
+				if (!seeks)
+					throw new IOError("the stream cannot seek: " + name);
 				i64 at = SeekTo(handle, offset, origin == SeekOrigin.Begin ? 0 : origin == SeekOrigin.Current ? 1 : 2);
 				if (at < 0)
 					throw new IOError("cannot seek in " + name);
@@ -640,7 +650,7 @@ into namespace System.IO
 					throw new IOError("cannot open " + path);
 				reads = access != FileAccess.Write;
 				writes = access != FileAccess.Read;
-				buffered = new BufferedStream(new HandleStream(handle, path, reads, writes), bufferSize);
+				buffered = new BufferedStream(new HandleStream(handle, path, reads, writes, true), bufferSize);
 			}
 
 			/// The path it was opened with.

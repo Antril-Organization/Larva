@@ -44,8 +44,18 @@ if (args is ["--version"] or ["version"])
     Console.WriteLine($"larva {LarvaVersion.Current}");
     return 0;
 }
+// Whatever no command caught ends with one line for the person (the whole exception with LARVA_DEBUG), not a crash report.
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    bool debug = Environment.GetEnvironmentVariable("LARVA_DEBUG") is { Length: > 0 };
+    Console.Error.WriteLine($"larva: {(debug || e.ExceptionObject is not Exception error ? e.ExceptionObject : error.Message)}");
+    Environment.Exit(1);
+};
 // A project's sources are the files of the languages installed (their manifests say which extensions).
 Larva.Build.QueenProject.SourceExtensions = LanguageRegistry.Extensions;
+// A pack that could not be read is skipped, and said: a language missing silently is harder to understand.
+foreach (string problem in LanguageRegistry.Problems)
+    Console.Error.WriteLine($"larva: warning: a language pack was skipped: {problem}");
 if (args.Length >= 1 && args[0] == "new")
     return NewCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "run" && RunCommand.Handles(args))

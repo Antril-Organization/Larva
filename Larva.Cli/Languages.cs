@@ -65,21 +65,51 @@ internal sealed unsafe class LanguagePack
     private delegate* unmanaged<byte*, void> free;
     private JsonObject? info;
 
-    /// <summary>The pack in <paramref name="folder"/> (its manifest read, nothing checked or loaded yet), or null with why.</summary>
+    /// <summary>
+    /// The pack in <paramref name="folder"/> (its manifest read and of the right shape, nothing checked or loaded yet), or
+    /// null with why. A manifest that is not JSON, not an object, or has a field of the wrong kind is a broken pack, never
+    /// a crash: the fields are read without further checks afterwards.
+    /// </summary>
     public static LanguagePack? Read(string folder, out string? problem, bool fromRegistry = false)
     {
         problem = null;
         string path = Path.Combine(folder, ManifestName);
         try
         {
-            if (JsonNode.Parse(File.ReadAllBytes(path)) is JsonObject manifest)
+            if (JsonNode.Parse(File.ReadAllBytes(path)) is not JsonObject manifest)
+                problem = $"{path}: not a JSON object";
+            else if (Malformed(manifest) is { } malformed)
+                problem = $"{path}: {malformed}";
+            else
                 return new LanguagePack { Folder = Path.GetFullPath(folder), Manifest = manifest, FromRegistry = fromRegistry };
-            problem = $"{path}: not a JSON object";
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException)
         {
             problem = $"{path}: {e.Message}";
         }
+        return null;
+    }
+
+    /// <summary>What is wrong with the kinds of a manifest's fields, or null.</summary>
+    private static string? Malformed(JsonObject manifest)
+    {
+        static bool IsText(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out _);
+        foreach (string key in new[] { "id", "name", "version", "description", "author", "license", "homepage", "entry", "larva", "icon", "publicKey", "fingerprint", "signature" })
+        {
+            if (manifest[key] is { } node && !IsText(node))
+                return $"`{key}` is not text";
+        }
+        foreach (string key in new[] { "abi", "hir" })
+        {
+            if (manifest[key] is { } node && !(node is JsonValue value && value.TryGetValue<int>(out _)))
+                return $"`{key}` is not a whole number";
+        }
+        if (manifest["extensions"] is { } extensions && (extensions is not JsonArray list || list.Any(e => !IsText(e))))
+            return "`extensions` is not a list of text";
+        if (manifest["files"] is { } files && (files is not JsonObject hashes || hashes.Any(h => !IsText(h.Value))))
+            return "`files` is not an object of file: hash";
+        if (manifest["registry"] is { } registry && registry is not JsonObject)
+            return "`registry` is not an object";
         return null;
     }
 
@@ -110,11 +140,11 @@ internal sealed unsafe class LanguagePack
             if (!string.Equals(Hash(path), hash?.GetValue<string>(), StringComparison.OrdinalIgnoreCase))
                 return $"{file} is not the file its manifest lists (changed since the pack was made)";
         }
-        // Code the manifest does not list is never there by accident.
+        // Nothing is in a pack by accident: every file (whatever it is called) is listed and hashed, or the pack is not loaded.
         foreach (string path in Directory.EnumerateFiles(Folder, "*", SearchOption.AllDirectories))
         {
             string relative = Path.GetRelativePath(Folder, path).Replace('\\', '/');
-            if (IsCode(path) && !files.ContainsKey(relative))
+            if (relative != ManifestName && !files.ContainsKey(relative))
                 return $"{relative} is not among its `files`";
         }
         if (Signed)
@@ -131,9 +161,6 @@ internal sealed unsafe class LanguagePack
             return untrusted;
         return null;
     }
-
-    private static bool IsCode(string path) =>
-        Path.GetExtension(path).ToLowerInvariant() is ".dll" or ".so" or ".dylib" or ".exe";
 
     /// <summary>A file's SHA-256, as the manifest writes it (hex).</summary>
     public static string Hash(string path)
@@ -375,7 +402,7 @@ internal static class LanguageRegistry
         }
     }
 
-    /// <summary>Manifests that could not be read.</summary>
+    /// <summary>Packs that could not be read (their manifests missing, not JSON or malformed): skipped, and said once as warnings.</summary>
     public static IReadOnlyList<string> Problems
     {
         get
@@ -429,11 +456,16 @@ internal static class LarvaVersion
     public static string Current { get; } = typeof(LarvaVersion).Assembly.GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)
         is [AssemblyInformationalVersionAttribute { InformationalVersion: var informational }, ..] ? informational.Split('+')[0] : "0.0.0";
 
-    /// <summary>Negative when <paramref name="a"/> is older than <paramref name="b"/>: numbers compared part by part.</summary>
+    /// <summary>
+    /// Negative when <paramref name="a"/> is older than <paramref name="b"/>, as semantic versioning orders them: the
+    /// numbers part by part; then a prerelease (<c>1.2.0-beta.1</c>) before its release (<c>1.2.0</c>); prereleases by
+    /// their dot-separated identifiers (numbers numerically and before words, words in ASCII order, fewer identifiers
+    /// first); build metadata (<c>+…</c>) ignored.
+    /// </summary>
     public static int Compare(string a, string b)
     {
-        var x = a.TrimStart('v', '>', '=', '^').Split('.', '-');
-        var y = b.TrimStart('v', '>', '=', '^').Split('.', '-');
+        var (x, xPre) = Split(a);
+        var (y, yPre) = Split(b);
         for (int i = 0; i < Math.Max(x.Length, y.Length); i++)
         {
             int p = i < x.Length && int.TryParse(x[i], out var px) ? px : 0;
@@ -441,6 +473,27 @@ internal static class LarvaVersion
             if (p != q)
                 return p.CompareTo(q);
         }
-        return 0;
+        if (xPre is null || yPre is null)
+            return (xPre is null ? 1 : 0) - (yPre is null ? 1 : 0);
+        var xs = xPre.Split('.');
+        var ys = yPre.Split('.');
+        for (int i = 0; i < Math.Min(xs.Length, ys.Length); i++)
+        {
+            bool xn = int.TryParse(xs[i], out var xv), yn = int.TryParse(ys[i], out var yv);
+            int order = xn && yn ? xv.CompareTo(yv) : xn != yn ? (xn ? -1 : 1) : string.CompareOrdinal(xs[i], ys[i]);
+            if (order != 0)
+                return order;
+        }
+        return xs.Length.CompareTo(ys.Length);
+    }
+
+    /// <summary>The numbers of a version and its prerelease (null when it is a release), without build metadata.</summary>
+    private static (string[] Numbers, string? Prerelease) Split(string version)
+    {
+        string text = version.TrimStart('v', '>', '=', '^');
+        if (text.IndexOf('+') is var plus && plus >= 0)
+            text = text[..plus];
+        int dash = text.IndexOf('-');
+        return dash < 0 ? (text.Split('.'), null) : (text[..dash].Split('.'), text[(dash + 1)..]);
     }
 }

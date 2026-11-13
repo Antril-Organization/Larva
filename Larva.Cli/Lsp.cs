@@ -42,8 +42,12 @@ internal sealed class LspServer
 
     private int Loop()
     {
-        while (Read() is { } message)
+        // A message that cannot be read (a bad header, a body that is not JSON) is logged and skipped: the editor's
+        // next message is read as usual. Only the end of the input (or `exit`) ends the server.
+        while (Read(out var message))
         {
+            if (message is null)
+                continue;
             try
             {
                 if (Handle(message) is false)
@@ -61,31 +65,73 @@ internal sealed class LspServer
 
     // ── Transport ──────────────────────────────────────
 
-    private JsonObject? Read()
+    /// <summary>
+    /// Reads one message: false at the end of the input; true with the message, or with null when what came could not
+    /// be read (logged: a header without a Content-Length, a body that is not a JSON object) and the next can be read.
+    /// </summary>
+    private bool Read(out JsonObject? message)
     {
+        message = null;
         int length = -1;
+        bool bad = false;
         while (true)
         {
             string? line = ReadLine();
             if (line is null)
-                return null;
+                return false;
             if (line.Length == 0)
                 break;
             if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
-                length = int.Parse(line.AsSpan(15).Trim());
+            {
+                if (!int.TryParse(line.AsSpan(15).Trim(), out length) || length < 0)
+                {
+                    Log($"bad header `{line}`: the message is skipped");
+                    bad = true;
+                    length = -1;
+                }
+            }
         }
         if (length < 0)
-            return null;
+        {
+            if (!bad)
+                Log("a message without Content-Length: skipped");
+            return true;
+        }
         var buffer = new byte[length];
         int read = 0;
         while (read < length)
         {
             int n = input.Read(buffer, read, length - read);
             if (n == 0)
-                return null;
+                return false;
             read += n;
         }
-        return JsonNode.Parse(buffer) as JsonObject;
+        try
+        {
+            if (JsonNode.Parse(buffer) is JsonObject parsed)
+                message = parsed;
+            else
+                Log("a message that is not a JSON object: skipped");
+        }
+        catch (System.Text.Json.JsonException e)
+        {
+            Log($"a message that is not JSON: skipped ({e.Message})");
+        }
+        return true;
+    }
+
+    /// <summary>A problem with what the editor sent: on standard error, and to the editor (`window/logMessage`) when it can be sent.</summary>
+    private void Log(string text)
+    {
+        Console.Error.WriteLine($"larva lsp: {text}");
+        try
+        {
+            Notify("window/logMessage", new JsonObject { ["type"] = 1, ["message"] = $"larva lsp: {text}" });
+        }
+        catch (IOException)
+        {
+            // The editor is gone: the loop ends at the end of the input.
+        }
     }
 
     private string? ReadLine()
@@ -124,8 +170,14 @@ internal sealed class LspServer
 
     private bool? Handle(JsonObject message)
     {
-        string method = message["method"]?.GetValue<string>() ?? "";
         var id = message["id"];
+        if (message["method"] is not JsonValue methodValue || !methodValue.TryGetValue(out string? method))
+        {
+            // A response to a request (the server sends none: ignored), or a request without a method.
+            if (id is not null && !message.ContainsKey("result") && !message.ContainsKey("error"))
+                Send(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(), ["error"] = new JsonObject { ["code"] = -32600, ["message"] = "a request names its method" } });
+            return true;
+        }
         var parameters = message["params"] as JsonObject;
         switch (method)
         {
@@ -329,7 +381,8 @@ internal sealed class LspServer
             return null;
         coreKey = "core|" + (corePath ?? "data");
         // System.Bindings too: a binding profile is analyzed against what it derives from.
-        bindings = BindProfile.BindingsLibrary(bytes, out string? bindingsPath, quiet: true) is { } bindingsBytes
+        bindingsBytes = BindProfile.BindingsLibrary(bytes, out string? bindingsPath, quiet: true);
+        bindings = bindingsBytes is not null
             ? bindingsPath is not null ? LanguagePack.Reference(bindingsPath) : LanguagePack.Reference(bindingsBytes)
             : null;
         return core = SourceBuild.CoreReference(bytes, corePath);
@@ -337,6 +390,9 @@ internal sealed class LspServer
 
     /// <summary>System.Bindings (when there is one), given to every analysis with System.Core.</summary>
     private JsonObject? bindings;
+
+    /// <summary>System.Bindings itself: linked into the background borrow check with System.Core, as a build links it.</summary>
+    private byte[]? bindingsBytes;
 
     private JsonArray Libraries(JsonObject coreReference) =>
         bindings is null ? [coreReference.DeepClone()] : [coreReference.DeepClone(), bindings.DeepClone()];
@@ -619,21 +675,27 @@ internal sealed class LspServer
     private IReadOnlyList<Larva.IR.Analysis.BorrowError> BorrowErrors(LanguagePack pack, Project project, List<string> sources, Dictionary<string, string> texts)
     {
         if (SourceBuild.CoreLibrary(coreFolder, noCache: false, out _, out _) is not { } coreBytes)
-            return [];
+            return Failed("System.Core not found");
         var references = project.References.Select(r => (JsonObject)r!.DeepClone()).ToList();
         var compiled = SourceBuild.Compile(pack, sources, "Program", references, texts: texts, options: project.Options, quiet: true);
         if (compiled?.Assembly is not { } programBytes)
-            return [];
-        var linked = Larva.Hir.Linking.HirLinker.Link("Program", [coreBytes, .. project.Assemblies.Select(File.ReadAllBytes), programBytes]);
+            return Failed("the program did not compile (its analysis found no error)");
+        // The same libraries a build links: System.Core, System.Bindings (the analysis compiled against it, so the
+        // program may reference it) and the project's assemblies.
+        var libraries = new List<byte[]> { coreBytes };
+        if (bindingsBytes is not null)
+            libraries.Add(bindingsBytes);
+        libraries.AddRange(project.Assemblies.Select(File.ReadAllBytes));
+        var linked = Larva.Hir.Linking.HirLinker.Link("Program", [.. libraries, programBytes]);
         if (!linked.Success)
-            return [];
+            return Failed("link: " + string.Join("; ", linked.Errors));
         var lowered = Larva.Hir.Lowering.HirLowerer.Lower(linked.Assembly!, new Larva.Hir.Lowering.LoweringOptions
         {
             StaticConstructorsFromEntry = true,
             Gc = project.Queen?.Gc ?? Larva.IR.GcConfig.Default,
         });
         if (!lowered.Success || lowered.Module is not { } module)
-            return [];
+            return Failed("lowering: " + string.Join("; ", lowered.Errors));
         // Only the program's own functions: the libraries were checked when they were built.
         var files = new HashSet<string>(sources.Select(Path.GetFullPath), StringComparer.OrdinalIgnoreCase);
         var errors = new List<Larva.IR.Analysis.BorrowError>();
@@ -644,6 +706,14 @@ internal sealed class LspServer
             errors.AddRange(Larva.IR.Analysis.BorrowChecker.Check(function, module));
         }
         return errors;
+    }
+
+    /// <summary>A background borrow check that could not run: said in the server's log (never silently nothing), no errors.</summary>
+    private IReadOnlyList<Larva.IR.Analysis.BorrowError> Failed(string why)
+    {
+        Console.Error.WriteLine($"larva lsp: borrow check: {why}");
+        Notify("window/logMessage", new JsonObject { ["type"] = 1, ["message"] = $"larva lsp: borrow check: {why}" });
+        return [];
     }
 
     /// <summary>The document analyzed by its language with the rest of its program: the diagnostics, or null.</summary>

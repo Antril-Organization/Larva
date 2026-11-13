@@ -371,6 +371,16 @@
 
         public void Ret() => Byte(0xC3);
         public void Nop() => Byte(0x90);
+
+        /// <summary>A 5-byte <c>nop</c> (<c>nop dword [rax + rax + 0]</c>): a slot the size of a <c>jmp rel32</c>.</summary>
+        public void Nop5() { Byte(0x0F); Byte(0x1F); Byte(0x44); Byte(0x00); Byte(0x00); }
+
+        /// <summary>Rewrites the 5 bytes at <paramref name="at"/> as <c>jmp rel32</c> to the bound <paramref name="label"/>.</summary>
+        public void PatchJmp(int at, Label label)
+        {
+            code[at] = 0xE9;
+            Patch32(at + 1, label.Position - (at + 5));
+        }
         public void Int3() => Byte(0xCC);
         public void PushRbp() => Byte(0x55);
         public void PopRbp() => Byte(0x5D);

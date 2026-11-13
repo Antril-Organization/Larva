@@ -243,6 +243,36 @@ namespace Larva.Build
         [ThreadStatic]
         private static (string Path, string Text)? pendingText;
 
+        /// <summary>
+        /// The BUILD settings in effect, as written: this machine's defaults (<c>larva config</c>), then the project's own
+        /// BUILD entries, which win. What a build is really made with (and what tells one build from the next: a change
+        /// of any of them, in the file or in the defaults, means building again).
+        /// </summary>
+        public SortedDictionary<string, string> EffectiveBuild()
+        {
+            var settings = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (key, value) in LarvaDefaults.Effective().Where(v => LarvaDefaults.IsBuildKey(v.Key)))
+                settings[key] = value;
+            foreach (var entry in Document.Named("BUILD").SelectMany(c => c.Entries))
+                settings[entry.Key] = entry.Value.Display;
+            return settings;
+        }
+
+        /// <summary>
+        /// The project a build without a <c>.queen</c> has: nothing but this machine's defaults (<c>larva config</c>), read
+        /// as a project's BUILD chunk is, so that every key applies the same way with or without a project file.
+        /// </summary>
+        public static QueenProject FromDefaults(string name)
+        {
+            var diagnostics = new List<QueenDiagnostic>();
+            string path = Path.Combine(Directory.GetCurrentDirectory(), name + Extension);
+            var document = QueenParser.Parse($"queen 1.0;\n\nchunk PROJ:\n   name: {name}\n", path, diagnostics)
+                ?? QueenParser.Parse("queen 1.0;\n\nchunk PROJ:\n   name: program\n", path, diagnostics)!;
+            var project = new QueenProject { File = path, Document = document };
+            project.Read(diagnostics);
+            return project;
+        }
+
         /// <summary>Whether the project's BUILD chunk sets <paramref name="key"/> itself (not a default).</summary>
         public bool Sets(string key) =>
             Document.Chunks.Where(c => c.Name == "BUILD").SelectMany(c => c.Entries).Any(e => e.Key == key) || LarvaDefaults.Configured().ContainsKey(key);
@@ -755,10 +785,12 @@ namespace Larva.Build
         {
             foreach (var entry in Document.Named("FILES").SelectMany(c => c.Entries).Where(e => e.Key is not ("copy" or "into")))
                 Report(diagnostics, "QN121", $"`{entry.Key}` is not a FILES key (copy, into)", entry.Value, error: false);
-            string into = Values("FILES", "into").LastOrDefault()?.Display.Replace('\\', '/').Trim('/') ?? "";
-            if (into.Split('/').Contains(".."))
+            string given = Values("FILES", "into").LastOrDefault()?.Display.Replace('\\', '/') ?? "";
+            string into = given.Trim('/');
+            if (into.Split('/').Contains("..") || given.StartsWith('/') || Path.IsPathRooted(given) || into.Contains(':'))
             {
-                Report(diagnostics, "QN131", "`into` is a folder under the build's: it cannot climb out with `..`", Values("FILES", "into").Last());
+                // Relative and inside: not `..`, not `/x`, not `C:/x` (a rooted path on any system, whichever this one is).
+                Report(diagnostics, "QN131", "`into` is a folder under the build's: it cannot climb out with `..` or be an absolute path", Values("FILES", "into").Last());
                 into = "";
             }
             var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

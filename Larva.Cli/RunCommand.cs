@@ -70,7 +70,11 @@ internal static class RunCommand
         if (wasm)
             output = Path.ChangeExtension(output, ".js");
 
-        if (rebuild || options.Count > 0 || !UpToDate(project, queen, output))
+        // What the program was built with, besides its files: the effective BUILD settings (the .queen's merged with
+        // `larva config`), the options given here, and the larva that built it. Kept next to the output: any change rebuilds.
+        string fingerprint = Fingerprint(project, options);
+        string stamp = output + StampExtension;
+        if (rebuild || options.Count > 0 || !UpToDate(project, queen, output) || ReadStamp(stamp) != fingerprint)
         {
             // The build's report goes to stderr: stdout is the program's.
             var stdout = Console.Out;
@@ -79,6 +83,8 @@ internal static class RunCommand
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+                if (File.Exists(stamp))
+                    File.Delete(stamp);
                 built = SourceBuild.Build([queen, "-o", output, .. options]);
             }
             finally
@@ -87,6 +93,14 @@ internal static class RunCommand
             }
             if (built != 0)
                 return built;
+            try
+            {
+                File.WriteAllText(stamp, fingerprint);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // Without the stamp the next run builds again: slower, never wrong.
+            }
         }
         var start = wasm ? new ProcessStartInfo("node") { ArgumentList = { output } } : new ProcessStartInfo(output);
         foreach (string argument in programArguments)
@@ -121,6 +135,36 @@ internal static class RunCommand
                 return Path.GetFullPath(found);
         }
         return null;
+    }
+
+    /// <summary>The file next to the output that records what it was built with (<see cref="Fingerprint"/>).</summary>
+    internal const string StampExtension = ".build";
+
+    /// <summary>
+    /// What a build depends on besides its files: every effective BUILD setting (the project's, with `larva config` filling
+    /// in what it does not set), the build options given on the command line, and the larva that builds. A line each, so a
+    /// stamp is readable.
+    /// </summary>
+    internal static string Fingerprint(Larva.Build.QueenProject project, IReadOnlyList<string> options)
+    {
+        var version = typeof(RunCommand).Assembly.GetName().Version?.ToString() ?? "0";
+        var lines = new List<string> { $"larva: {version}", $"format: {Larva.Hir.Encoding.LvaFormat.Version}" };
+        lines.AddRange(project.EffectiveBuild().Select(s => $"{s.Key}: {s.Value}"));
+        if (options.Count > 0)
+            lines.Add("options: " + string.Join(" ", options));
+        return string.Join("\n", lines) + "\n";
+    }
+
+    private static string? ReadStamp(string stamp)
+    {
+        try
+        {
+            return File.Exists(stamp) ? File.ReadAllText(stamp) : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

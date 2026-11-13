@@ -51,7 +51,9 @@ namespace Larva.Llvm
         public const uint ExceptionCode = 0xE04C5641;
 
         private readonly Dictionary<IrType, int> typeIds = [];
-        private readonly Dictionary<int, LLVMValueRef> filters = [];
+        private readonly Dictionary<(LLVMValueRef Parent, int Id), LLVMValueRef> filters = [];
+        private LLVMValueRef recoverFp, localRecover;
+        private LLVMTypeRef recoverFpType, localRecoverType;
         private LLVMValueRef personality;
         private LLVMValueRef payloadGlobal;
         private LLVMValueRef typeGlobal;
@@ -69,6 +71,13 @@ namespace Larva.Llvm
         /// frame cleans up and returns with it.
         /// </summary>
         private readonly bool flagExceptions;
+
+        /// <summary>
+        /// Flag exceptions on a target with threads (POSIX): the exception in flight lives in thread-local globals, so two
+        /// threads throwing at once do not see each other's. WebAssembly (single-threaded) keeps plain globals, which the host
+        /// reads as exports.
+        /// </summary>
+        private readonly bool threadLocalExceptions;
 
         /// <summary>
         /// Safepoints read the runtime's flag (through <c>__imp_larva_poll_pending</c>, as an import from the runtime DLL)
@@ -150,8 +159,9 @@ namespace Larva.Llvm
 
         public LlvmCodegen(IrModule module, GcConfig gc, bool noalias, string name, bool eliminateBoundsChecks = true, string? symbolPrefix = null,
             bool flagExceptions = false, LLVMContextRef? context = null, Func<int, bool>? defines = null, bool[]? compilable = null,
-            bool inlinePolls = true, bool stackRoots = true)
+            bool inlinePolls = true, bool stackRoots = true, bool threadLocalExceptions = false)
         {
+            this.threadLocalExceptions = threadLocalExceptions;
             this.inlinePolls = inlinePolls;
             this.stackRoots = stackRoots;
             this.compilable = compilable;
@@ -422,6 +432,7 @@ namespace Larva.Llvm
             Runtime("larva_region_enter", v, i32);
             Runtime("larva_region_exit", v, i32);
             Runtime("larva_gc_wb", v, ptr, ptr, i64);
+            Runtime("larva_gc_wb_at", v, ptr, i64);
             Runtime("larva_pin", v, ptr);
             Runtime("larva_unpin", v, ptr);
             Runtime("larva_poll", v);
@@ -435,6 +446,11 @@ namespace Larva.Llvm
             Runtime("larva_float_mul", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_div", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_rem", v, ptr, ptr, ptr, i32);
+            // Wide integers (i128, i256): division by limbs, as the direct x86-64 back end calls it.
+            Runtime("larva_wide_udiv", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_urem", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_sdiv", v, ptr, ptr, ptr, i32);
+            Runtime("larva_wide_srem", v, ptr, ptr, ptr, i32);
             Runtime("larva_float_cmp", i32, ptr, ptr, i32, i32);
             Runtime("larva_float_conv", v, ptr, ptr, i32, i32);
             Runtime("larva_region_depth", i32);
@@ -459,6 +475,12 @@ namespace Larva.Llvm
                 typeGlobal = Module.AddGlobal(i64, "larva_exception_type");
                 typeGlobal.Initializer = LLVMValueRef.CreateConstInt(i64, 0);
                 typeGlobal.Linkage = LLVMLinkage.LLVMWeakAnyLinkage;
+                if (threadLocalExceptions)
+                {
+                    // One exception in flight per thread (the runtime declares its copies thread-local too).
+                    LLVM.SetThreadLocal(payloadGlobal, 1);
+                    LLVM.SetThreadLocal(typeGlobal, 1);
+                }
                 return;
             }
             personality = Module.AddFunction("__C_specific_handler", LLVMTypeRef.CreateFunction(i32, [ptr, ptr, ptr, ptr]));
@@ -467,12 +489,12 @@ namespace Larva.Llvm
             var raise = Module.AddFunction("larva_raise", raiseType);
             none = LLVM.ConstNull(LLVM.TokenTypeInContext(Module.Context));
 
-            payloadGlobal = Module.AddGlobal(ptr, "larva.eh.payload");
-            payloadGlobal.Initializer = LLVMValueRef.CreateConstNull(ptr);
-            payloadGlobal.Linkage = LLVMLinkage.LLVMInternalLinkage;
-            typeGlobal = Module.AddGlobal(i64, "larva.eh.type");
-            typeGlobal.Initializer = LLVMValueRef.CreateConstInt(i64, 0);
-            typeGlobal.Linkage = LLVMLinkage.LLVMInternalLinkage;
+            // A filter hands the exception to the handling frame's own slots (llvm.localescape in the frame, llvm.localrecover
+            // in the filter), never through a global: threads throw at the same time, each in its own frames.
+            recoverFpType = LLVMTypeRef.CreateFunction(ptr, [ptr, ptr]);
+            recoverFp = Module.AddFunction("llvm.eh.recoverfp", recoverFpType);
+            localRecoverType = LLVMTypeRef.CreateFunction(ptr, [ptr, ptr, i32]);
+            localRecover = Module.AddFunction("llvm.localrecover", localRecoverType);
             filterType = LLVMTypeRef.CreateFunction(i32, [ptr, ptr]);
 
             // larva_throw(payload, type): larva_raise(code, NONCONTINUABLE, 2, [payload, type])
@@ -499,18 +521,20 @@ namespace Larva.Llvm
         }
 
         /// <summary>
-        /// SEH filter for a catch clause: <c>EXCEPTION_EXECUTE_HANDLER</c> when the exception is Larva's and its type id matches
-        /// (any id for 0); it records the payload and type for the handler to pick up.
+        /// SEH filter for a catch clause of <paramref name="parent"/>: <c>EXCEPTION_EXECUTE_HANDLER</c> when the exception is
+        /// Larva's and its type id matches (any id for 0); it stores the payload and type into the frame's incoming slots
+        /// (escaped as 0 and 1, see <see cref="FunctionEmitter.EscapeOwned"/>) for the handler to pick up: the frame's own,
+        /// so threads that throw at the same time never see each other's exception.
         /// </summary>
-        private LLVMValueRef Filter(int id)
+        private LLVMValueRef Filter(LLVMValueRef parent, int id)
         {
-            if (filters.TryGetValue(id, out var known))
+            if (filters.TryGetValue((parent, id), out var known))
                 return known;
             var i32 = Ctx.Int32Type;
             var i64 = Ctx.Int64Type;
-            var filter = Module.AddFunction($"larva.filter.{id}", filterType);
+            var filter = Module.AddFunction($"larva.filter.{parent.Name}.{id}", filterType);
             filter.Linkage = LLVMLinkage.LLVMInternalLinkage;
-            filters[id] = filter;
+            filters[(parent, id)] = filter;
 
             var here = builder.InsertBlock;
             var start = filter.AppendBasicBlock("entry");
@@ -529,8 +553,10 @@ namespace Larva.Llvm
                 builder.BuildCondBr(builder.BuildICmp(LLVMIntPredicate.LLVMIntEQ, type, LLVMValueRef.CreateConstInt(i64, (ulong)id), ""), yes, no);
             builder.PositionAtEnd(yes);
             var payload = builder.BuildLoad2(ptr, builder.BuildGEP2(Ctx.Int8Type, record, new[] { LLVMValueRef.CreateConstInt(i64, 32) }, ""), "payload");
-            builder.BuildStore(payload, payloadGlobal);
-            builder.BuildStore(type, typeGlobal);
+            // The establisher frame the dispatcher passes → the parent's frame pointer → its escaped slots.
+            var frame = builder.BuildCall2(recoverFpType, recoverFp, new[] { parent, filter.GetParam(1) }, "frame");
+            builder.BuildStore(payload, builder.BuildCall2(localRecoverType, localRecover, new[] { parent, frame, LLVMValueRef.CreateConstInt(i32, 0) }, "incoming.payload"));
+            builder.BuildStore(type, builder.BuildCall2(localRecoverType, localRecover, new[] { parent, frame, LLVMValueRef.CreateConstInt(i32, 1) }, "incoming.type"));
             builder.BuildRet(LLVMValueRef.CreateConstInt(i32, 1));
             builder.PositionAtEnd(no);
             builder.BuildRet(LLVMValueRef.CreateConstInt(i32, 0));
@@ -813,11 +839,20 @@ namespace Larva.Llvm
             }
             var after = CountedBlock(function, handle, "retain");
             var slot = At(handle, -8);
-            var count = builder.BuildLoad2(Ctx.Int32Type, slot, "count");
-            builder.BuildStore(builder.BuildAdd(count, LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1), ""), slot);
+            var one = LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1);
+            if (CountsAtomically)
+                builder.BuildAtomicRMW(LLVMAtomicRMWBinOp.LLVMAtomicRMWBinOpAdd, slot, one, LLVMAtomicOrdering.LLVMAtomicOrderingMonotonic, false);
+            else
+                builder.BuildStore(builder.BuildAdd(builder.BuildLoad2(Ctx.Int32Type, slot, "count"), one, ""), slot);
             builder.BuildBr(after);
             builder.PositionAtEnd(after);
         }
+
+        /// <summary>
+        /// Whether the inline counts are atomic: in a program that starts threads, two threads may share an object (a
+        /// plain load-add-store loses counts, and frees live objects). A program without threads keeps the plain update.
+        /// </summary>
+        private bool CountsAtomically => Larva.IR.Analysis.Safepoints.Threaded(module);
 
         /// <summary>
         /// Reference counting: <paramref name="handle"/> loses an owner; at 0 the runtime frees it (and releases what it holds).
@@ -831,8 +866,19 @@ namespace Larva.Llvm
             }
             var after = CountedBlock(function, handle, "release");
             var slot = At(handle, -8);
-            var count = builder.BuildSub(builder.BuildLoad2(Ctx.Int32Type, slot, "count"), LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1), "");
-            builder.BuildStore(count, slot);
+            var one = LLVMValueRef.CreateConstInt(Ctx.Int32Type, 1);
+            LLVMValueRef count;
+            if (CountsAtomically)
+            {
+                // Acquire-release: the thread that frees the object sees every write the other owners made to it.
+                var before = builder.BuildAtomicRMW(LLVMAtomicRMWBinOp.LLVMAtomicRMWBinOpSub, slot, one, LLVMAtomicOrdering.LLVMAtomicOrderingAcquireRelease, false);
+                count = builder.BuildSub(before, one, "");
+            }
+            else
+            {
+                count = builder.BuildSub(builder.BuildLoad2(Ctx.Int32Type, slot, "count"), one, "");
+                builder.BuildStore(count, slot);
+            }
             var dead = function.AppendBasicBlock("dead");
             Unlikely(builder.BuildCondBr(builder.BuildICmp(LLVMIntPredicate.LLVMIntEQ, count, LLVMValueRef.CreateConstInt(Ctx.Int32Type, 0), ""), dead, after));
             builder.PositionAtEnd(dead);
@@ -1079,6 +1125,9 @@ namespace Larva.Llvm
             // Exceptions: where the exception being handled lives, the shared cleanup pad, the region depth at entry.
             private LLVMValueRef caughtPayload;
             private LLVMValueRef caughtType;
+            /// <summary>SEH: where this frame's filters put the exception they take (escaped slots 0 and 1).</summary>
+            private LLVMValueRef incomingPayload;
+            private LLVMValueRef incomingType;
             private LLVMValueRef regionDepth;
             private LLVMBasicBlockRef cleanup;
             private bool needsCleanup;
@@ -1184,6 +1233,13 @@ namespace Larva.Llvm
                     caughtPayload = b.BuildAlloca(cg.ptr, "caught.payload");
                     b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), caughtPayload);
                     caughtType = b.BuildAlloca(Ctx.Int64Type, "caught.type");
+                    if (!cg.flagExceptions)
+                    {
+                        incomingPayload = b.BuildAlloca(cg.ptr, "incoming.payload");
+                        b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), incomingPayload);
+                        incomingType = b.BuildAlloca(Ctx.Int64Type, "incoming.type");
+                        b.BuildStore(LLVMValueRef.CreateConstInt(Ctx.Int64Type, 0), incomingType);
+                    }
                 }
                 if (function.Blocks.SelectMany(x => x.Statements).Any(x => x is RegionEnterStatement))
                     regionDepth = cg.CallRuntime("larva_region_depth");
@@ -1210,7 +1266,7 @@ namespace Larva.Llvm
                 }
 
                 b.PositionAtEnd(entry);
-                if (cleanup.Handle != IntPtr.Zero && !cg.flagExceptions)
+                if ((cleanup.Handle != IntPtr.Zero || incomingPayload.Handle != IntPtr.Zero) && !cg.flagExceptions)
                     EscapeOwned();
                 b.BuildBr(blocks[0]);
 
@@ -1306,12 +1362,18 @@ namespace Larva.Llvm
             {
                 var (address, type) = Address(target);
                 var owner = lastOwner;
+                bool throughReference = lastThroughReference;
                 var stored = b.BuildStore(value, address);
                 if (IsScalarElement(target, type))
                     cg.TagElement(stored);
                 // Generations: a store into an old object remembers it (handles only: numbers need no barrier).
-                if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && owner.Handle != IntPtr.Zero && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
-                    cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
+                {
+                    if (owner.Handle != IntPtr.Zero)
+                        cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                    else if (throughReference)
+                        cg.CallRuntime("larva_gc_wb_at", address, I64(Layouts.Of(type, module)!.Size)); // the owner, if any, is the runtime's to find
+                }
             }
 
             // ── Terminators ────────────────────────────────────────
@@ -1517,15 +1579,17 @@ namespace Larva.Llvm
                     var handler = fn.AppendBasicBlock("catch");
                     LLVM.AddHandler(catchSwitch, handler);
                     b.PositionAtEnd(handler);
-                    LLVMOpaqueValue* filter = cg.Filter(clause.Type is null ? 0 : cg.TypeId(clause.Type));
+                    LLVMOpaqueValue* filter = cg.Filter(fn, clause.Type is null ? 0 : cg.TypeId(clause.Type));
                     var pad = LLVM.BuildCatchPad(b, catchSwitch, &filter, 1, Text("catch.pad"));
                     var landing = fn.AppendBasicBlock("caught");
                     LLVM.BuildCatchRet(b, pad, landing);
                     b.PositionAtEnd(landing);
-                    // The previous exception of this frame (if any) is finished; keep the new one for `caught` / `resume`.
+                    // The previous exception of this frame (if any) is finished; keep the new one (which the filter stored in
+                    // this frame's incoming slots) for `caught` / `resume`.
                     cg.CallRuntime("larva_free", b.BuildLoad2(cg.ptr, caughtPayload, ""));
-                    b.BuildStore(b.BuildLoad2(cg.ptr, cg.payloadGlobal, ""), caughtPayload);
-                    b.BuildStore(b.BuildLoad2(Ctx.Int64Type, cg.typeGlobal, ""), caughtType);
+                    b.BuildStore(b.BuildLoad2(cg.ptr, incomingPayload, ""), caughtPayload);
+                    b.BuildStore(b.BuildLoad2(Ctx.Int64Type, incomingType, ""), caughtType);
+                    b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), incomingPayload);
                     b.BuildBr(blocks[clause.Block]);
                     unwindTo = dispatch;
                 }
@@ -1605,6 +1669,12 @@ namespace Larva.Llvm
                 b.PositionAtEnd(cleanup);
                 if (cg.flagExceptions)
                 {
+                    // The exception in flight is taken off the flag while the releases run their destructors (a destructor's
+                    // own calls would read it as thrown by them, and one that throws and catches would clear it), and put
+                    // back after; a destructor that lets an exception escape here ends the program, rather than hiding this one.
+                    var payload = b.BuildLoad2(cg.ptr, cg.payloadGlobal, "unwinding.payload");
+                    var type = b.BuildLoad2(Ctx.Int64Type, cg.typeGlobal, "unwinding.type");
+                    b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), cg.payloadGlobal);
                     for (int l = 0; l < function.Locals.Length; l++)
                         ReleaseOwned(new Place(l), []);
                     if (caughtPayload.Handle != IntPtr.Zero)
@@ -1613,6 +1683,16 @@ namespace Larva.Llvm
                         cg.CallRuntime("larva_unpin", b.BuildLoad2(cg.ptr, slot, ""));
                     if (regionDepth.Handle != IntPtr.Zero)
                         cg.CallRuntime("larva_region_unwind", regionDepth);
+                    var escaped = b.BuildIsNotNull(b.BuildLoad2(cg.ptr, cg.payloadGlobal, ""), "destructor.threw");
+                    var terminate = fn.AppendBasicBlock("destructor.threw");
+                    var restore = fn.AppendBasicBlock("unwinding.restored");
+                    cg.Unlikely(b.BuildCondBr(escaped, terminate, restore));
+                    b.PositionAtEnd(terminate);
+                    cg.CallRuntime("larva_panic", I32(7), I64(0), I64(0));
+                    b.BuildUnreachable();
+                    b.PositionAtEnd(restore);
+                    b.BuildStore(payload, cg.payloadGlobal);
+                    b.BuildStore(type, cg.typeGlobal);
                     b.BuildBr(Propagate());
                     return;
                 }
@@ -1801,6 +1881,8 @@ namespace Larva.Llvm
             private LLVMValueRef Binary(BinaryRvalue binary)
             {
                 var type = function.TypeOf(binary.Left, module);
+                if (Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType)
+                    return HandleComparison(binary);
                 var left = Operand(binary.Left);
                 var right = Operand(binary.Right);
                 if (IsWideFloat(type))
@@ -1832,9 +1914,11 @@ namespace Larva.Llvm
                 {
                     case BinaryOp.Div or BinaryOp.Rem:
                         CheckNotZero(right);
-                        return binary.Op == BinaryOp.Div
-                            ? signed ? b.BuildSDiv(left, right, "") : b.BuildUDiv(left, right, "")
-                            : signed ? b.BuildSRem(left, right, "") : b.BuildURem(left, right, "");
+                        if (type.BitWidth > 64)
+                            return WideIntDivide(binary.Op, left, right, type);
+                        if (!signed)
+                            return binary.Op == BinaryOp.Div ? b.BuildUDiv(left, right, "") : b.BuildURem(left, right, "");
+                        return SignedDivide(binary.Op, left, right);
                     case BinaryOp.Shl or BinaryOp.Shr:
                         // Shift amounts wrap at the width, as in the VM (an oversized LLVM shift would be poison).
                         var amount = b.BuildAnd(right, LLVMValueRef.CreateConstInt(right.TypeOf, (ulong)(type.BitWidth!.Value - 1)), "");
@@ -1857,6 +1941,75 @@ namespace Larva.Llvm
                     BinaryOp.Ge => b.BuildICmp(signed ? LLVMIntPredicate.LLVMIntSGE : LLVMIntPredicate.LLVMIntUGE, left, right, ""),
                     _ => throw new LlvmBackendException($"`{binary.Op}`"),
                 };
+            }
+
+            /// <summary>
+            /// Reference counting: <c>==</c> / <c>!=</c> on handles compare addresses and keep no reference, so the operands are
+            /// read without a retain (an <see cref="Operand"/> read would take one that nothing releases); a read that transfers
+            /// a local's reference (its last use) releases it here, since its drop flag is cleared for it.
+            /// </summary>
+            private LLVMValueRef HandleComparison(BinaryRvalue binary)
+            {
+                LLVMValueRef Read(Operand operand) => operand switch
+                {
+                    CopyOperand copy => Load(copy.Place),
+                    MoveOperand move => Load(move.Place),
+                    _ => Operand(operand),
+                };
+                var left = Read(binary.Left);
+                var right = Read(binary.Right);
+                var result = binary.Op switch
+                {
+                    BinaryOp.Eq => b.BuildICmp(LLVMIntPredicate.LLVMIntEQ, left, right, ""),
+                    BinaryOp.Ne => b.BuildICmp(LLVMIntPredicate.LLVMIntNE, left, right, ""),
+                    _ => throw new LlvmBackendException($"`{binary.Op}` on handles"),
+                };
+                if (Transfers(binary.Left, current))
+                    cg.ReleaseHandle(fn, left);
+                if (Transfers(binary.Right, current))
+                    cg.ReleaseHandle(fn, right);
+                return result;
+            }
+
+            /// <summary>
+            /// Signed <c>/</c> and <c>%</c> as the VM and the x86-64 back end define them: <c>MIN / -1</c> wraps to <c>MIN</c> and
+            /// <c>MIN % -1</c> is 0. LLVM's <c>sdiv</c> / <c>srem</c> leave that overflow undefined (a #DE crash at -O0, anything
+            /// at -O3), so a divisor that may be -1 is tested first and takes the negation (or 0) instead of the instruction.
+            /// </summary>
+            private LLVMValueRef SignedDivide(BinaryOp op, LLVMValueRef left, LLVMValueRef right)
+            {
+                var minusOne = LLVMValueRef.CreateConstInt(right.TypeOf, ulong.MaxValue, true);
+                LLVMValueRef Regular() => op == BinaryOp.Div ? b.BuildSDiv(left, right, "") : b.BuildSRem(left, right, "");
+                LLVMValueRef Negated() => op == BinaryOp.Div ? b.BuildNeg(left, "") : LLVMValueRef.CreateConstInt(left.TypeOf, 0);
+                if (right.IsAConstantInt.Handle != IntPtr.Zero)
+                    return right.ConstIntSExt == -1 ? Negated() : Regular();
+                var special = fn.AppendBasicBlock("div.neg");
+                var regular = fn.AppendBasicBlock("div");
+                var join = fn.AppendBasicBlock("divided");
+                cg.Unlikely(b.BuildCondBr(b.BuildICmp(LLVMIntPredicate.LLVMIntEQ, right, minusOne, ""), special, regular));
+                b.PositionAtEnd(special);
+                var negated = Negated();
+                b.BuildBr(join);
+                b.PositionAtEnd(regular);
+                var divided = Regular();
+                b.BuildBr(join);
+                b.PositionAtEnd(join);
+                var result = b.BuildPhi(left.TypeOf, "");
+                result.AddIncoming([negated, divided], [special, regular], 2);
+                return result;
+            }
+
+            /// <summary>
+            /// <c>/</c> and <c>%</c> on integers wider than 64 bits: the runtime's limb routines (as the x86-64 back end calls them),
+            /// since LLVM would call compiler-rt's <c>__divti3</c>, which no Larva executable links.
+            /// </summary>
+            private LLVMValueRef WideIntDivide(BinaryOp op, LLVMValueRef left, LLVMValueRef right, IrType type)
+            {
+                int limbs = type.BitWidth!.Value / 64;
+                string name = op == BinaryOp.Div ? (type.IsSigned ? "larva_wide_sdiv" : "larva_wide_udiv") : (type.IsSigned ? "larva_wide_srem" : "larva_wide_urem");
+                var result = EntryAlloca(cg.ValueType(type), "wi.r");
+                cg.CallRuntime(name, Spilled(left, "wi.a"), Spilled(right, "wi.b"), result, I32(limbs));
+                return b.BuildLoad2(cg.ValueType(type), result, "");
             }
 
             /// <summary>Numeric conversion with Larva semantics (sign follows the source type).</summary>
@@ -2001,11 +2154,15 @@ namespace Larva.Llvm
             /// <summary>The gc object the last <see cref="Address"/> went into (its last dereference), if it went into one.</summary>
             private LLVMValueRef lastOwner;
 
+            /// <summary>Whether the last <see cref="Address"/> went through a reference or pointer after its last gc object (so the memory may be inside an object this function cannot name).</summary>
+            private bool lastThroughReference;
+
             private (LLVMValueRef Pointer, IrType Type) Address(Place place)
             {
                 var address = locals[place.Local];
                 IrType type = function.Locals[place.Local].Type;
                 lastOwner = default;
+                lastThroughReference = false;
                 for (int p = 0; p < place.Projections.Length; p++)
                 {
                     switch (place.Projections[p])
@@ -2015,6 +2172,7 @@ namespace Larva.Llvm
                             if (type is OptionalType)
                                 Guard(b.BuildIsNotNull(address, ""), 5, I64(0), I64(0)); // null reference
                             lastOwner = type.Unoptional() is GcType ? address : default;
+                            lastThroughReference = type.Unoptional() is ReferenceType or PointerType;
                             type = type.Pointee()!;
                             break;
                         case FieldProjection field:
@@ -2202,20 +2360,31 @@ namespace Larva.Llvm
             private const int EscapeThreshold = 24;
 
             /// <summary>
-            /// With a cleanup funclet, what it releases (owning locals and their drop flags) stays in the frame
-            /// (<c>llvm.localescape</c>): promoted to registers, every call that may throw would first copy all of them out for
-            /// the funclet, hundreds of stores a turn in a large function's loop. A small frame stays in registers: its few
-            /// copies cost less than keeping every flag and handle in memory.
+            /// What the frame's filters and funclets reach through <c>llvm.localescape</c>: first the incoming exception slots
+            /// (0: payload, 1: type) the catch filters fill in (see <see cref="Filter"/>), then, with a cleanup funclet, what
+            /// it releases (owning locals and their drop flags) when there are many: promoted to registers, every call that
+            /// may throw would first copy all of them out for the funclet, hundreds of stores a turn in a large function's
+            /// loop. A small frame stays in registers: its few copies cost less than keeping every flag and handle in memory.
             /// </summary>
             private void EscapeOwned()
             {
                 var slots = new List<LLVMValueRef>();
+                if (incomingPayload.Handle != IntPtr.Zero)
+                {
+                    slots.Add(incomingPayload);
+                    slots.Add(incomingType);
+                }
+                var owned = new List<LLVMValueRef>();
                 for (int l = 0; l < function.Locals.Length; l++)
                     if (Owned(function.Locals[l].Type, []).Any())
-                        slots.Add(locals[l]);
-                if (slots.Count < EscapeThreshold)
+                        owned.Add(locals[l]);
+                if (owned.Count >= EscapeThreshold)
+                {
+                    slots.AddRange(owned);
+                    slots.AddRange(flags.Values);
+                }
+                if (slots.Count == 0)
                     return;
-                slots.AddRange(flags.Values);
                 var type = LLVMTypeRef.CreateFunction(Ctx.VoidType, [], IsVarArg: true);
                 var escape = cg.Module.GetNamedFunction("llvm.localescape");
                 if (escape.Handle == IntPtr.Zero)
@@ -2234,12 +2403,15 @@ namespace Larva.Llvm
                     if (place.Projections[j] is DerefProjection && function.TypeOf(handle, module).Unoptional() is GcType)
                     {
                         var value = Load(handle);
-                        cg.CallRuntime("larva_pin", value);
                         var here = b.InsertBlock;
                         b.PositionBefore(entry.FirstInstruction);
                         var slot = b.BuildAlloca(cg.ptr, "pin");
                         b.BuildStore(LLVMValueRef.CreateConstNull(cg.ptr), slot);
                         b.PositionAtEnd(here);
+                        // One pin per site per activation: in a loop, the previous pass's pin is given back first (the slot is
+                        // null before the first), else the runtime's pin stack grows with every pass until the return.
+                        cg.CallRuntime("larva_unpin", b.BuildLoad2(cg.ptr, slot, ""));
+                        cg.CallRuntime("larva_pin", value);
                         b.BuildStore(value, slot);
                         pinSlots.Add(slot);
                         return;

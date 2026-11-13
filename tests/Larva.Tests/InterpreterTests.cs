@@ -192,6 +192,233 @@ public sealed class InterpreterTests : CheckedTest
         Check("f128: 1 + 1 = 2", Equal(vm.Run("quad"), 2.0));
     }
 
+    [Fact]
+    public void Threads_keep_the_turn_for_a_slice_while_others_spin()
+    {
+        // Four workers spin on a flag (each poll is a safepoint) while the main thread counts to 20000; then it sets the
+        // flag, waits on a condition until every worker has reported under the lock, and joins them. Handing the turn over
+        // at every safepoint would make every one of main's polls a host context switch (the shape of a thread pool whose
+        // workers spin for work): the slice keeps the handoffs to a small fraction of the safepoints.
+        var i32Ptr = IrType.PtrMut(IrType.I32);
+        var envStruct = new StructDef("Env", i32Ptr, i32Ptr, IrType.I64, IrType.I64); // flag, done, mutex, cond
+        var env = IrType.Struct(0);
+        var envPtr = IrType.PtrMut(env);
+        var opaque = IrType.Ptr(IrType.Unit);
+        var unit = IrType.Unit;
+
+        var worker = new FunctionBuilder("spinner", unit) { Unsafe = true };
+        int arg = worker.Argument(opaque, "env");
+        int we = worker.Local(envPtr, "e");
+        int seen = worker.Local(IrType.I32, "seen", mutable: true);
+        int wc = worker.Temp(IrType.Bool);
+        int u1 = worker.Temp(unit), u2 = worker.Temp(unit), u3 = worker.Temp(unit);
+        int old = worker.Temp(IrType.I32);
+        int spin = worker.NewBlock(), report = worker.NewBlock();
+        worker.Assign(we, Rvalue.Cast(Copy(arg), envPtr)).Goto(spin);
+        worker.At(spin).Assign(seen, new IntrinsicRvalue("atomic.load.i32", [Copy(new Place(we).Deref().Field(0))]))
+              .Assign(wc, Rvalue.Binary(BinaryOp.Eq, Copy(seen), Int(0))).If(Move(wc), spin, report);
+        worker.At(report).Assign(u1, new IntrinsicRvalue("mutex.lock", [Copy(new Place(we).Deref().Field(2))]))
+              .Assign(old, new IntrinsicRvalue("atomic.add.i32", [Copy(new Place(we).Deref().Field(1)), Int(1)]))
+              .Assign(u2, new IntrinsicRvalue("cond.signal", [Copy(new Place(we).Deref().Field(3))]))
+              .Assign(u3, new IntrinsicRvalue("mutex.unlock", [Copy(new Place(we).Deref().Field(2))]))
+              .Return();
+
+        var main = new FunctionBuilder("spin_main", IrType.I32) { Unsafe = true };
+        int e = main.Local(env, "e", mutable: true);
+        int p = main.Local(envPtr, "p");
+        int flag = main.Local(i32Ptr, "flag"), done = main.Local(i32Ptr, "done");
+        int code = main.Local(new FunctionType([opaque], unit), "code");
+        int handle = main.Local(opaque, "handle");
+        int[] threads = [main.Local(IrType.I64, "t0"), main.Local(IrType.I64, "t1"), main.Local(IrType.I64, "t2"), main.Local(IrType.I64, "t3")];
+        int i = main.Local(IrType.I32, "i", mutable: true);
+        int d = main.Local(IrType.I32, "d", mutable: true);
+        int mc = main.Temp(IrType.Bool), wc2 = main.Temp(IrType.Bool);
+        int mu1 = main.Temp(unit), mu2 = main.Temp(unit), mu3 = main.Temp(unit);
+        int joined = main.Local(IrType.I64, "joined", mutable: true), woken = main.Local(IrType.I64, "woken", mutable: true);
+        int count = main.NewBlock(), countBody = main.NewBlock(), release = main.NewBlock(), check = main.NewBlock(), wait = main.NewBlock(), finish = main.NewBlock();
+        main.Assign(flag, Rvalue.Alloc(Int(0))).Assign(done, Rvalue.Alloc(Int(0)))
+            .Assign(new Place(e).Field(0), Copy(flag)).Assign(new Place(e).Field(1), Copy(done))
+            .Assign(new Place(e).Field(2), new IntrinsicRvalue("mutex.new", []))
+            .Assign(new Place(e).Field(3), new IntrinsicRvalue("cond.new", []))
+            .Assign(p, Rvalue.Alloc(Move(e)))
+            .Assign(code, Rvalue.FunctionRef(0))
+            .Assign(handle, Rvalue.Cast(Copy(p), opaque));
+        foreach (int t in threads)
+            main.Assign(t, new IntrinsicRvalue("thread.start", [Copy(code), Copy(handle)]));
+        main.Assign(i, Int(0)).Goto(count);
+        main.At(count).Assign(mc, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(20_000))).If(Move(mc), countBody, release);
+        main.At(countBody).Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1))).Goto(count);
+        main.At(release).Assign(mu1, new IntrinsicRvalue("atomic.store.i32", [Copy(flag), Int(1)]))
+            .Assign(mu2, new IntrinsicRvalue("mutex.lock", [Copy(new Place(p).Deref().Field(2))]))
+            .Goto(check);
+        main.At(check).Assign(d, new IntrinsicRvalue("atomic.load.i32", [Copy(done)]))
+            .Assign(wc2, Rvalue.Binary(BinaryOp.Lt, Copy(d), Int(threads.Length))).If(Move(wc2), wait, finish);
+        main.At(wait).Assign(woken, new IntrinsicRvalue("cond.wait", [Copy(new Place(p).Deref().Field(3)), Copy(new Place(p).Deref().Field(2)), Int(-1, IrType.I64)]))
+            .Goto(check);
+        main.At(finish).Assign(mu3, new IntrinsicRvalue("mutex.unlock", [Copy(new Place(p).Deref().Field(2))]));
+        foreach (int t in threads)
+            main.Assign(joined, new IntrinsicRvalue("thread.join", [Copy(t), Int(-1, IrType.I64)]));
+        main.Free(p).Free(flag).Free(done).Assign(FunctionBuilder.ReturnPlace, Copy(d)).Return();
+
+        var vm = Vm(new IrModule([envStruct], [worker.Build(), main.Build()]));
+        Check("spin_main() = 4: every worker reported", Equal(vm.Run("spin_main"), 4L), vm.Stats.ToString());
+        Check("turn handoffs are a small fraction of the safepoints (a slice per turn, not a handoff per safepoint)",
+            vm.Stats.Turns > 0 && vm.Stats.Turns * 50 < vm.Stats.Safepoints, vm.Stats.ToString());
+        Check("the environment was freed", Leaks(vm) == 0);
+    }
+
+    [Fact]
+    public void Deep_recursion_runs_without_the_host_stack_and_the_depth_limit_is_a_vm_error()
+    {
+        // fn deep(n: i32) -> i32 { if n == 0 { 0 } else { deep(n - 1) + 1 } }
+        var deep = new FunctionBuilder("deep", IrType.I32);
+        int n = deep.Argument(IrType.I32, "n");
+        int c = deep.Temp(IrType.Bool);
+        int m = deep.Local(IrType.I32, "m");
+        int t = deep.Local(IrType.I32, "t");
+        int zero = deep.NewBlock(), recurse = deep.NewBlock(), after = deep.NewBlock();
+        deep.Assign(c, Rvalue.Binary(BinaryOp.Eq, Copy(n), Int(0))).If(Move(c), zero, recurse);
+        deep.At(zero).Assign(FunctionBuilder.ReturnPlace, Int(0)).Return();
+        deep.At(recurse).Assign(m, Rvalue.Binary(BinaryOp.Sub, Copy(n), Int(1))).Call(0, [Copy(m)], t, after);
+        deep.At(after).Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Add, Copy(t), Int(1))).Return();
+
+        // fn deep_throw(n: i32) -> i32 { if n == 0 { throw 7 } deep_throw(n - 1) }
+        var thrower = new FunctionBuilder("deep_throw", IrType.I32);
+        int tn = thrower.Argument(IrType.I32, "n");
+        int tc = thrower.Temp(IrType.Bool);
+        int tm = thrower.Local(IrType.I32, "m");
+        int raise = thrower.NewBlock(), descend = thrower.NewBlock(), back = thrower.NewBlock();
+        thrower.Assign(tc, Rvalue.Binary(BinaryOp.Eq, Copy(tn), Int(0))).If(Move(tc), raise, descend);
+        thrower.At(raise).Throw(Int(7));
+        thrower.At(descend).Assign(tm, Rvalue.Binary(BinaryOp.Sub, Copy(tn), Int(1))).Call(1, [Copy(tm)], FunctionBuilder.ReturnPlace, back);
+        thrower.At(back).Return();
+
+        // fn catch_deep(n: i32) -> i32 { try { deep_throw(n) } catch (e: i32) { -e } }
+        var catcher = new FunctionBuilder("catch_deep", IrType.I32);
+        int cn = catcher.Argument(IrType.I32, "n");
+        int e = catcher.Local(IrType.I32, "e");
+        int ok = catcher.NewBlock(), handler = catcher.NewBlock();
+        catcher.Call(1, [], [Copy(cn)], FunctionBuilder.ReturnPlace, ok, [new CatchClause(IrType.I32, handler)]);
+        catcher.At(ok).Return();
+        catcher.At(handler).Assign(e, Rvalue.Caught).Assign(FunctionBuilder.ReturnPlace, Rvalue.Unary(UnaryOp.Neg, Copy(e))).Return();
+
+        // fn forever(n: i32) -> i32 { forever(n + 1) }
+        var forever = new FunctionBuilder("forever", IrType.I32);
+        int fn = forever.Argument(IrType.I32, "n");
+        int fm = forever.Local(IrType.I32, "m");
+        int done = forever.NewBlock();
+        forever.Assign(fm, Rvalue.Binary(BinaryOp.Add, Copy(fn), Int(1))).Call(3, [Copy(fm)], FunctionBuilder.ReturnPlace, done);
+        forever.At(done).Return();
+
+        var module = new IrModule([], [deep.Build(), thrower.Build(), catcher.Build(), forever.Build()]);
+        var vm = Vm(module);
+        Check("deep(50000) = 50000 (far beyond what the host stack allows)", Equal(vm.Run("deep", 50_000), 50_000L), vm.Stats.ToString());
+        Check("frames released after the recursion", vm.Heap.Live.Count() == 0);
+        Check("an exception thrown 20000 frames down is caught at the top: catch_deep(20000) = -7", Equal(vm.Run("catch_deep", 20_000), -7L));
+        Check("frames released after unwinding", vm.Heap.Live.Count() == 0);
+        Check("uncaught at depth surfaces as UnhandledException", Throws<UnhandledException>(() => vm.Run("deep_throw", 1000), "unhandled"));
+
+        var limited = new Interpreter(Compile(module), options: new InterpreterOptions { MaxCallDepth = 2000 });
+        Check("unbounded recursion stops at the depth limit with a VM error, not a host crash",
+            Throws<VmException>(() => limited.Run("forever", 0), "call depth"));
+        Check("frames released after the depth error", limited.Heap.Live.Count() == 0);
+        Check("the interpreter is usable afterwards", Equal(limited.Run("deep", 1500), 1500L));
+    }
+
+    [Fact]
+    public void A_callee_closing_its_region_keeps_the_callers_region_objects()
+    {
+        // Both functions number their region 0: the ids are per function, the regions are per activation.
+        // fn inner() -> i32 { region { let g = gc Point{1, 2}; g.x } }
+        var inner = new FunctionBuilder("inner", IrType.I32);
+        int ip = inner.Local(GcPrograms.PointType, "p", mutable: true);
+        int ig = inner.Local(IrType.Gc(GcPrograms.PointType), "g");
+        int iv = inner.Local(IrType.I32, "v");
+        inner.RegionEnter(0)
+             .Assign(new Place(ip).Field(0), Int(1)).Assign(new Place(ip).Field(1), Int(2))
+             .Assign(ig, Rvalue.Gc(Move(ip)))
+             .Assign(iv, Copy(new Place(ig).Deref().Field(0)))
+             .RegionExit(0)
+             .Assign(FunctionBuilder.ReturnPlace, Copy(iv))
+             .Return();
+
+        // fn outer() -> i32 { region { let g = gc Point{40, 0}; let t = inner(); g.x + t } }
+        var outer = new FunctionBuilder("outer", IrType.I32);
+        int op = outer.Local(GcPrograms.PointType, "p", mutable: true);
+        int og = outer.Local(IrType.Gc(GcPrograms.PointType), "g");
+        int t = outer.Local(IrType.I32, "t");
+        int after = outer.NewBlock();
+        outer.RegionEnter(0)
+             .Assign(new Place(op).Field(0), Int(40)).Assign(new Place(op).Field(1), Int(0))
+             .Assign(og, Rvalue.Gc(Move(op)))
+             .Call(0, [], t, after);
+        outer.At(after)
+             .Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Add, Copy(new Place(og).Deref().Field(0)), Copy(t)))
+             .RegionExit(0)
+             .Return();
+
+        var vm = Vm(new IrModule(GcPrograms.StructDefs, [inner.Build(), outer.Build()]), gc: GcConfig.Arena);
+        Check("outer() = 41: inner's region exit freed inner's object only", Equal(vm.Run("outer"), 41L));
+        Check("both regions freed their own object", vm.Heap.Live.Count(x => x.Kind == AllocationKind.Gc) == 0 && vm.Heap.TotalFrees == 2, $"frees {vm.Heap.TotalFrees}");
+    }
+
+    [Fact]
+    public void Marking_a_long_linked_list_does_not_overflow_the_host_stack()
+    {
+        // fn chain(count: i32) -> i32 { let head: ?gc Node = null; for i in 0..count { head = gc Node{i, head} } head.value }
+        var node = IrType.Struct(0);
+        var link = new OptionalType(IrType.Gc(node));
+        var f = new FunctionBuilder("chain", IrType.I32);
+        int count = f.Argument(IrType.I32, "count");
+        int head = f.Local(link, "head", mutable: true);
+        int n = f.Local(node, "n", mutable: true);
+        int h = f.Local(IrType.Gc(node), "h", mutable: true);
+        int i = f.Local(IrType.I32, "i", mutable: true);
+        int c = f.Temp(IrType.Bool);
+        int loop = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(head, Rvalue.Zero(link)).Assign(i, Int(0)).Goto(loop);
+        f.At(loop).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(count))).If(Move(c), body, exit);
+        f.At(body).Assign(new Place(n).Field(0), Copy(i)).Assign(new Place(n).Field(1), Move(head))
+         .Assign(h, Rvalue.Gc(Move(n))).Assign(head, Rvalue.Wrap(Move(h)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1))).Goto(loop);
+        f.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(head).Deref().Field(0))).Return();
+
+        var module = new IrModule([new StructDef("Node", IrType.I32, link)], [f.Build()]);
+        var vm = Vm(module, gc: GcConfig.Default);
+        Check("chain(30000) = 29999 (the list is marked by collections during the loop)", Equal(vm.Run("chain", 30000), 29999L), vm.Stats.ToString());
+        Check("collections happened while the list was live", vm.Stats.Collections > 0, vm.Stats.ToString());
+    }
+
+    [Fact]
+    public void Shift_amounts_are_masked_by_the_operand_width()
+    {
+        // The native back ends mask the amount (`shl cl` on x64, wasm, LLVM `and`): `1 << -1` is `1 << 31` for i32.
+        static IrFunction Shift(string name, BinaryOp op, IrType type, BigInteger left, BigInteger amount)
+        {
+            var f = new FunctionBuilder(name, type);
+            f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Int(left, type), Int(amount, type))).Return();
+            return f.Build();
+        }
+        var module = new IrModule([],
+        [
+            Shift("shl_i32_neg", BinaryOp.Shl, IrType.I32, 1, -1),
+            Shift("shl_i32_33", BinaryOp.Shl, IrType.I32, 1, 33),
+            Shift("shr_i32_neg", BinaryOp.Shr, IrType.I32, -8, -1),
+            Shift("shl_i64_neg", BinaryOp.Shl, IrType.I64, 1, -1),
+            Shift("shr_u8_9", BinaryOp.Shr, IrType.U8, 0x80, 9),
+            Shift("shl_i128_neg", BinaryOp.Shl, IrType.I128, 1, -1),
+            Shift("shr_u64_neg", BinaryOp.Shr, IrType.U64, ulong.MaxValue, ulong.MaxValue),
+        ]);
+        var vm = Vm(module);
+        Check("i32: 1 << -1 = 1 << 31", Equal(vm.Run("shl_i32_neg"), (long)int.MinValue));
+        Check("i32: 1 << 33 = 1 << 1", Equal(vm.Run("shl_i32_33"), 2L));
+        Check("i32: -8 >> -1 = -8 >> 31", Equal(vm.Run("shr_i32_neg"), -1L));
+        Check("i64: 1 << -1 = 1 << 63", Equal(vm.Run("shl_i64_neg"), long.MinValue));
+        Check("u8: 0x80 >> 9 = 0x80 >> 1", Equal(vm.Run("shr_u8_9"), 64UL));
+        Check("i128: 1 << -1 = 1 << 127", Equal(vm.Run("shl_i128_neg"), -(BigInteger.One << 127)));
+        Check("u64: max >> max = max >> 63", Equal(vm.Run("shr_u64_neg"), 1UL));
+    }
+
     // ── Reflection ─────────────────────────────────────────────────
 
     [Fact]

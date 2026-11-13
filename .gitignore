@@ -10,3 +10,6 @@ __pycache__/
 *.key
 *.pem
 TestResults/
+
+# Worktrees the Claude desktop app creates for its agents
+.claude/worktrees/

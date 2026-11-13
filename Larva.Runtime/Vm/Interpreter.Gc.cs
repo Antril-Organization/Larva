@@ -16,7 +16,7 @@ namespace Larva.Runtime.Vm
                 {
                     var type = frame.Resolve(a0);
                     var allocation = Heap.Allocate(AllocationKind.Gc, type);
-                    allocation.Region = regions.Count > 0 ? regions.Peek() : null;
+                    allocation.Region = regions.Count > 0 ? regions.Peek().Instance : null;
                     allocation.Domain = frame.Function.Domain;
                     allocation.Counted = il.Counts(frame.Function.Domain);
                     Heap.Write(type, new Address(allocation.Id, 0), Pop(stack));
@@ -31,7 +31,7 @@ namespace Larva.Runtime.Vm
                     var allocation = Heap.Allocate(AllocationKind.Gc, type);
                     allocation.Domain = frame.Function.Domain;
                     allocation.Counted = il.Counts(frame.Function.Domain);
-                    allocation.Region = regions.Count > 0 ? regions.Peek() : null;
+                    allocation.Region = regions.Count > 0 ? regions.Peek().Instance : null;
                     allocation.Finalizer = finalizer.Kind == ValueKind.Function ? finalizer.Function : FunctionOf(Heap.AsInteger(finalizer));
                     Heap.Write(type, new Address(allocation.Id, 0), Pop(stack));
                     allocatedSinceCollect++;
@@ -79,7 +79,7 @@ namespace Larva.Runtime.Vm
                 {
                     var element = frame.Resolve(a0);
                     var array = Heap.AllocateArray(AllocationKind.Gc, element, Heap.AsInteger(Pop(stack)));
-                    array.Region = regions.Count > 0 ? regions.Peek() : null;
+                    array.Region = regions.Count > 0 ? regions.Peek().Instance : null;
                     array.Domain = frame.Function.Domain;
                     array.Counted = il.Counts(frame.Function.Domain);
                     allocatedSinceCollect++;
@@ -90,7 +90,7 @@ namespace Larva.Runtime.Vm
                 {
                     var owner = frame.Resolve(a0) as StructType ?? throw new VmException("newtrail needs a struct");
                     var made = Heap.AllocateTrailing(AllocationKind.Gc, owner, Heap.AsInteger(Pop(stack)));
-                    made.Region = regions.Count > 0 ? regions.Peek() : null;
+                    made.Region = regions.Count > 0 ? regions.Peek().Instance : null;
                     made.Domain = frame.Function.Domain;
                     made.Counted = il.Counts(frame.Function.Domain);
                     allocatedSinceCollect++;
@@ -105,20 +105,28 @@ namespace Larva.Runtime.Vm
                     break;
                 }
                 case GcOp.RegionEnter:
-                    regions.Push((int)a0);
+                    // The number is the region's id within its function; the activation gets an instance of its own, so
+                    // that a callee closing its region 0 never frees what the caller allocated in *its* region 0.
+                    regions.Push(new OpenRegion((int)a0, Interlocked.Increment(ref lastRegionInstance)));
                     break;
                 case GcOp.RegionExit:
-                    if (regions.Count == 0 || regions.Peek() != (int)a0)
+                    if (regions.Count == 0 || regions.Peek().Id != (int)a0)
                         throw new VmException($"gc.rexit {a0} does not close the innermost region");
-                    ExitRegion((int)a0);
+                    ExitRegion();
                     break;
             }
         }
 
-        /// <summary>Closes the innermost region, freeing everything allocated in it.</summary>
-        private void ExitRegion(int region)
+        /// <summary>An open arena region: its id in the function that opened it, and the instance objects are tagged with.</summary>
+        private readonly record struct OpenRegion(int Id, int Instance);
+
+        /// <summary>Process-wide: the interpreters of a program's threads share one heap.</summary>
+        private static int lastRegionInstance;
+
+        /// <summary>Closes the innermost region, freeing everything allocated in it (that activation's objects only).</summary>
+        private void ExitRegion()
         {
-            regions.Pop();
+            int region = regions.Pop().Instance;
             var dying = Heap.Live.Where(x => x.Kind == AllocationKind.Gc && x.Region == region).ToList();
             // Finalizers first, while everything in the region is still there for them to read.
             foreach (var allocation in dying)
@@ -276,7 +284,17 @@ namespace Larva.Runtime.Vm
             }
         }
 
+        /// <summary>Objects marked but not yet scanned: marking is iterative (a long linked list must not recurse per node).</summary>
+        private readonly Stack<Allocation> markWork = new();
+
         private void Mark(Address address)
+        {
+            Push(address);
+            Drain();
+        }
+
+        /// <summary>Marks the object (if it is a live gc object not yet marked) and queues its contents for scanning.</summary>
+        private void Push(Address address)
         {
             if (address.IsNull)
                 return;
@@ -284,9 +302,16 @@ namespace Larva.Runtime.Vm
             if (allocation.Kind != AllocationKind.Gc || allocation.Marked)
                 return;
             allocation.Marked = true;
-            ScanContents(allocation);
+            markWork.Push(allocation);
         }
 
+        private void Drain()
+        {
+            while (markWork.Count > 0)
+                ScanContents(markWork.Pop());
+        }
+
+        /// <summary>Queues every handle stored in <paramref name="allocation"/> (an object, array, heap cell or global).</summary>
         private void ScanContents(Allocation allocation)
         {
             if (allocation.Kind is AllocationKind.Buffer or AllocationKind.Native)
@@ -301,12 +326,14 @@ namespace Larva.Runtime.Vm
                 for (ulong i = 0; i < length; i++)
                 {
                     foreach (int offset in offsets)
-                        Mark(Address.Unpack(BitConverter.ToUInt64(allocation.Data, header + (int)i * stride + offset)));
+                        Push(Address.Unpack(BitConverter.ToUInt64(allocation.Data, header + (int)i * stride + offset)));
                 }
+                Drain();
                 return;
             }
             foreach (int offset in Heap.LayoutOf(allocation.Type).GcOffsets)
-                Mark(Address.Unpack(BitConverter.ToUInt64(allocation.Data, offset)));
+                Push(Address.Unpack(BitConverter.ToUInt64(allocation.Data, offset)));
+            Drain();
         }
     }
 }

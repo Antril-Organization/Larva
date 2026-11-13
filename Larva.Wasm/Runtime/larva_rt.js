@@ -138,8 +138,13 @@ export async function run(options = {}) {
         const grown = (Kind, old) => { const a = new Kind(n); a.set(old); return a; };
         kinds = grown(Uint8Array, kinds); sizes = grown(Uint32Array, sizes); counts = grown(Int32Array, counts); owners = grown(Int32Array, owners);
     };
+    // Block sizes are kept in 32 bits (`sizes`) and a 32-bit memory holds at most 4 GB: a larger request is refused
+    // here, before any arithmetic truncates it (an array of 2^32 bytes was once reserved as one 16-byte block).
+    const MAX_BLOCK = 0xFFFF_FFF0;
+    const outOfMemory = () => { throw new LarvaPanic("larva: out of memory"); };
     const block = size => {
-        const n = (size + 15) >>> 4 || 1;
+        if (!(size >= 0 && size <= MAX_BLOCK)) outOfMemory();
+        const n = Math.floor((size + 15) / 16) || 1;
         let at = 0;
         if (n < 256) at = listPop(n);
         else { const list = freeLarge.get(n); if (list !== undefined && list.length) at = list.pop(); }
@@ -157,7 +162,7 @@ export async function run(options = {}) {
     function grow() {
         if (top > memory.buffer.byteLength) {
             const pages = Math.ceil((top - memory.buffer.byteLength) / 65536) + 16;
-            memory.grow(c64 ? BigInt(pages) : pages);
+            try { memory.grow(c64 ? BigInt(pages) : pages); } catch { outOfMemory(); } // past the memory's maximum
             refresh();
         }
         if (top >>> 4 > kinds.length) growFacts(top >>> 4);
@@ -470,7 +475,14 @@ export async function run(options = {}) {
     const halfView = new DataView(new ArrayBuffer(8));
     const toHalf = (bits, from) => Number(repack(unpack(bits, fmt(from)), fmt(16)));
     const fromHalf = (half, to) => repack(unpack(BigInt(half & 0xFFFF), fmt(16)), fmt(to));
+    // Wide integers (i128, i256) by limbs, as larva_rt.c divides them: the LLVM back end calls these instead of compiler-rt.
+    const wideDivide = (signed, remainder) => (a, b, result, limbs) => {
+        const x = limbsRead(a, limbs, signed), y = limbsRead(b, limbs, signed);
+        limbsWrite(result, limbs, remainder ? x % y : x / y);
+    };
     const softFloat = {
+        larva_wide_udiv: wideDivide(false, false), larva_wide_urem: wideDivide(false, true),
+        larva_wide_sdiv: wideDivide(true, false), larva_wide_srem: wideDivide(true, true),
         larva_float_add: wideBinary(fadd), larva_float_sub: wideBinary(fsub), larva_float_mul: wideBinary(fmul),
         larva_float_div: wideBinary(fdiv), larva_float_rem: wideBinary(frem),
         // 1 when the condition (0 ==, 1 !=, 2 <, 3 <=, 4 >, 5 >=) holds; NaN makes every one false but !=.
@@ -498,7 +510,8 @@ export async function run(options = {}) {
     };
 
     const panics = { 1: (a, b) => `index ${a} out of bounds for length ${b}`, 2: () => "division by zero", 3: () => "unreachable code",
-        4: a => `invalid array length ${a}`, 5: () => "null reference", 6: () => "stack overflow" };
+        4: a => `invalid array length ${a}`, 5: () => "null reference", 6: () => "stack overflow",
+        7: () => "an exception escaped a destructor while another was being handled" };
 
     const imports = {
         env: {
@@ -696,6 +709,7 @@ export async function run(options = {}) {
             larva_math_ceil: x => toBits(Math.ceil(fromBits(x))),
             larva_math_atan2: (x, y) => toBits(Math.atan2(fromBits(x), fromBits(y))),
             larva_math_pow: (x, y) => toBits(Math.pow(fromBits(x), fromBits(y))),
+            larva_f64_rem: (x, y) => toBits(fromBits(x) % fromBits(y)), // fmod: exact, the dividend's sign, NaN for a zero divisor
             larva_f64_bits: bits => bits,
             larva_f64_from_bits: bits => bits,
             // No C in WebAssembly: interop stops the program.

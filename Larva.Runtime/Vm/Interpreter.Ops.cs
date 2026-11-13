@@ -148,7 +148,11 @@ namespace Larva.Runtime.Vm
                     var type = a.Type ?? b.Type;
                     int width = type?.BitWidth ?? 64;
                     var mask = (BigInteger.One << width) - 1;
-                    int shift = (int)(y % width);
+                    // Shift and rotate amounts are masked by the operand width (`& 31`, `& 63`, `& 127`, `& 255`), the way
+                    // every native back end does it (x64 `shl cl`, wasm shifts, LLVM `and` before the shift, the wide
+                    // helpers in larva_rt.c): `1 << -1` is `1 << 31` for i32. A remainder would turn a negative amount into
+                    // a shift the other way.
+                    int shift = (int)(y & (width - 1));
                     stack.Add(Value.FromInt(op switch
                     {
                         AluOp.Div => y.IsZero ? throw new VmException("division by zero") : BigInteger.Divide(x, y),

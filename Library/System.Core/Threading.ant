@@ -105,7 +105,7 @@ into namespace System.Threading
 	}
 
 	/// A lock: one thread at a time between Lock and Unlock (not re-entrant: a thread that holds it must not lock it again).
-	/// `Run(() => …)` holds it around a function. Dispose frees it.
+	/// `Run(() => …)` holds it around a function. Dispose frees its handle (an undisposed one is freed when the object dies).
 	public class Mutex
 	{
 		extern("mutex.new") New() : i64;
@@ -125,7 +125,7 @@ into namespace System.Threading
 			/// Takes it when no other thread holds it: whether it did.
 			TryLock() : bool => TryNative(handle) != 0;
 
-			/// The names .NET's Mutex has.
+			/// WaitOne and ReleaseMutex: the same as Lock and Unlock.
 			WaitOne() { LockNative(handle); }
 			ReleaseMutex() { UnlockNative(handle); }
 
@@ -153,9 +153,11 @@ into namespace System.Threading
 					Free(handle);
 				handle = 0;
 			}
+
+			destroy() { Dispose(); }
 	}
 
-	/// .NET 9's Lock: Enter, Exit, TryEnter.
+	/// A lock with the names Enter, Exit and TryEnter.
 	public final class Lock : Mutex
 	{
 		public:
@@ -189,12 +191,15 @@ into namespace System.Threading
 			Signal() { SignalNative(handle); }
 			Broadcast() { BroadcastNative(handle); }
 
+			/// Frees it (it must not be used after; an undisposed one is freed when the object dies).
 			Dispose()
 			{
 				if (handle != 0)
 					Free(handle);
 				handle = 0;
 			}
+
+			destroy() { Dispose(); }
 	}
 
 	/// An i32 that threads change together (each operation is atomic). Add, Increment and Decrement give the new value,
@@ -353,6 +358,13 @@ into namespace System.Threading
 			}
 
 			bool IsSet { get => set; }
+
+			/// Frees what it holds (it must not be used after).
+			Dispose()
+			{
+				mutex.Dispose();
+				changed.Dispose();
+			}
 	}
 
 	/// An event that lets one waiter through each time it is set (and resets itself).
@@ -460,6 +472,13 @@ into namespace System.Threading
 			Release() : i32 => Release(1);
 
 			i32 CurrentCount { get => count; }
+
+			/// Frees what it holds (it must not be used after).
+			Dispose()
+			{
+				mutex.Dispose();
+				changed.Dispose();
+			}
 	}
 
 	/// Set once it has been signaled `initialCount` times: Wait waits for that.
@@ -497,6 +516,9 @@ into namespace System.Threading
 
 			i32 CurrentCount { get => left.Load(); }
 			bool IsSet { get => left.Load() == 0; }
+
+			/// Frees what it holds (it must not be used after).
+			Dispose() { zero.Dispose(); }
 	}
 
 	/// Threads that run queued work: as many as processors, started with the first work item, kept for the program.
@@ -544,7 +566,7 @@ into namespace System.Threading
 		}
 
 		public:
-			/// Runs `item` on a pool thread (an error it throws ends the program, as in .NET).
+			/// Runs `item` on a pool thread (an error it throws ends the program).
 			QueueUserWorkItem(func item)
 			{
 				mutex.Lock();
@@ -586,32 +608,57 @@ into namespace System.Threading
 				if (chunk < 1)
 					chunk = 1;
 				AtomicI32 next = new AtomicI32(fromInclusive);
-				CountdownEvent finished = new CountdownEvent(threads - 1);
 				Shared<any?> failure = new Shared<any?>(null);
-				func run = () =>
+				// The loop is done when no chunk is left to take and none is being run on a pool thread. The caller never waits
+				// for the helpers queued on the pool to be scheduled: when the pool is busy (its workers inside loops of their
+				// own, or this loop called from pool work), the caller runs the remaining chunks itself, and a helper that runs
+				// late finds nothing to take. `active` counts the helpers between taking a chunk and finishing it; the last one
+				// to stop once nothing is left sets `idle`.
+				AtomicI32 active = new AtomicI32();
+				ManualResetEvent idle = new ManualResetEvent(false);
+				// `idle` is freed by the last of its users: the caller, or a helper scheduled after the caller has left.
+				AtomicI32 users = new AtomicI32(threads);
+				func : bool run = () =>
 				{
+					i32 start = next.Add(chunk) - chunk;
+					if (start >= toExclusive)
+						return false;
 					try
 					{
-						loop (true)
-						{
-							i32 start = next.Add(chunk) - chunk;
-							if (start >= toExclusive)
-								break;
-							i32 end = toExclusive - start < chunk ? toExclusive : start + chunk;
-							loop (i32 i = start..end)
-								body(i);
-						}
+						i32 end = toExclusive - start < chunk ? toExclusive : start + chunk;
+						loop (i32 i = start..end)
+							body(i);
 					}
 					catch (any error)
 					{
 						failure.Value = error;
 						next.Store(toExclusive);
 					}
+					return true;
+				};
+				func help = () =>
+				{
+					loop (true)
+					{
+						active.Increment();
+						bool took = run();
+						if (active.Decrement() == 0 && next.Load() >= toExclusive)
+							idle.Set();
+						if (!took)
+							break;
+					}
+					if (users.Decrement() == 0)
+						idle.Dispose();
 				};
 				loop (i32 t = 1..threads)
-					ThreadPool.QueueUserWorkItem(() => { run(); finished.Signal(); });
-				run();
-				finished.Wait();
+					ThreadPool.QueueUserWorkItem(help);
+				loop (run()) { }
+				// No chunk is left: wait for the chunks being run elsewhere (a helper that takes one increments `active` before
+				// it looks, so one seen at 0 here means none is running and none will be).
+				loop (active.Load() != 0)
+					idle.WaitOne();
+				if (users.Decrement() == 0)
+					idle.Dispose();
 				if (failure.Value is any error)
 					throw error;
 			}
@@ -672,6 +719,9 @@ into namespace System.Threading
 			}
 
 			bool IsEmpty { get => Count == 0; }
+
+			/// Frees what it holds (it must not be used after).
+			Dispose() { mutex.Dispose(); }
 	}
 
 	/// A queue that hands items from producers to consumers: Take waits for an item; after CompleteAdding, Take on an
@@ -765,5 +815,12 @@ into namespace System.Threading
 			}
 
 			i32 Count { get => items.Count; }
+
+			/// Frees what it holds (it must not be used after).
+			Dispose()
+			{
+				mutex.Dispose();
+				changed.Dispose();
+			}
 	}
 }
