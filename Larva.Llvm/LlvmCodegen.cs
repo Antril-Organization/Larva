@@ -143,6 +143,16 @@ namespace Larva.Llvm
             return statics[index] = global;
         }
 
+        private readonly Dictionary<IrType, TypeLayout?> layouts = [];
+
+        /// <summary><see cref="Layouts.Of"/>, kept per type (it measures the type and checks four constraints each time).</summary>
+        internal TypeLayout? LayoutOf(IrType type)
+        {
+            if (!layouts.TryGetValue(type, out var layout))
+                layouts[type] = layout = Layouts.Of(type, module);
+            return layout;
+        }
+
         public static string Symbol(string name, string? prefix) => prefix is null || name.StartsWith("larva_", StringComparison.Ordinal) ? name : prefix + name;
 
         /// <summary>
@@ -299,7 +309,7 @@ namespace Larva.Llvm
             ReferenceType or GcType or BoxType or PointerType or FunctionType or OptionalType => ptr,
             StructType st => StructOf(st).Type,
             // Inline arrays are their bytes: elements are reached by offset, so strides follow Layouts exactly.
-            FixedArrayType inline => LLVMTypeRef.CreateArray(Ctx.Int8Type, (uint)(Layouts.Of(inline, module)?.Size
+            FixedArrayType inline => LLVMTypeRef.CreateArray(Ctx.Int8Type, (uint)(LayoutOf(inline)?.Size
                 ?? throw new LlvmBackendException($"`{IrPrinter.FormatType(type, module)}` was not monomorphized"))),
             _ => throw new LlvmBackendException($"`{IrPrinter.FormatType(type, module)}` cannot be a native value"),
         };
@@ -318,7 +328,7 @@ namespace Larva.Llvm
             structs[type.Id] = (named, elements);
 
             var offsets = Layouts.FieldOffsets(type, module) ?? throw new LlvmBackendException($"`{def.Name}` has no static layout");
-            int size = Layouts.Of(type, module)!.Size;
+            int size = LayoutOf(type)!.Size;
             List<LLVMTypeRef> body = [];
             int position = 0;
             for (int i = 0; i < def.Fields.Length; i++)
@@ -328,7 +338,7 @@ namespace Larva.Llvm
                 elements[i] = body.Count;
                 // An array kept in place at the end: its length word here, the elements after the struct.
                 body.Add(def.Fields[i] is ArrayType ? Ctx.Int64Type : ValueType(def.Fields[i]));
-                position = offsets[i] + (def.Fields[i] is ArrayType ? 8 : Layouts.Of(def.Fields[i], module)!.Size);
+                position = offsets[i] + (def.Fields[i] is ArrayType ? 8 : LayoutOf(def.Fields[i])!.Size);
             }
             if (size > position)
                 body.Add(LLVMTypeRef.CreateArray(Ctx.Int8Type, (uint)(size - position)));
@@ -680,7 +690,7 @@ namespace Larva.Llvm
         {
             if (descriptors.TryGetValue((type, array, domain), out var known))
                 return known;
-            if (Layouts.Of(type, module) is not { } layout || Layouts.PointerMap(type, module) is not var (handles, cells, ambiguous))
+            if (LayoutOf(type) is not { } layout || Layouts.PointerMap(type, module) is not var (handles, cells, ambiguous))
                 return null;
             // An object ending with an array in place: its size is up to the elements (the length is the word before), the
             // stride theirs; the handles are its fields' (the elements hold none).
@@ -1129,7 +1139,9 @@ namespace Larva.Llvm
             private readonly IrModule module;
             private readonly TypeContext context;
             private readonly MoveAnalysis moves;
-            private readonly Liveness liveness;
+            /// <summary>Which locals are live where: only reference counting asks (its moves and field borrows), so it is made on first use.</summary>
+            private Liveness Live => liveness ??= Liveness.Compute(function);
+            private Liveness? liveness;
             private readonly HashSet<int> addressTaken;
 
             /// <summary>Locals that borrow a handle read from memory instead of taking a reference (<see cref="FieldBorrows"/>).</summary>
@@ -1169,10 +1181,9 @@ namespace Larva.Llvm
                 b = cg.builder;
                 module = cg.module;
                 context = TypeContext.For(function, module);
-                liveness = Liveness.Compute(function);
                 addressTaken = [.. function.Blocks.SelectMany(x => x.Statements).OfType<AssignStatement>()
                     .Select(x => x.Value).OfType<RefRvalue>().Select(r => r.Place.Local)];
-                fieldBorrows = BorrowsHandles && !module.Traces(gc) ? FieldBorrows.Of(function, module, addressTaken, liveness) : [];
+                fieldBorrows = BorrowsHandles && !module.Traces(gc) ? FieldBorrows.Of(function, module, addressTaken, Live) : [];
                 moves = new MoveAnalysis(function, module, Transfers);
                 locals = new LLVMValueRef[function.Locals.Length];
             }
@@ -1198,7 +1209,7 @@ namespace Larva.Llvm
                     && function.TypeOf(place, module).Unoptional() is GcType
                     && !addressTaken.Contains(place.Local)
                     && MoveAnalysis.Occurrences(function, place.Local, at) == 1
-                    && !liveness.LiveAfter(at).Contains(place.Local);
+                    && !Live.LiveAfter(at).Contains(place.Local);
             }
 
 
@@ -1389,9 +1400,9 @@ namespace Larva.Llvm
                 if (Has(GcCapabilities.Barriers) && cg.InlineHeapFor(gc) && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
                 {
                     if (owner.Handle != IntPtr.Zero)
-                        cg.Barrier(fn, owner, address, Layouts.Of(type, module)!.Size);
+                        cg.Barrier(fn, owner, address, cg.LayoutOf(type)!.Size);
                     else if (throughReference)
-                        cg.CallRuntime("larva_gc_wb_at", address, I64(Layouts.Of(type, module)!.Size)); // the owner, if any, is the runtime's to find
+                        cg.CallRuntime("larva_gc_wb_at", address, I64(cg.LayoutOf(type)!.Size)); // the owner, if any, is the runtime's to find
                 }
             }
 
@@ -1507,7 +1518,7 @@ namespace Larva.Llvm
                         var type = function.TypeOf(@throw.Value, module);
                         var value = Operand(@throw.Value);
                         UpdateFlags(Moved([@throw.Value]), null);
-                        var layout = Layouts.Of(type, module)!;
+                        var layout = cg.LayoutOf(type)!;
                         var cell = cg.CallRuntime("larva_exception_cell", I64(layout.Size), I64(layout.Align));
                         b.BuildStore(value, cell);
                         if (cg.flagExceptions)
@@ -1773,7 +1784,7 @@ namespace Larva.Llvm
                     var join = fn.AppendBasicBlock("global.ready");
                     cg.Unlikely(b.BuildCondBr(b.BuildIsNotNull(cell, ""), join, make), second: true);
                     b.PositionAtEnd(make);
-                    var made = cg.CallRuntime("larva_global", slot, I64(Layouts.Of(global.Type, module)!.Size));
+                    var made = cg.CallRuntime("larva_global", slot, I64(cg.LayoutOf(global.Type)!.Size));
                     var madeEnd = b.InsertBlock;
                     b.BuildBr(join);
                     b.PositionAtEnd(join);
@@ -1812,12 +1823,12 @@ namespace Larva.Llvm
                         PinIfInsideGcObject(reference.Place);
                         return Address(reference.Place).Pointer;
                     case SizeOfRvalue size:
-                        return LLVMValueRef.CreateConstInt(Ctx.Int64Type, (ulong)Layouts.Of(size.Type, module)!.Size);
+                        return LLVMValueRef.CreateConstInt(Ctx.Int64Type, (ulong)cg.LayoutOf(size.Type)!.Size);
                     case AllocRvalue alloc:
                     {
                         var valueType = function.TypeOf(alloc.Value, module);
                         var value = Operand(alloc.Value);
-                        var layout = Layouts.Of(valueType, module)!;
+                        var layout = cg.LayoutOf(valueType)!;
                         var cell = alloc.Kind == AllocKind.Gc
                             ? cg.AllocateObject(fn, valueType, layout.Size, layout.Align, inline: alloc.Finalizer is null, gc, domainByte)
                             : cg.CallRuntime(alloc.Kind == AllocKind.Raw ? "larva_raw_alloc" : "larva_alloc", I64(layout.Size), I64(layout.Align));
@@ -2203,7 +2214,7 @@ namespace Larva.Llvm
                         case IndexProjection inlineIndex when type is FixedArrayType inline:
                         {
                             var inlineElement = inline.Element;
-                            var elementLayout = Layouts.Of(inlineElement, module)!;
+                            var elementLayout = cg.LayoutOf(inlineElement)!;
                             int inlineStride = (elementLayout.Size + elementLayout.Align - 1) / elementLayout.Align * elementLayout.Align;
                             int length = inline.Length(module)!.Value;
                             var position = ToI64(b.BuildLoad2(cg.ValueType(function.Locals[inlineIndex.Local].Type), locals[inlineIndex.Local], ""), function.Locals[inlineIndex.Local].Type);
@@ -2232,7 +2243,7 @@ namespace Larva.Llvm
 
             private (int Header, int Stride) ArrayLayout(IrType element)
             {
-                var layout = Layouts.Of(element, module)!;
+                var layout = cg.LayoutOf(element)!;
                 int stride = Math.Max(1, (layout.Size + layout.Align - 1) / layout.Align * layout.Align);
                 return (Math.Max(8, layout.Align), stride);
             }
