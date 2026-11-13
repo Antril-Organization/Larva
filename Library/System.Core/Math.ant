@@ -8,7 +8,8 @@
 // - numbers no more exact than f64 (f16, f32, f64, a program's own): the runtime's f64 functions
 //   (the C library's, or the instruction), reached through FromF64/ToF64, which for f64 are nothing at all;
 // - wider floats (f128: 113 bits, f256: 237): computed in the type itself, from an f64 estimate refined by Newton's
-//   method or from series with the argument reduced (π and ln 2 worked out in the type), so no digit is lost to f64.
+//   method or from series with the argument reduced (π and ln 2 exact constants in f128 and f256, worked out in the
+//   type for others), so no digit is lost to f64.
 
 into namespace System
 {
@@ -162,8 +163,50 @@ into namespace System
 			return Scaled(root, scale);
 		}
 
-		/// ln 2 = 2 atanh(1/3), its series summed until a term no longer changes the sum.
+		/// Whether T has f128's 113 bits (one plus 2^-112 is above one, one plus 2^-113 rounds back to it); a constant for T.
+		[Inline] Bits113<T : number>(T unit) : bool => T.One < T.One + T.FromF64(1.925929944387236e-34) && !(T.One < T.One + T.FromF64(9.62964972193618e-35));
+
+		/// Whether T has f256's 237 bits (one plus 2^-236 is above one, one plus 2^-237 is not); a constant for T.
+		[Inline] Bits237<T : number>(T unit) : bool => T.One < T.One + T.FromF64(9.055679078826712e-72) && !(T.One < T.One + T.FromF64(4.527839539413356e-72));
+
+		// ln 2, π and ln 10 in f128 and f256 are sums of f64 parts: exactly the values their series and LogWide give in
+		// those types (each sum is exact), so nothing is worked out at run time. Other types sum the series each time.
+
+		/// ln 2.
 		Ln2<T : number>(T unit) : T
+		{
+			if (Bits113(unit))
+				return T.FromF64(0.6931471805599453) + T.FromF64(2.3190468138462996e-17) + T.FromF64(2.8888949165808538e-34);
+			if (Bits237(unit))
+				return T.FromF64(0.6931471805599453) + T.FromF64(2.3190468138462996e-17) + T.FromF64(5.707708438416212e-34)
+					+ T.FromF64(-3.5824322106018114e-50) + T.FromF64(-1.3521668330131682e-66);
+			return Ln2Series(unit);
+		}
+
+		/// π.
+		PiOf<T : number>(T unit) : T
+		{
+			if (Bits113(unit))
+				return T.FromF64(3.141592653589793) + T.FromF64(1.2246467991473532e-16) + T.FromF64(-3.0814879110195774e-33);
+			if (Bits237(unit))
+				return T.FromF64(3.141592653589793) + T.FromF64(1.2246467991473532e-16) + T.FromF64(-2.9947698097183397e-33)
+					+ T.FromF64(1.1124542208633653e-49) + T.FromF64(5.672205704604688e-66);
+			return PiSeries(unit);
+		}
+
+		/// ln 10.
+		Ln10<T : number>(T unit) : T
+		{
+			if (Bits113(unit))
+				return T.FromF64(2.302585092994046) + T.FromF64(-2.1707562233822494e-16) + T.FromF64(-1.0785207688568521e-32);
+			if (Bits237(unit))
+				return T.FromF64(2.302585092994046) + T.FromF64(-2.1707562233822494e-16) + T.FromF64(-9.984262454465777e-33)
+					+ T.FromF64(-4.023357454450206e-49) + T.FromF64(1.9288994887780366e-65);
+			return LogWide(T.FromF64(10));
+		}
+
+		/// ln 2 = 2 atanh(1/3), its series summed until a term no longer changes the sum.
+		Ln2Series<T : number>(T unit) : T
 		{
 			T z = T.One / T.FromF64(3);
 			T z2 = z * z;
@@ -206,7 +249,7 @@ into namespace System
 		}
 
 		/// π by Machin's formula: 16 atan(1/5) − 4 atan(1/239).
-		PiOf<T : number>(T unit) : T => T.FromF64(16) * AtanInverse(unit, 5) - T.FromF64(4) * AtanInverse(unit, 239);
+		PiSeries<T : number>(T unit) : T => T.FromF64(16) * AtanInverse(unit, 5) - T.FromF64(4) * AtanInverse(unit, 239);
 
 		/// e^x: x − k ln 2 (|r| ≤ ½ ln 2), its series, times 2^k.
 		ExpWide<T : number>(T x) : T
@@ -399,7 +442,7 @@ into namespace System
 					return Divisions(x, T.FromF64(10));
 				}
 				if (T.One < T.One + T.FromF64(1.1102230246251565e-16))
-					return LogWide(x) / LogWide(T.FromF64(10));
+					return LogWide(x) / Ln10(x);
 				return T.FromF64(Log10Of(T.ToF64(x)));
 			}
 
