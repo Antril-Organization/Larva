@@ -429,6 +429,12 @@ namespace Larva.X64
         private int returnPointer = int.MinValue;
         private Location current;
 
+        /// <summary>
+        /// The local the last comparison was stored into, the condition its flags still hold, and the code position right
+        /// after it: an <c>if</c> on that local emitted at that very position branches on the flags (<c>cmp</c> + <c>jcc</c>).
+        /// </summary>
+        private (int Local, Cond Condition, int Position)? compared;
+
         // Exceptions: the exception being handled (caught), the one a filter just matched (incoming), the arguments of
         // RaiseException, the region depth at entry; the sites with their scope entries and the landings they jump to.
         private bool handles, needsCleanup;
@@ -549,6 +555,7 @@ namespace Larva.X64
             for (int b = 0; b < function.Blocks.Length; b++)
             {
                 a.Bind(blocks[b]);
+                compared = null; // other blocks may jump here: no flags carry over
                 if (Has(GcCapabilities.Tracing) && (loopHeaders.Contains(b) || b == 0 && entryPoll))
                     Poll();
                 var block = function.Blocks[b];
@@ -885,6 +892,31 @@ namespace Larva.X64
                     Intrinsic(effect); // runs for its effect
                 return;
             }
+            // A scalar or float that owns nothing: computed in a register and stored straight into the place.
+            if (CanIntoRegister(value, type) && !Owned(type, []).Any())
+            {
+                var movedHere = Moved(MoveAnalysis.Operands(value));
+                var condition = IntoRegister(value, type);
+                var (kind, size, _) = cg.Shape(type);
+                if (target.IsLocal)
+                {
+                    if (kind == X64Codegen.Kind.Float)
+                        a.StoreFloat(Frame(slots[target.Local]), Xmm.X0, size);
+                    else
+                        a.Store(Frame(slots[target.Local]), Reg.Rax, size);
+                }
+                else
+                {
+                    if (kind != X64Codegen.Kind.Float)
+                        a.Mov(Reg.R10, Reg.Rax); // Address uses rax, rcx, rdx and r11 (and leaves xmm0 alone)
+                    StoreRegister(target, kind == X64Codegen.Kind.Float);
+                }
+                UpdateFlags(movedHere, target);
+                // Moves and stores leave the flags as the comparison set them: an `if` on this local right after can use them.
+                if (condition is { } set && target.IsLocal)
+                    compared = (target.Local, set, a.Position);
+                return;
+            }
             int result = Rvalue(value, type);
             var moved = Moved(MoveAnalysis.Operands(value));
             // What the target owned is released after the new value is stored: a destructor that runs in the
@@ -904,10 +936,16 @@ namespace Larva.X64
         private void Intrinsic(IntrinsicRvalue intrinsic)
         {
             var info = Intrinsics.Find(intrinsic.Name)!;
-            var slots = intrinsic.Arguments.Select(Operand).ToArray();
+            var values = intrinsic.Arguments.Select(Scalar).ToArray();
             Reg[] registers = [Reg.Rcx, Reg.Rdx, Reg.R8, Reg.R9];
-            for (int i = 0; i < slots.Length; i++)
-                a.Load(registers[i], Frame(slots[i]), info.Parameters[i] == IrType.Bool ? 1 : 8, false);
+            for (int i = 0; i < values.Length; i++)
+            {
+                // A temp holds 8 bytes; a bool parameter reads its low byte, as before. An f64 goes as its bits.
+                if (values[i] is { Constant: null, Size: 8 } inTemp && info.Parameters[i] == IrType.Bool)
+                    a.Load(registers[i], Frame(inTemp.Offset), 1, false);
+                else
+                    LoadTo(registers[i], values[i]);
+            }
             a.Call(info.Symbol);
         }
 
@@ -935,6 +973,26 @@ namespace Larva.X64
             a.Mov(Reg.Rcx, Reg.Rax);
             bool owned = ownerInR11;
             Copy(Reg.Rdx, 0, Reg.Rbp, value, size, toRegister: Reg.Rcx);
+            Barrier(type, size, owned);
+        }
+
+        /// <summary>Stores <c>r10</c> (or <c>xmm0</c> with <paramref name="floating"/>) into a place, as <see cref="Store"/> does.</summary>
+        private void StoreRegister(Place target, bool floating)
+        {
+            var type = Address(target);
+            var (_, size, _) = cg.Shape(type);
+            a.Mov(Reg.Rcx, Reg.Rax);
+            bool owned = ownerInR11;
+            if (floating)
+                a.StoreFloat(Mem.At(Reg.Rcx), Xmm.X0, size);
+            else
+                a.Store(Mem.At(Reg.Rcx), Reg.R10, size);
+            Barrier(type, size, owned);
+        }
+
+        /// <summary>After a store of <paramref name="size"/> bytes at <c>rcx</c>, into the gc object in <c>r11</c> when <paramref name="owned"/>.</summary>
+        private void Barrier(IrType type, int size, bool owned)
+        {
             // Generations: a store of handles into an old object (its age byte, before the payload, is 1) remembers it.
             if (Has(GcCapabilities.Barriers) && Has(GcCapabilities.Tracing) && owned && !Constraints.Satisfies(type, TypeConstraint.Unmanaged, context))
             {
@@ -976,27 +1034,42 @@ namespace Larva.X64
             switch (terminator)
             {
                 case GotoTerminator jump:
-                    a.Jmp(blocks[jump.Target]);
+                    Jump(jump.Target);
                     break;
                 case IfTerminator branch:
                 {
-                    int condition = Operand(branch.Condition);
-                    a.Load(Reg.Rax, Frame(condition), 8, false);
-                    a.Test(Reg.Rax, Reg.Rax);
-                    a.Jcc(Cond.NE, blocks[branch.Then]);
-                    a.Jmp(blocks[branch.Else]);
+                    var place = branch.Condition switch { CopyOperand copy => copy.Place, MoveOperand move => move.Place, _ => null };
+                    Cond condition;
+                    if (compared is { } last && last.Position == a.Position && place is { IsLocal: true } && place.Local == last.Local)
+                    {
+                        condition = last.Condition; // the comparison just stored into the condition left its flags
+                    }
+                    else
+                    {
+                        LoadTo(Reg.Rax, Scalar(branch.Condition));
+                        a.Test(Reg.Rax, Reg.Rax);
+                        condition = Cond.NE;
+                    }
+                    if (branch.Then == current.Block + 1)
+                    {
+                        a.Jcc(Negate(condition), blocks[branch.Else]);
+                    }
+                    else
+                    {
+                        a.Jcc(condition, blocks[branch.Then]);
+                        Jump(branch.Else);
+                    }
                     break;
                 }
                 case SwitchTerminator @switch:
                 {
-                    int value = Operand(@switch.Value);
-                    a.Load(Reg.Rax, Frame(value), 8, false);
+                    LoadTo(Reg.Rax, Scalar(@switch.Value));
                     for (int i = 0; i < @switch.Targets.Length; i++)
                     {
                         a.CmpImm(Reg.Rax, i);
                         a.Jcc(Cond.E, blocks[@switch.Targets[i]]);
                     }
-                    a.Jmp(blocks[@switch.Otherwise]);
+                    Jump(@switch.Otherwise);
                     break;
                 }
                 case ReturnTerminator:
@@ -1012,7 +1085,8 @@ namespace Larva.X64
                         a.Load(Reg.Rcx, Frame(pin), 8, false);
                         a.Call("larva_unpin");
                     }
-                    a.Jmp(epilogue);
+                    if (current.Block != function.Blocks.Length - 1)
+                        a.Jmp(epilogue); // the last block falls into the epilogue
                     break;
                 case CallTerminator call:
                     Call(call);
@@ -1045,7 +1119,7 @@ namespace Larva.X64
                 case DropTerminator drop:
                     ReleaseOwned(drop.Place, []);
                     UpdateFlags([drop.Place], null);
-                    a.Jmp(blocks[drop.Target]);
+                    Jump(drop.Target);
                     break;
                 case UnreachableTerminator:
                     a.MovImm(Reg.Rcx, 3);
@@ -1128,12 +1202,12 @@ namespace Larva.X64
             // Evaluate the arguments into temps (big aggregates: the temp is the copy; its address is passed).
             var (returnKind, returnSize, _) = cg.Shape(returnType);
             bool hidden = X64Codegen.ByReference(returnKind, returnSize);
-            var passed = new List<(int Temp, X64Codegen.Kind Kind, int Size, bool ByReference)>();
+            var passed = new List<(Value Value, X64Codegen.Kind Kind, int Size, bool ByReference)>();
             int resultArea = 0;
             if (hidden)
             {
                 resultArea = Temp(returnSize);
-                passed.Add((resultArea, X64Codegen.Kind.Scalar, 8, true));
+                passed.Add((Value.InTemp(resultArea), X64Codegen.Kind.Scalar, 8, true));
             }
             int calleeTemp = call.Callee is { } calleeOperand ? Operand(calleeOperand) : -1;
             // Handles go at +0: a local's own value as it is (released right after the call when this was its last use);
@@ -1163,10 +1237,12 @@ namespace Larva.X64
                         a.Call("larva_gc_retain");
                         held.Add(handle);
                     }
-                    passed.Add((handle, kind, size, X64Codegen.ByReference(kind, size)));
+                    passed.Add((Value.InTemp(handle), kind, size, X64Codegen.ByReference(kind, size)));
                     continue;
                 }
-                int value = Operand(operand);
+                // Scalars and floats are read in place (a constant or a local's slot) when they can be; the rest, and
+                // anything passed by reference (the callee gets a copy), through a temp.
+                var value = kind is X64Codegen.Kind.Scalar or X64Codegen.Kind.Float ? Scalar(operand) : Value.InTemp(Operand(operand));
                 passed.Add((value, kind, size, X64Codegen.ByReference(kind, size)));
             }
             var moved = Moved(call.Arguments).Where(p => !lent.Contains(p)).ToList();
@@ -1175,14 +1251,16 @@ namespace Larva.X64
             outgoing = Math.Max(outgoing, 8 * Math.Max(4, passed.Count));
             for (int p = passed.Count - 1; p >= 0; p--)
             {
-                var (temp, kind, size, byReference) = passed[p];
+                var (value, kind, size, byReference) = passed[p];
                 Reg target = p < 4 ? IntegerArguments[p] : Reg.Rax;
                 if (byReference)
-                    a.Lea(target, Frame(temp));
+                    a.Lea(target, Frame(value.Offset));
                 else if (kind == X64Codegen.Kind.Float && p < 4)
-                    a.LoadFloat((Xmm)p, Frame(temp), size);
+                    LoadFloatTo((Xmm)p, value, size);
+                else if (kind == X64Codegen.Kind.Aggregate)
+                    a.Load(target, Frame(value.Offset), size, false);
                 else
-                    a.Load(target, Frame(temp), kind == X64Codegen.Kind.Aggregate ? size : 8, false);
+                    LoadTo(target, value);
                 if (p >= 4)
                     a.Store(Mem.At(Reg.Rsp, 8 * p), Reg.Rax, 8);
             }
@@ -1198,7 +1276,18 @@ namespace Larva.X64
 
             var (resultKind, resultSize, _) = cg.Shape(returnType);
             int returned = -1;
-            if (resultKind != X64Codegen.Kind.Unit)
+            // A scalar or float result for a whole local that owns nothing (nor anyone else can see) goes straight into it.
+            bool direct = resultKind is X64Codegen.Kind.Scalar or X64Codegen.Kind.Float && call.Destination.IsLocal
+                && !addressTaken.Contains(call.Destination.Local) && !Owned(returnType, []).Any();
+            if (direct)
+            {
+                var slot = Frame(slots[call.Destination.Local]);
+                if (resultKind == X64Codegen.Kind.Float)
+                    a.StoreFloat(slot, Xmm.X0, resultSize);
+                else
+                    a.Store(slot, Reg.Rax, resultSize);
+            }
+            else if (resultKind != X64Codegen.Kind.Unit)
             {
                 returned = hidden ? resultArea : Temp(resultSize);
                 if (resultKind == X64Codegen.Kind.Float)
@@ -1216,17 +1305,223 @@ namespace Larva.X64
                 a.Load(Reg.Rcx, Frame(handle), 8, false);
                 a.Call("larva_gc_release");
             }
-            if (resultKind != X64Codegen.Kind.Unit)
+            if (resultKind != X64Codegen.Kind.Unit && !direct)
             {
                 int result = returned;
                 ReleaseOwned(call.Destination, moved);
                 Store(call.Destination, result);
             }
             UpdateFlags([], resultKind != X64Codegen.Kind.Unit ? call.Destination : null);
-            a.Jmp(blocks[call.Target]);
+            Jump(call.Target);
         }
 
+        /// <summary>A jump to a block, left out when the block is the next one (it follows this code).</summary>
+        private void Jump(int target)
+        {
+            if (target != current.Block + 1)
+                a.Jmp(blocks[target]);
+        }
+
+        private static Cond Negate(Cond condition) => (Cond)((int)condition ^ 1);
+
         // ── Values ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Where a scalar or float operand's value is, so a simple operation reads it in place instead of through a temp: a
+        /// constant (canonical bits), a local's own slot (<see cref="Size"/> bytes, extended by <see cref="Signed"/>), or a
+        /// temp (canonical in 8 bytes). Nothing is kept in a register past the statement that reads it: every value still
+        /// lives in the frame at every call and safepoint.
+        /// </summary>
+        private readonly record struct Value(int Offset, int Size, bool Signed, long? Constant = null)
+        {
+            public static Value InTemp(int temp) => new(temp, 8, false);
+        }
+
+        /// <summary>
+        /// The value of a scalar or float operand, read in place when it is a constant or a whole local (and the read takes
+        /// no reference: handles under reference counting go through <see cref="Operand"/>), else evaluated into a temp.
+        /// Emits code only in the temp case, which may use any volatile register: take every operand's value before loading any.
+        /// </summary>
+        private Value Scalar(Operand operand)
+        {
+            var type = function.TypeOf(operand, module);
+            var (kind, size, signed) = cg.Shape(type);
+            if (kind is X64Codegen.Kind.Scalar or X64Codegen.Kind.Float)
+            {
+                if (operand is ConstOperand constant)
+                    return new Value(0, 8, false, X64Codegen.Canonical(constant));
+                var place = operand switch { CopyOperand copy => copy.Place, MoveOperand move => move.Place, _ => null };
+                if (place is { IsLocal: true } && !(Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType))
+                    return new Value(slots[place.Local], size, signed);
+            }
+            return Value.InTemp(Operand(operand));
+        }
+
+        /// <summary>Loads a value into a register (canonical: extended by its signedness); touches no other register or flags but <c>xor</c> for 0.</summary>
+        private void LoadTo(Reg reg, Value value)
+        {
+            if (value.Constant is { } constant)
+                a.MovImm(reg, constant);
+            else
+                a.Load(reg, Frame(value.Offset), value.Size, value.Signed);
+        }
+
+        /// <summary>Loads a float value of <paramref name="size"/> bytes into an xmm register (a constant through <c>r10</c>).</summary>
+        private void LoadFloatTo(Xmm xmm, Value value, int size)
+        {
+            if (value.Constant is { } constant)
+            {
+                a.MovImm(Reg.R10, constant);
+                a.BitsToFloat(xmm, Reg.R10);
+            }
+            else
+            {
+                a.LoadFloat(xmm, Frame(value.Offset), size);
+            }
+        }
+
+        /// <summary>A constant that fits an instruction's 32-bit immediate (sign-extended to 64 bits).</summary>
+        private static bool Immediate(Value value, out int immediate)
+        {
+            immediate = 0;
+            if (value.Constant is not { } constant || constant is < int.MinValue or > int.MaxValue)
+                return false;
+            immediate = (int)constant;
+            return true;
+        }
+
+        /// <summary>
+        /// Whether <see cref="IntoRegister"/> computes <paramref name="rvalue"/> (of <paramref name="resultType"/>): integer,
+        /// bool, pointer and float values of the simple operations, which then need no temp. Decides without emitting code.
+        /// </summary>
+        private bool CanIntoRegister(Rvalue rvalue, IrType resultType)
+        {
+            if (cg.Shape(resultType).Kind is not (X64Codegen.Kind.Scalar or X64Codegen.Kind.Float))
+                return false;
+            bool Simple(IrType type, bool floats = true) => cg.Shape(type).Kind is X64Codegen.Kind.Scalar || floats && cg.Shape(type).Kind is X64Codegen.Kind.Float;
+            bool Counted(IrType type) => Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType;
+            switch (rvalue)
+            {
+                case UseRvalue use:
+                {
+                    var type = function.TypeOf(use.Operand, module);
+                    return Simple(type) && !Counted(type) && use.Operand is ConstOperand or CopyOperand or MoveOperand;
+                }
+                case BinaryRvalue binary:
+                {
+                    var type = function.TypeOf(binary.Left, module);
+                    return Simple(type) && !Counted(type);
+                }
+                case UnaryRvalue unary:
+                    return Simple(function.TypeOf(unary.Operand, module));
+                case CastRvalue cast:
+                {
+                    var from = function.TypeOf(cast.Operand, module);
+                    return Simple(from) && from != IrType.F16 && cast.Type != IrType.F16;
+                }
+                case LenRvalue or SizeOfRvalue or IsNullRvalue:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Computes an rvalue <see cref="CanIntoRegister"/> accepts into <c>rax</c> (integers, bools, pointers: canonical
+        /// only where the generic path is, so a store of the result's size is right) or <c>xmm0</c> (floats). For a
+        /// comparison, returns the condition whose flags are still set (the result was made with <c>setcc</c>, which keeps them).
+        /// </summary>
+        private Cond? IntoRegister(Rvalue rvalue, IrType resultType)
+        {
+            switch (rvalue)
+            {
+                case UseRvalue use:
+                {
+                    var type = function.TypeOf(use.Operand, module);
+                    var (kind, size, signed) = cg.Shape(type);
+                    var place = use.Operand switch { CopyOperand copy => copy.Place, MoveOperand move => move.Place, _ => null };
+                    if (place is { IsLocal: false })
+                    {
+                        Address(place);
+                        if (kind == X64Codegen.Kind.Float)
+                            a.LoadFloat(Xmm.X0, Mem.At(Reg.Rax), size);
+                        else
+                            a.Load(Reg.Rax, Mem.At(Reg.Rax), size, signed);
+                        return null;
+                    }
+                    var value = Scalar(use.Operand);
+                    if (kind == X64Codegen.Kind.Float)
+                        LoadFloatTo(Xmm.X0, value, size);
+                    else
+                        LoadTo(Reg.Rax, value);
+                    return null;
+                }
+                case BinaryRvalue binary:
+                {
+                    var type = function.TypeOf(binary.Left, module);
+                    var left = Scalar(binary.Left);
+                    var right = Scalar(binary.Right);
+                    var (kind, size, signed) = cg.Shape(type);
+                    return kind == X64Codegen.Kind.Float ? FloatBinary(binary.Op, left, right, size) : IntegerBinary(binary.Op, left, right, signed, type);
+                }
+                case UnaryRvalue unary:
+                {
+                    var type = function.TypeOf(unary.Operand, module);
+                    LoadTo(Reg.Rax, Scalar(unary.Operand)); // a float as its bits
+                    if (unary.Op == UnaryOp.Neg && type.IsFloat)
+                    {
+                        a.MovImm(Reg.Rcx, type == IrType.F32 ? 0x8000_0000L : type == IrType.F16 ? 0x8000L : long.MinValue);
+                        a.Xor(Reg.Rax, Reg.Rcx);
+                    }
+                    else if (unary.Op == UnaryOp.Neg)
+                    {
+                        a.Neg(Reg.Rax);
+                    }
+                    else if (type == IrType.Bool)
+                    {
+                        a.MovImm(Reg.Rcx, 1);
+                        a.Xor(Reg.Rax, Reg.Rcx);
+                    }
+                    else
+                    {
+                        a.Not(Reg.Rax);
+                    }
+                    if (type.IsFloat)
+                        a.BitsToFloat(Xmm.X0, Reg.Rax);
+                    return null;
+                }
+                case CastRvalue cast:
+                    ConvertIntoRegister(Scalar(cast.Operand), function.TypeOf(cast.Operand, module), cast.Type);
+                    return null;
+                case LenRvalue len:
+                    Address(len.Array);
+                    a.Load(Reg.Rax, Mem.At(Reg.Rax), 8, false);
+                    return null;
+                case SizeOfRvalue sizeOf:
+                    a.MovImm(Reg.Rax, Layouts.Of(sizeOf.Type, module)!.Size);
+                    return null;
+                case IsNullRvalue test:
+                    Address(test.Value);
+                    a.Load(Reg.Rax, Mem.At(Reg.Rax), 8, false);
+                    a.Test(Reg.Rax, Reg.Rax);
+                    a.SetCondition(Cond.E, Reg.Rax);
+                    return Cond.E;
+                default:
+                    throw new X64BackendException($"rvalue {rvalue}");
+            }
+        }
+
+        /// <summary>Puts a result <see cref="IntoRegister"/> left in <c>rax</c> / <c>xmm0</c> into a fresh temp, as the generic path holds it.</summary>
+        private int Spill(IrType type)
+        {
+            var (kind, size, _) = cg.Shape(type);
+            int temp = Temp();
+            if (kind == X64Codegen.Kind.Float)
+                a.StoreFloat(Frame(temp), Xmm.X0, size);
+            else
+                a.Store(Frame(temp), Reg.Rax, 8);
+            return temp;
+        }
 
         /// <summary>Evaluates an operand into a fresh temp (scalars canonical in 8 bytes, floats and aggregates as bytes).</summary>
         private int Operand(Operand operand)
@@ -1290,6 +1585,11 @@ namespace Larva.X64
 
         private int Rvalue(Rvalue rvalue, IrType resultType)
         {
+            if (CanIntoRegister(rvalue, resultType))
+            {
+                IntoRegister(rvalue, resultType);
+                return Spill(resultType);
+            }
             switch (rvalue)
             {
                 case UseRvalue use:
@@ -1533,14 +1833,45 @@ namespace Larva.X64
             var (kind, size, signed) = cg.Shape(type);
             if (kind == X64Codegen.Kind.Wide && type.IsFloat)
                 return WideFloatBinary(binary.Op, left, right, size / 8, type);
-            if (type.IsFloat)
-                return FloatBinary(binary.Op, left, right, size);
             if (kind == X64Codegen.Kind.Wide)
                 return WideBinary(binary.Op, left, right, signed, type);
+            throw new X64BackendException($"`{binary.Op}` on `{type}` goes through IntoRegister");
+        }
 
-            a.Load(Reg.Rax, Frame(left), 8, false);
-            a.Load(Reg.Rcx, Frame(right), 8, false);
-            switch (binary.Op)
+        /// <summary>
+        /// An integer (bool, pointer) operation into <c>rax</c>: the left value in <c>rax</c>, the right one in <c>rcx</c> or,
+        /// when it is a constant that fits, an immediate. A comparison returns its condition (the flags stay set).
+        /// </summary>
+        private Cond? IntegerBinary(BinaryOp op, Value leftValue, Value rightValue, bool signed, IrType type)
+        {
+            LoadTo(Reg.Rax, leftValue);
+            if (Immediate(rightValue, out int immediate))
+            {
+                switch (op)
+                {
+                    case BinaryOp.Add: a.AddImm(Reg.Rax, immediate); return null;
+                    case BinaryOp.Sub: a.SubImm(Reg.Rax, immediate); return null;
+                    case BinaryOp.And: a.AndImm(Reg.Rax, immediate); return null;
+                    case BinaryOp.Mul: a.ImulImm(Reg.Rax, Reg.Rax, immediate); return null;
+                    case BinaryOp.Shl or BinaryOp.Shr:
+                    {
+                        // Shift amounts wrap at the width, as in the VM and the LLVM back end.
+                        int amount = immediate & (type.BitWidth!.Value - 1);
+                        if (amount != 0)
+                            a.ShiftImm(op == BinaryOp.Shl ? 4 : signed ? 7 : 5, Reg.Rax, amount);
+                        return null;
+                    }
+                    case BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Le or BinaryOp.Gt or BinaryOp.Ge:
+                    {
+                        a.CmpImm(Reg.Rax, immediate);
+                        var condition = Comparison(op, signed);
+                        a.SetCondition(condition, Reg.Rax);
+                        return condition;
+                    }
+                }
+            }
+            LoadTo(Reg.Rcx, rightValue);
+            switch (op)
             {
                 case BinaryOp.Add: a.Add(Reg.Rax, Reg.Rcx); break;
                 case BinaryOp.Sub: a.Sub(Reg.Rax, Reg.Rcx); break;
@@ -1559,7 +1890,7 @@ namespace Larva.X64
                         var regular = new Label();
                         a.CmpImm(Reg.Rcx, -1);
                         a.Jcc(Cond.NE, regular);
-                        if (binary.Op == BinaryOp.Div)
+                        if (op == BinaryOp.Div)
                             a.Neg(Reg.Rax);
                         else
                             a.MovImm(Reg.Rax, 0);
@@ -1573,7 +1904,7 @@ namespace Larva.X64
                         a.MovImm(Reg.Rdx, 0);
                         a.Div(Reg.Rcx);
                     }
-                    if (binary.Op == BinaryOp.Rem)
+                    if (op == BinaryOp.Rem)
                         a.Mov(Reg.Rax, Reg.Rdx);
                     a.Bind(done);
                     break;
@@ -1581,7 +1912,7 @@ namespace Larva.X64
                 case BinaryOp.Shl or BinaryOp.Shr:
                     // Shift amounts wrap at the width, as in the VM and the LLVM back end.
                     a.AndImm(Reg.Rcx, type.BitWidth!.Value - 1);
-                    if (binary.Op == BinaryOp.Shl)
+                    if (op == BinaryOp.Shl)
                         a.ShlCl(Reg.Rax);
                     else if (signed)
                         a.SarCl(Reg.Rax);
@@ -1589,22 +1920,26 @@ namespace Larva.X64
                         a.ShrCl(Reg.Rax);
                     break;
                 default:
+                {
                     a.Cmp(Reg.Rax, Reg.Rcx);
-                    a.SetCondition(binary.Op switch
-                    {
-                        BinaryOp.Eq => Cond.E,
-                        BinaryOp.Ne => Cond.NE,
-                        BinaryOp.Lt => signed ? Cond.L : Cond.B,
-                        BinaryOp.Le => signed ? Cond.LE : Cond.BE,
-                        BinaryOp.Gt => signed ? Cond.G : Cond.A,
-                        BinaryOp.Ge => signed ? Cond.GE : Cond.AE,
-                        _ => throw new X64BackendException($"`{binary.Op}`"),
-                    }, Reg.Rax);
-                    break;
+                    var condition = Comparison(op, signed);
+                    a.SetCondition(condition, Reg.Rax);
+                    return condition;
+                }
             }
-            a.Store(Frame(left), Reg.Rax, 8);
-            return left;
+            return null;
         }
+
+        private static Cond Comparison(BinaryOp op, bool signed) => op switch
+        {
+            BinaryOp.Eq => Cond.E,
+            BinaryOp.Ne => Cond.NE,
+            BinaryOp.Lt => signed ? Cond.L : Cond.B,
+            BinaryOp.Le => signed ? Cond.LE : Cond.BE,
+            BinaryOp.Gt => signed ? Cond.G : Cond.A,
+            BinaryOp.Ge => signed ? Cond.GE : Cond.AE,
+            _ => throw new X64BackendException($"`{op}`"),
+        };
 
         /// <summary>
         /// Reference counting: <c>==</c> / <c>!=</c> on handles compare addresses and keep no reference, so the operands are
@@ -1797,10 +2132,11 @@ namespace Larva.X64
         private static long TypeCode(IrType type) =>
             (type.BitWidth ?? 64) | (type.IsSigned ? Larva.Native.NativeRuntime.SignedCode : 0) | (type.IsFloat ? Larva.Native.NativeRuntime.FloatCode : 0);
 
-        private int FloatBinary(BinaryOp op, int left, int right, int size)
+        /// <summary>A float operation: the result in <c>xmm0</c>, or (comparisons) a bool in <c>rax</c>; an ordered comparison returns its condition.</summary>
+        private Cond? FloatBinary(BinaryOp op, Value left, Value right, int size)
         {
-            a.LoadFloat(Xmm.X0, Frame(left), size);
-            a.LoadFloat(Xmm.X1, Frame(right), size);
+            LoadFloatTo(Xmm.X0, left, size);
+            LoadFloatTo(Xmm.X1, right, size);
             bool half = size == 2;
             if (half)
             {
@@ -1844,27 +2180,104 @@ namespace Larva.X64
                         a.And(Reg.Rax, Reg.Rcx);
                     else
                         a.Or(Reg.Rax, Reg.Rcx);
-                    a.Store(Frame(left), Reg.Rax, 8);
-                    return left;
+                    return null; // two flags: nothing to branch on directly
                 case BinaryOp.Lt or BinaryOp.Le or BinaryOp.Gt or BinaryOp.Ge:
+                {
                     // Ordered compares via "above": a < b ⇔ b above a, which is false when unordered.
                     if (op is BinaryOp.Lt or BinaryOp.Le)
                         a.FloatCompare(Xmm.X1, Xmm.X0, size);
                     else
                         a.FloatCompare(Xmm.X0, Xmm.X1, size);
-                    a.SetCondition(op is BinaryOp.Lt or BinaryOp.Gt ? Cond.A : Cond.AE, Reg.Rax);
-                    a.Store(Frame(left), Reg.Rax, 8);
-                    return left;
+                    var condition = op is BinaryOp.Lt or BinaryOp.Gt ? Cond.A : Cond.AE;
+                    a.SetCondition(condition, Reg.Rax);
+                    return condition;
+                }
                 default:
                     throw new X64BackendException($"`{op}` on floats is not supported by the direct x86-64 back end");
             }
             if (half)
-            {
                 a.SingleToHalf(Xmm.X0, Xmm.X0);
-                size = 2;
+            return null;
+        }
+
+        /// <summary>
+        /// <see cref="Convert"/> for scalars and floats other than f16, into <c>rax</c> (integers) or <c>xmm0</c> (floats).
+        /// </summary>
+        private void ConvertIntoRegister(Value value, IrType from, IrType to)
+        {
+            var (fromKind, fromSize, _) = cg.Shape(from);
+            var (toKind, toSize, _) = cg.Shape(to);
+            if (from == to)
+            {
+                if (toKind == X64Codegen.Kind.Float)
+                    LoadFloatTo(Xmm.X0, value, toSize);
+                else
+                    LoadTo(Reg.Rax, value);
+                return;
             }
-            a.StoreFloat(Frame(left), Xmm.X0, size);
-            return left;
+            if (to == IrType.Bool)
+            {
+                if (fromKind == X64Codegen.Kind.Float)
+                {
+                    LoadFloatTo(Xmm.X0, value, fromSize);
+                    a.MovImm(Reg.Rax, 0);
+                    a.IntToFloat(Xmm.X1, Reg.Rax, fromSize);
+                    a.FloatCompare(Xmm.X0, Xmm.X1, fromSize);
+                    a.SetCondition(Cond.NE, Reg.Rax);
+                    a.SetCondition(Cond.P, Reg.Rcx);
+                    a.Or(Reg.Rax, Reg.Rcx);
+                }
+                else
+                {
+                    LoadTo(Reg.Rax, value);
+                    a.Test(Reg.Rax, Reg.Rax);
+                    a.SetCondition(Cond.NE, Reg.Rax);
+                }
+                return;
+            }
+            if (fromKind == X64Codegen.Kind.Float && toKind == X64Codegen.Kind.Float)
+            {
+                LoadFloatTo(Xmm.X0, value, fromSize);
+                a.FloatResize(Xmm.X0, Xmm.X0, fromSize);
+                return;
+            }
+            if (fromKind == X64Codegen.Kind.Float)
+            {
+                LoadFloatTo(Xmm.X0, value, fromSize);
+                if (fromSize == 4)
+                    a.FloatResize(Xmm.X0, Xmm.X0, 4); // a single widened to a double is exact: one set of bounds below
+                FloatToIntSaturating(to);
+                return;
+            }
+            LoadTo(Reg.Rax, value);
+            if (toKind == X64Codegen.Kind.Float)
+            {
+                if (from == IrType.U64)
+                {
+                    // Values ≥ 2^63 look negative to cvtsi2sd: halve (keeping the low bit for rounding), convert, double.
+                    var positive = new Label();
+                    var done = new Label();
+                    a.Test(Reg.Rax, Reg.Rax);
+                    a.Jcc(Cond.NS, positive);
+                    a.Mov(Reg.Rcx, Reg.Rax);
+                    a.ShiftImm(5, Reg.Rcx, 1);
+                    a.AndImm(Reg.Rax, 1);
+                    a.Or(Reg.Rcx, Reg.Rax);
+                    a.IntToFloat(Xmm.X0, Reg.Rcx, toSize);
+                    a.FloatAdd(Xmm.X0, Xmm.X0, toSize);
+                    a.Jmp(done);
+                    a.Bind(positive);
+                    a.IntToFloat(Xmm.X0, Reg.Rax, toSize);
+                    a.Bind(done);
+                }
+                else
+                {
+                    a.IntToFloat(Xmm.X0, Reg.Rax, toSize);
+                }
+                return;
+            }
+            // Integer ↔ integer (and pointers): the canonical value is already extended by the source's signedness.
+            Canonicalize(Reg.Rax, to);
         }
 
         /// <summary>Numeric conversion with Larva semantics (sign follows the source type).</summary>
