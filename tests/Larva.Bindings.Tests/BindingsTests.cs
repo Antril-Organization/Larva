@@ -219,7 +219,7 @@ public sealed class BindingsTests : CheckedTest
             struct Later;
             struct Never;
             long unsigned int Size(void);
-            unsigned long long int Big(int long a, short unsigned b, long signed int c, char unsigned d, long double e);
+            unsigned long long int Big(int long a, short unsigned b, long signed int c, char unsigned d, long long unsigned e);
             enum Tag GetTag(enum Tag t, enum Tag* out, TagT u);
             struct Later* MakeLater(const struct Later* from);
             struct Never* MakeNever(const struct Never* n, struct Unknown* u);
@@ -229,7 +229,7 @@ public sealed class BindingsTests : CheckedTest
             """, "lib.dll");
         Log(description);
         Check("`long unsigned int` is u64 (LP64), the other orders of the words likewise",
-            description.Contains("Size() : u64\n") && description.Contains("Big(i64 a, u16 b, i64 c, u8 d, f64 e) : u64\n"));
+            description.Contains("Size() : u64\n") && description.Contains("Big(i64 a, u16 b, i64 c, u8 d, u64 e) : u64\n"));
         Check("`enum Tag` is i32 by value, i32* by pointer, through a typedef too; the prototype that starts with `enum` is read",
             description.Contains("GetTag(i32 t, i32* out, i32 u) : i32\n")
             && reader.TypedefUses.GetValueOrDefault("GetTag#0") == "Tag" && reader.TypedefUses.GetValueOrDefault("GetTag#result") == "Tag"
