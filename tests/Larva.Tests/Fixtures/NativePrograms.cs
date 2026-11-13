@@ -481,4 +481,66 @@ internal static class NativePrograms
         f.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(last).Deref().Field(1))).Return();
         return new IrModule(GcPrograms.StructDefs, [f.Build()]);
     }
+
+    /// <summary>
+    /// Finalizers in a program that started a thread (functions 0..3; global 0 = finalized: i32):
+    /// fin_count(dead: gc Point) { finalized += 1 } — the finalizer;
+    /// noop_worker(env: ptr unit) {} — the thread's code;
+    /// make_garbage(n: i64) -> i64 { for i in 0..n { let g = gc Point{i, i} finalized fin_count } n } — garbage with a finalizer;
+    /// finalized_after_thread(n: i64) -> i32 { join thread.start(noop_worker, null); make_garbage(n); gc.request; make_garbage(0); finalized }
+    /// — once a thread ran, the main thread fills its own nursery block: the objects it allocates there must still be
+    /// recognised as gc objects (their finalizers registered) and finalized by the collection (→ about n).
+    /// </summary>
+    public static IrModule FinalizedAfterThreadProgram()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var environment = IrType.Ptr(IrType.Unit);
+        var fin = new FunctionBuilder("fin_count", IrType.Unit);
+        fin.Argument(gcPoint, "dead");
+        int count = fin.Local(IrType.I32, "count", mutable: true);
+        fin.Assign(count, new GlobalRvalue(0)).Assign(count, Rvalue.Binary(BinaryOp.Add, Copy(count), Int(1))).StoreGlobal(0, Copy(count)).Return();
+
+        var worker = new FunctionBuilder("noop_worker", IrType.Unit);
+        worker.Argument(environment, "env");
+        worker.Return();
+
+        var garbage = new FunctionBuilder("make_garbage", IrType.I64);
+        int n = garbage.Argument(IrType.I64, "n");
+        int i = garbage.Local(IrType.I64, "i", mutable: true);
+        int p = garbage.Local(Point, "p", mutable: true);
+        int finalizer = garbage.Local(new FunctionType([gcPoint], IrType.Unit), "finalizer", mutable: true);
+        int g = garbage.Local(gcPoint, "g", mutable: true);
+        int c = garbage.Local(IrType.Bool, "c", mutable: true);
+        int head = garbage.NewBlock(), body = garbage.NewBlock(), exit = garbage.NewBlock();
+        garbage.Assign(i, Int(0, IrType.I64)).Assign(finalizer, Rvalue.FunctionRef(0)).Goto(head);
+        garbage.At(head).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(n))).If(Copy(c), body, exit);
+        garbage.At(body)
+               .Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+               .Assign(g, Rvalue.Gc(Move(p), Copy(finalizer)))
+               .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(head);
+        garbage.At(exit).Assign(FunctionBuilder.ReturnPlace, Copy(n)).Return();
+
+        var main = new FunctionBuilder("finalized_after_thread", IrType.I32) { Unsafe = true };
+        int mn = main.Argument(IrType.I64, "n");
+        int code = main.Local(new FunctionType([environment], IrType.Unit), "code", mutable: true);
+        int zero = main.Local(IrType.U64, "zero");
+        int env = main.Local(environment, "env");
+        int t = main.Local(IrType.I64, "t");
+        int joined = main.Local(IrType.I64, "joined", mutable: true);
+        int made = main.Local(IrType.I64, "made", mutable: true);
+        int unit = main.Local(IrType.Unit, null, mutable: true);
+        int finalized = main.Local(IrType.I32, "finalized", mutable: true);
+        int b1 = main.NewBlock(), b2 = main.NewBlock();
+        main.Assign(code, Rvalue.FunctionRef(1))
+            .Assign(zero, Int(0, IrType.U64))
+            .Assign(env, Rvalue.Cast(Copy(zero), environment))
+            .Assign(t, new IntrinsicRvalue("thread.start", [Copy(code), Copy(env)]))
+            .Assign(joined, new IntrinsicRvalue("thread.join", [Copy(t), Int(-1, IrType.I64)]))
+            .Call(2, [Copy(mn)], made, b1);
+        main.At(b1).Assign(unit, new IntrinsicRvalue("gc.request", [])).Call(2, [Int(0, IrType.I64)], made, b2);
+        main.At(b2).Assign(finalized, new GlobalRvalue(0)).Assign(FunctionBuilder.ReturnPlace, Copy(finalized)).Return();
+
+        return new IrModule(GcPrograms.StructDefs, [fin.Build(), worker.Build(), garbage.Build(), main.Build()])
+            { Globals = [new GlobalDef("finalized", IrType.I32)] };
+    }
 }

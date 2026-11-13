@@ -2749,7 +2749,11 @@ static void finalize(void *payload) {
 }
 
 LARVA_API void larva_gc_finalizer(void *handle, void *finalizer) {
-    if (handle && is_gc(handle)) {
+    if (!handle)
+        return;
+    /* The table and the young list are shared state: under the runtime's lock once threads exist. */
+    int locked = rt_enter();
+    if (is_gc(handle)) {
         GcHeader *header = header_of(handle);
         table_put(&finalizers, (uintptr_t)handle, (int64_t)(intptr_t)finalizer, 0);
         header->flags |= FLAG_FINALIZER;
@@ -2757,6 +2761,7 @@ LARVA_API void larva_gc_finalizer(void *handle, void *finalizer) {
         if (header->age == AGE_YOUNG)
             push_pointer(&young_finalizable, &young_finalizable_count, &young_finalizable_capacity, handle);
     }
+    rt_leave(locked);
 }
 
 static void each_slot(void *payload, void (*visit)(void **slot), void (*ambiguous)(const uint8_t *, int64_t), void (*cell)(uintptr_t));
@@ -3226,6 +3231,38 @@ static void block_starts(NurseryBlock *block, size_t index) {
 static size_t *walked_blocks;
 static size_t walked_count, walked_capacity;
 
+/*
+ * A block's `used` is written when it closes: while it is being filled, the cursor of whoever fills it says how far the
+ * objects go. One thread: larva_heap (compiled code allocates inline in it). With threads each thread fills its own block
+ * (this thread's first, the others' through the thread list: a thread that joined the list or left it did so under the
+ * runtime's lock, which the callers that ask about another thread's block hold).
+ */
+static void refresh_block_used(size_t index) {
+    NurseryBlock *block = &nursery_blocks[index];
+    if (index == current_block) {
+        if (larva_heap.cursor)
+            block->used = (uint32_t)(larva_heap.cursor - block_start(index));
+        return;
+    }
+    if (shared_heap)
+        return;
+    LarvaThread *me = this_thread;
+    if (me && me->block == index) {
+        if (me->heap.cursor)
+            block->used = (uint32_t)(me->heap.cursor - block_start(index));
+        return;
+    }
+    for (LarvaThread *thread = thread_list; thread; thread = thread->next) {
+        if (thread->block != index)
+            continue;
+        /* Another thread's cursor only moves forward while it fills the block: a stale reading never lowers `used`. */
+        char *cursor = thread->heap.cursor;
+        if (cursor && (uint32_t)(cursor - block_start(index)) > block->used)
+            block->used = (uint32_t)(cursor - block_start(index));
+        return;
+    }
+}
+
 static void *nursery_object(uintptr_t address) {
     if (!in_nursery((void *)address))
         return NULL;
@@ -3234,8 +3271,7 @@ static void *nursery_object(uintptr_t address) {
     if (block->state != BLOCK_ACTIVE && block->state != BLOCK_RETAINED)
         return NULL;
     uint32_t offset = (uint32_t)(address - (uintptr_t)block_start(index));
-    if (index == current_block && larva_heap.cursor)
-        block->used = (uint32_t)(larva_heap.cursor - block_start(index));
+    refresh_block_used(index);
     if (offset >= block->used)
         return NULL;
     if (block->starts && block->starts_used != block->used) {
@@ -4458,14 +4494,15 @@ LARVA_API int64_t larva_gc_collections(void) { return collections; }
 /* Objects alive or not collected yet: the old ones, and those in the nursery (walked to count them). */
 LARVA_API int64_t larva_gc_objects(void) {
     int64_t young = 0;
-    if (current_block != (size_t)-1 && larva_heap.cursor)
-        nursery_blocks[current_block].used = (uint32_t)(larva_heap.cursor - block_start(current_block));
+    int locked = rt_enter();
     for (size_t i = 0; i < active_count; i++) {
+        refresh_block_used(active_blocks[i]);
         NurseryBlock *block = &nursery_blocks[active_blocks[i]];
         char *base = block_start(active_blocks[i]);
         for (uint32_t at = 0; at < block->used; young++)
             at += (uint32_t)total_bytes(payload_bytes((GcHeader *)(base + at)));
     }
+    rt_leave(locked);
     return gc_live + young;
 }
 
