@@ -527,16 +527,9 @@ into namespace System
 			/// The text in UTF-8 (`str`).
 			ToUtf8() : String<u8>
 			{
-				if (sizeof(T) == 1)
-				{
-					String<u8> bytes = new String<u8>(units.Length);
-					unsafe
-					{
-						if (units.Length > 0)
-							System.Runtime.InteropServices.Memory.Copy((u8*)&bytes.units[0], (u8*)&units[0], (i64)units.Length);
-					}
-					return bytes;
-				}
+				// A str is already UTF-8, and strings do not change: the same string.
+				if (sizeof(T) == 1 && (any)this is String<u8> same)
+					return same;
 				return new String<u8>(Unicode.Encode<u8>(Unicode.Decode(Units())));
 			}
 
