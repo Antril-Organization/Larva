@@ -338,6 +338,42 @@ public sealed class BindingsTests : CheckedTest
         Check("through clang, run as C, the guarded block is gone and the function read", real.ReadFile(header, "lib.dll").Contains("Inside(i32 x) : i32\n"));
     }
 
+    /// <summary>
+    /// A header mixing declarations the reader can and cannot read: each unreadable one is left out with a warning naming
+    /// its line (the header's own line after a line marker), and everything else is read; the bind never aborts.
+    /// </summary>
+    [Fact]
+    public void Unreadable_declarations_are_skipped_with_their_line_and_the_rest_is_read()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            # 1 "C:\\api\\mixed.h"
+            int Good1(int x);
+            typedef struct { int a; } Twice;
+            struct Twice { int b; };
+            int Good2(int x);
+            typedef void (*Broken)(int;
+            int Good3(int x);
+            typedef struct Pair { int a; } Pair;
+            int Good4(int x);
+            struct Open { int a;
+            int Good5(int x);
+            """, "lib.dll");
+        Log(description);
+        Log(string.Join("\n", reader.Unparsed.Select(u => $"{u.Where}: {u.Why}")));
+        Check("the good prototypes before and between the bad declarations are read, and the struct defined twice keeps its first body",
+            description.Contains("Good1(i32 x) : i32\n") && description.Contains("Good2(i32 x) : i32\n") && description.Contains("Good3(i32 x) : i32\n")
+            && description.Contains("Good4(i32 x) : i32\n") && description.Contains("struct Twice { i32 a }\n") && description.Contains("struct Pair { i32 a }\n")
+            && !description.Contains("Broken") && !description.Contains("Open"));
+        Check("each unreadable declaration is a warning with the header's line: the second `Twice` (line 3), `typedef … (int;` (line 5), the unclosed `struct Open` (line 9, swallowing Good5)",
+            reader.Unparsed.Count == 3
+            && reader.Unparsed[0] == ("C:/api/mixed.h:3", "struct `Twice` is defined twice: the first definition is kept")
+            && reader.Unparsed[1].Where == "C:/api/mixed.h:5" && reader.Unparsed[1].Why.Contains("typedef void (*Broken)(int")
+            && reader.Unparsed[2].Where == "C:/api/mixed.h:9" && reader.Unparsed[2].Why.Contains("struct Open"),
+            string.Join("; ", reader.Unparsed.Select(u => $"{u.Where}: {u.Why}")));
+        Check("the description parses", BindingDescription.Parse(description).Functions.Count == 4);
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()

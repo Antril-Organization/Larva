@@ -19,6 +19,9 @@ namespace Larva.Bindings
         /// <summary>Structs left opaque although they have a body, each with why.</summary>
         public List<(string Name, string Why)> Opaque { get; } = [];
 
+        /// <summary>Declarations the reader could not read and left out, each as <c>file:line</c> with why; the rest of the header is read.</summary>
+        public List<(string Where, string Why)> Unparsed { get; } = [];
+
         /// <summary>A C enum: the names it goes by (its tag and the typedefs of it), its members and the header it is in.</summary>
         public sealed record CEnum(List<string> Names, List<(string Name, long Value)> Members, string? File);
 
@@ -39,6 +42,7 @@ namespace Larva.Bindings
 
         private readonly HashSet<string> enumNames = new(StringComparer.Ordinal);
         private string? currentFile;
+        private int currentLine;
 
         /// <summary>The header a declaration came from, kept among the declarations where its line marker was.</summary>
         private const string FileMarker = "\u0002file";
@@ -171,23 +175,19 @@ namespace Larva.Bindings
                 }
             }
             currentFile = null;
-            var declarations = Declarations(code).Select(d => d.StartsWith(FileMarker, StringComparison.Ordinal) ? d : Callable.Replace(StripDecorations(d), "(*").Trim())
-                .Where(d => d.Length > 0).ToList();
+            var declarations = Declarations(code).Select(d => (Text: d.Text.StartsWith(FileMarker, StringComparison.Ordinal) ? d.Text : Callable.Replace(StripDecorations(d.Text), "(*").Trim(), d.Line))
+                .Where(d => d.Text.Length > 0).ToList();
             // Types first, prototypes after: a prototype may use a typedef written below it in another header.
-            foreach (string declaration in declarations)
+            foreach (bool types in new[] { true, false })
             {
-                if (declaration.StartsWith(FileMarker, StringComparison.Ordinal))
-                    currentFile = declaration[FileMarker.Length..];
-                else if (IsTypeDeclaration(declaration))
-                    Declaration(declaration);
-            }
-            currentFile = null;
-            foreach (string declaration in declarations)
-            {
-                if (declaration.StartsWith(FileMarker, StringComparison.Ordinal))
-                    currentFile = declaration[FileMarker.Length..];
-                else if (!IsTypeDeclaration(declaration))
-                    Declaration(declaration);
+                currentFile = null;
+                foreach (var (declaration, line) in declarations)
+                {
+                    if (declaration.StartsWith(FileMarker, StringComparison.Ordinal))
+                        currentFile = declaration[FileMarker.Length..];
+                    else if (IsTypeDeclaration(declaration) == types)
+                        TryDeclaration(declaration, line);
+                }
             }
             var text = new StringBuilder();
             text.Append("library ").Append(library).Append('\n');
@@ -377,16 +377,27 @@ namespace Larva.Bindings
             return null;
         }
 
-        /// <summary>Top-level declarations (ending in <c>;</c>), bodies <c>{ … }</c> of functions skipped, directives dropped.</summary>
-        private static List<string> Declarations(string code)
+        /// <summary>
+        /// Top-level declarations (ending in <c>;</c>), bodies <c>{ … }</c> of functions skipped, directives dropped, each
+        /// with the line it starts on (the header's own line after a line marker). Text left unterminated at the end
+        /// (an unmatched <c>{</c>) is a declaration too, for the reader to refuse with its line.
+        /// </summary>
+        private static List<(string Text, int Line)> Declarations(string code)
         {
-            var declarations = new List<string>();
+            var declarations = new List<(string, int)>();
             var current = new StringBuilder();
-            int depth = 0, parens = 0, externBlocks = 0;
+            int depth = 0, parens = 0, externBlocks = 0, line = 1, startLine = 1;
             bool directive = false, lineStart = true;
+            void Take()
+            {
+                declarations.Add((current.ToString(), startLine));
+                current.Clear();
+            }
             for (int i = 0; i < code.Length; i++)
             {
                 char c = code[i];
+                if (c == '\n')
+                    line++;
                 if (lineStart && c == '#')
                     directive = true;
                 lineStart = c == '\n';
@@ -397,14 +408,19 @@ namespace Larva.Bindings
                         directive = false;
                         // `#pragma pack(…)`: kept in place (it changes the structs declared after it).
                         int lineStart2 = code.LastIndexOf('\n', Math.Max(0, i - 1)) + 1;
-                        string line = code[lineStart2..i].Trim();
-                        if (System.Text.RegularExpressions.Regex.IsMatch(line, @"^#\s*pragma\s+pack\s*\("))
-                            declarations.Add(PackMarker + line[(line.IndexOf('(') + 1)..line.LastIndexOf(')')]);
-                        else if (LineMarker.Match(line) is { Success: true } marker)
-                            declarations.Add(FileMarker + MarkerPath(marker.Groups[1].Value));
+                        string text = code[lineStart2..i].Trim();
+                        if (System.Text.RegularExpressions.Regex.IsMatch(text, @"^#\s*pragma\s+pack\s*\("))
+                            declarations.Add((PackMarker + text[(text.IndexOf('(') + 1)..text.LastIndexOf(')')], line));
+                        else if (LineMarker.Match(text) is { Success: true } marker)
+                        {
+                            declarations.Add((FileMarker + MarkerPath(marker.Groups[1].Value), line));
+                            line = int.Parse(System.Text.RegularExpressions.Regex.Match(text, @"\d+").Value); // the next line's number in that file
+                        }
                     }
                     continue;
                 }
+                if (current.Length == 0 && !char.IsWhiteSpace(c))
+                    startLine = line;
                 if (c == '{')
                 {
                     // `extern "C" {` (a header read without the preprocessor, or an unguarded block): the declarations
@@ -431,22 +447,21 @@ namespace Larva.Bindings
                     current.Append(c);
                     // A function definition: its body ends the declaration without a `;`.
                     if (depth == 0 && parens == 0 && !current.ToString().TrimStart().StartsWith("typedef") && !StartsWithAggregate(current.ToString()))
-                    {
-                        declarations.Add(current.ToString());
-                        current.Clear();
-                    }
+                        Take();
                     continue;
                 }
                 if (c == '(') parens++;
                 else if (c == ')') parens--;
                 if (c == ';' && depth == 0)
                 {
-                    declarations.Add(current.ToString());
-                    current.Clear();
+                    Take();
                     continue;
                 }
-                current.Append(c == '\n' ? ' ' : c);
+                if (current.Length > 0 || !char.IsWhiteSpace(c))
+                    current.Append(c == '\n' ? ' ' : c); // no leading whitespace: an empty `current` marks where a declaration starts
             }
+            if (current.ToString().Trim().Length > 0)
+                Take();
             return declarations;
         }
 
@@ -532,6 +547,24 @@ namespace Larva.Bindings
             }
             if (int.TryParse(parts[0], out int value))
                 pack = value;
+        }
+
+        /// <summary>
+        /// One declaration, or a warning in <see cref="Unparsed"/> naming its line: what the reader cannot make sense of
+        /// (text C would refuse, a shape the reader does not know) is left out, never the whole header.
+        /// </summary>
+        private void TryDeclaration(string t, int line)
+        {
+            currentLine = line;
+            try
+            {
+                Declaration(t);
+            }
+            catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException or InvalidOperationException or FormatException or NullReferenceException)
+            {
+                string shown = t.Length > 60 ? t[..57] + "…" : t;
+                Unparsed.Add(($"{currentFile ?? "header"}:{line}", $"`{shown}` could not be read"));
+            }
         }
 
         private void Declaration(string t)
@@ -675,6 +708,12 @@ namespace Larva.Bindings
 
         private void DefineStruct(string name, string tag, string body, bool isUnion = false)
         {
+            if (structs.ContainsKey(name))
+            {
+                // Defined twice (two headers, or a header read without the preprocessor and its include guard): the first wins.
+                Unparsed.Add(($"{currentFile ?? "header"}:{currentLine}", $"{(isUnion ? "union" : "struct")} `{name}` is defined twice: the first definition is kept"));
+                return;
+            }
             var raw = new RawStruct { Name = name, Fields = [], IsUnion = isUnion, Pack = pack };
             if (currentFile is not null)
                 Origins.TryAdd(name, currentFile);
