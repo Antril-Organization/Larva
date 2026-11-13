@@ -20,6 +20,39 @@ public sealed unsafe class LinkerTests : CheckedTest
         Check("object file round trip", roundTrip.Module.ToString() == app.Module.ToString() && roundTrip.Gc == app.Gc);
     }
 
+    /// <summary>
+    /// Struct attributes (the struct's and its fields') name types by the object's own struct ids: linked, they must be
+    /// renumbered like the fields are. app is linked first so that its ids differ from the merged ones (its Point import
+    /// is 0 in app and 1 after geom comes in; its Holder is 1 in app and 0 merged).
+    /// </summary>
+    [Fact]
+    public void Struct_attributes_are_renumbered_when_objects_merge()
+    {
+        const int HolderId = 1;
+        var holder = new StructDef("Holder", Point, IrType.I32)
+        {
+            FieldNames = ["point", "n"],
+            Attributes = [new IrAttribute("holds", [new TypeArgument(Point), new TypeArgument(IrType.Ref(IrType.Struct(HolderId))), new TextArgument("x")])],
+            FieldAttributes = [[new IrAttribute("field", [new TypeArgument(IrType.ArrayOf(Point))])], []],
+        };
+        var app = App() with { Structs = [PointDef(Linkage.Import, "geom::Point"), holder] };
+        var linked = Linker.Link([Object(app), Object(Geom())], new LinkOptions { LowerToIl = false });
+        Check("app (first) and geom link", linked.Success, string.Join(" | ", linked.Errors));
+        if (!linked.Success)
+            return;
+        var merged = linked.Merged!;
+        int point = Array.FindIndex(merged.Structs, s => s.Name == "geom::Point"), mergedHolder = Array.FindIndex(merged.Structs, s => s.Name == "app::Holder");
+        Check("both structs are in the merged module, with different ids than in app", point >= 0 && mergedHolder >= 0 && point != PointId, $"Point {point}, Holder {mergedHolder}");
+        var def = merged.Structs[mergedHolder];
+        Check("Holder's point field is geom's Point", def.Fields[0] is StructType { Id: var fieldId } && fieldId == point);
+        Check("the struct attribute's type arguments are renumbered (Point and &Holder)",
+            def.Attributes is [{ Name: "holds", Arguments: [TypeArgument { Type: StructType { Id: var a } }, TypeArgument { Type: ReferenceType { Pointee: StructType { Id: var h } } }, TextArgument { Value: "x" }] }]
+            && a == point && h == mergedHolder, string.Join(", ", def.Attributes.SelectMany(x => x.Arguments)));
+        Check("the field attribute's type argument is renumbered ([Point])",
+            def.FieldAttributes is [[{ Arguments: [TypeArgument { Type: ArrayType { Element: StructType { Id: var f } } }] }], []] && f == point,
+            string.Join(", ", def.FieldAttributes.SelectMany(x => x).SelectMany(x => x.Arguments)));
+    }
+
     [Fact]
     public void Geom_and_app_link_specialize_and_drop_dead_code()
     {

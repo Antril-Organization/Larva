@@ -321,12 +321,8 @@ namespace Larva.IR.Linking
                             || module.Structs[s].Linkage == Linkage.LinkOnce && !structOwner.ContainsKey(structMap[m][s]))
                             continue;
                         int id = structMap[m][s];
-                        structs[id] = structs[id] with
-                        {
-                            Fields = [.. structs[id].Fields.Select(t => MapType(t, m))],
-                            Generics = MapGenerics(structs[id].Generics, m),
-                            Base = structs[id].Base is { } baseType ? (StructType)MapType(baseType, m) : null,
-                        };
+                        // Fields, generics, the base and the types named in the struct's and its fields' attributes.
+                        structs[id] = Ids(m).Struct(structs[id]);
                     }
                     for (int f = 0; f < module.Functions.Length; f++)
                     {
