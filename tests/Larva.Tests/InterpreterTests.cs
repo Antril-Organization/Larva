@@ -434,6 +434,85 @@ public sealed class InterpreterTests : CheckedTest
         Check("collections ran while the array was live and reclaimed the garbage", vm.Stats.Collections > 0 && vm.Stats.Reclaimed > 0, vm.Stats.ToString());
     }
 
+    /// <summary>
+    /// mem.copy and mem.cmp work on spans of the backing bytes: overlapping copies forward and backward, the first
+    /// difference, a compare that stops at a difference before the end of memory, and a copy past the end that fails
+    /// before writing anything.
+    /// </summary>
+    [Fact]
+    public void Mem_copy_and_compare_move_whole_spans()
+    {
+        var bytes = IrType.PtrMut(IrType.U8);
+        var f = new FunctionBuilder("mem", IrType.I64) { Unsafe = true };
+        int a = f.Local(IrType.Box(new ArrayType(IrType.U8)), "a", mutable: true);
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int unit = f.Local(IrType.Unit, "unit", mutable: true);
+        int digits = f.Local(IrType.I64, "digits", mutable: true);
+        int fill = f.NewBlock(), store = f.NewBlock(), read = f.NewBlock(), digit = f.NewBlock(), done = f.NewBlock();
+        int Pointer(int index)
+        {
+            int at = f.Temp(IrType.I64), borrow = f.Temp(IrType.RefMut(IrType.U8)), pointer = f.Temp(bytes);
+            f.Assign(at, Int(index, IrType.I64)).Assign(borrow, Rvalue.RefMut(new Place(a).Deref().Index(at))).Assign(pointer, Rvalue.Cast(Move(borrow), bytes));
+            return pointer;
+        }
+        void Print(Rvalue value)
+        {
+            int t = f.Temp(IrType.I64);
+            f.Assign(t, value).Assign(unit, new IntrinsicRvalue("print.i64", [Move(t)]));
+        }
+
+        f.Assign(a, Rvalue.NewArray(AllocKind.Box, IrType.U8, Int(8, IrType.I64))).Assign(i, Int(0, IrType.I64)).Goto(fill);
+        f.At(fill).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(8, IrType.I64))).If(Copy(c), store, read);
+        int plusOne = f.Temp(IrType.I64);
+        f.At(store).Assign(plusOne, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Assign(new Place(a).Deref().Index(i), Rvalue.Cast(Move(plusOne), IrType.U8))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(fill);
+        f.At(read);
+        int to = Pointer(2), from = Pointer(0);
+        f.Assign(unit, new IntrinsicRvalue("mem.copy", [Copy(to), Copy(from), Int(4, IrType.I64)]));      // 1 2 1 2 3 4 7 8 (forward overlap)
+        to = Pointer(0);
+        from = Pointer(1);
+        f.Assign(unit, new IntrinsicRvalue("mem.copy", [Copy(to), Copy(from), Int(4, IrType.I64)]));      // 2 1 2 3 3 4 7 8 (backward overlap)
+        int left = Pointer(0), right = Pointer(4);
+        Print(new IntrinsicRvalue("mem.cmp", [Copy(left), Copy(right), Int(2, IrType.I64)]));              // 2 - 3 = -1
+        left = Pointer(2);
+        right = Pointer(0);
+        Print(new IntrinsicRvalue("mem.cmp", [Copy(left), Copy(right), Int(2, IrType.I64)]));              // [2 3] vs [2 1]: 3 - 1 = 2
+        left = Pointer(4);
+        right = Pointer(6);
+        Print(new IntrinsicRvalue("mem.cmp", [Copy(left), Copy(right), Int(100, IrType.I64)]));            // differs at once (3 - 7 = -4), never reads past the end
+        f.Assign(digits, Int(0, IrType.I64)).Assign(i, Int(0, IrType.I64)).Goto(digit);
+        f.At(digit).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(8, IrType.I64))).If(Copy(c), done + 1, done);
+        f.At(done).Assign(FunctionBuilder.ReturnPlace, Copy(digits)).Return();
+        int next = f.NewBlock();
+        int element = f.Temp(IrType.U8), wide = f.Temp(IrType.I64), shifted = f.Temp(IrType.I64);
+        f.At(next).Assign(element, Copy(new Place(a).Deref().Index(i))).Assign(wide, Rvalue.Cast(Move(element), IrType.I64))
+         .Assign(shifted, Rvalue.Binary(BinaryOp.Mul, Copy(digits), Int(10, IrType.I64)))
+         .Assign(digits, Rvalue.Binary(BinaryOp.Add, Move(shifted), Move(wide)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(digit);
+
+        var past = new FunctionBuilder("past_the_end", IrType.U8) { Unsafe = true };
+        int pa = past.Local(IrType.Box(new ArrayType(IrType.U8)), "a", mutable: true);
+        int six = past.Local(IrType.I64, "six"), zero = past.Local(IrType.I64, "zero");
+        int r1 = past.Temp(IrType.RefMut(IrType.U8)), r2 = past.Temp(IrType.RefMut(IrType.U8)), p1 = past.Temp(bytes), p2 = past.Temp(bytes);
+        int moved = past.Temp(IrType.Unit);
+        past.Assign(pa, Rvalue.NewArray(AllocKind.Box, IrType.U8, Int(8, IrType.I64))).Assign(six, Int(6, IrType.I64)).Assign(zero, Int(0, IrType.I64))
+            .Assign(r1, Rvalue.RefMut(new Place(pa).Deref().Index(six))).Assign(p1, Rvalue.Cast(Move(r1), bytes))
+            .Assign(r2, Rvalue.RefMut(new Place(pa).Deref().Index(zero))).Assign(p2, Rvalue.Cast(Move(r2), bytes))
+            .Assign(moved, new IntrinsicRvalue("mem.copy", [Copy(p1), Copy(p2), Int(4, IrType.I64)]))
+            .Assign(FunctionBuilder.ReturnPlace, Copy(new Place(pa).Deref().Index(six)))
+            .Return();
+
+        var output = new StringWriter();
+        // Raw pointers into one array taken one after another: the borrow checker would see overlapping borrows.
+        var compiled = Compiler.Compile(new IrModule([], [f.Build(), past.Build()]), new CompilationOptions { BorrowCheck = BorrowCheckMode.Off });
+        Check("the program compiles", compiled.Success, string.Join("; ", compiled.TypeErrors.Concat<object>(compiled.Diagnostics)));
+        var vm = new Interpreter(compiled.Il!, options: new InterpreterOptions { Output = output });
+        Check("overlapping copies forward and backward give 2 1 2 3 3 4 7 8", Equal(vm.Run("mem"), 21233478L));
+        Check("mem.cmp gives the first difference: -1, 2, -4", output.ToString() == "-12-4", output.ToString());
+        Check("a copy past the end of the array is an error", Throws<VmException>(() => vm.Run("past_the_end"), "overruns"));
+    }
+
     [Fact]
     public void Shift_amounts_are_masked_by_the_operand_width()
     {

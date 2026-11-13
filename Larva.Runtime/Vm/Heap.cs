@@ -281,6 +281,37 @@ namespace Larva.Runtime.Vm
             return allocation;
         }
 
+        // ── Raw bytes (mem.copy, mem.cmp, text and file buffers) ────
+
+        /// <summary>The <paramref name="count"/> bytes at <paramref name="address"/>, bounds-checked as one read.</summary>
+        internal Span<byte> ReadableBytes(Address address, long count, string why = "read")
+        {
+            var allocation = Get(address, why);
+            if (count < 0 || address.Offset < 0 || address.Offset + count > allocation.Length)
+                throw new VmException($"{why} of {count}B at {address} overruns {allocation}");
+            return allocation.Bytes(address.Offset, (int)count);
+        }
+
+        /// <summary>The <paramref name="count"/> bytes at <paramref name="address"/>, bounds-checked as one write.</summary>
+        internal Span<byte> WritableBytes(Address address, long count, string why = "write")
+        {
+            var allocation = Get(address, why);
+            if (allocation.Kind == AllocationKind.Static && allocation.Sealed)
+                throw new VmException($"{why}: {address} is read-only static data");
+            if (count < 0 || address.Offset < 0 || address.Offset + count > allocation.Length)
+                throw new VmException($"{why} of {count}B at {address} overruns {allocation}");
+            return allocation.Bytes(address.Offset, (int)count);
+        }
+
+        /// <summary>The bytes of an array's elements (<c>[length:u64][elements…]</c> at <paramref name="array"/>), and their count.</summary>
+        internal Span<byte> ArrayBytes(Address array, IrType element, bool writable, out long length)
+        {
+            var (header, stride) = ArrayLayout(element);
+            length = (long)AsInteger(Read(IrType.U64, array));
+            long size = length * stride;
+            return writable ? WritableBytes(array.Plus(header), size) : ReadableBytes(array.Plus(header), size);
+        }
+
         // ── Arrays: [length:u64][padding][elements...] ─────────────
 
         /// <summary>Where elements start and how far apart they are.</summary>
