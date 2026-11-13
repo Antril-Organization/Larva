@@ -67,6 +67,17 @@ public sealed unsafe class X64Tests : CheckedTest
         }
     }
 
+    /// <summary>A store releases the old value after the new one is in place: a finalizer sees the field (or the global) already changed.</summary>
+    [Fact]
+    public void Reference_counting_stores_before_releasing_the_old_value()
+    {
+        NativeRuntime.Reset();
+        using var image = Load(NativePrograms.RcStoreOrder(), GcConfig.RefCount);
+        int seen = ((delegate* unmanaged<int>)image.Address("rc_store_order"))();
+        Check("RC: the finalizers of an overwritten field and global find the new values (22)", seen == 22, $"seen {seen}");
+        Check("RC: no runtime errors", NativeRuntime.Errors == 0, $"errors {NativeRuntime.Errors}");
+    }
+
     [Fact]
     public void Arrays_index_free_and_eliminate_proven_bounds_checks()
     {

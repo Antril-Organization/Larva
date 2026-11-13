@@ -81,6 +81,81 @@ internal static class NativePrograms
         return new IrModule(GcPrograms.StructDefs, [churn.Build(), keep.Build()]);
     }
 
+    /// <summary>
+    /// Reference counting, the order of a store: rc_store_order() overwrites a Holder's counted field and a counted global;
+    /// the finalizers of the values that die there look at the field (through global 0) and at the global (2) and
+    /// record in global 1 whether they still find the dying object (1) or the new one (2): 22 when the stores happen
+    /// before the releases.
+    /// </summary>
+    public static IrModule RcStoreOrder()
+    {
+        var gcPoint = IrType.Gc(Point);
+        var holderType = IrType.Struct(1);
+        var gcHolder = IrType.Gc(holderType);
+
+        // fin_field(dead) / fin_global(dead): seen = seen * 10 + (what is there now is dead ? 1 : 2)
+        FunctionBuilder Finalizer(string name, Action<FunctionBuilder, int> current)
+        {
+            var fin = new FunctionBuilder(name, IrType.Unit) { Unsafe = true };
+            int dead = fin.Argument(gcPoint, "dead");
+            int now = fin.Local(gcPoint, "now", mutable: true);
+            current(fin, now);
+            int a = fin.Local(IrType.U64, "a", mutable: true), b = fin.Local(IrType.U64, "b", mutable: true);
+            int same = fin.Local(IrType.Bool, "same", mutable: true), bit = fin.Local(IrType.I32, "bit", mutable: true);
+            int seen = fin.Local(IrType.I32, "seen", mutable: true);
+            fin.Assign(a, Rvalue.Cast(Copy(now), IrType.U64)).Assign(b, Rvalue.Cast(Copy(dead), IrType.U64))
+               .Assign(same, Rvalue.Binary(BinaryOp.Eq, Copy(a), Copy(b)))
+               .Assign(bit, Rvalue.Cast(Copy(same), IrType.I32))
+               .Assign(seen, new GlobalRvalue(1))
+               .Assign(seen, Rvalue.Binary(BinaryOp.Mul, Copy(seen), Int(10)))
+               .Assign(seen, Rvalue.Binary(BinaryOp.Add, Copy(seen), Int(2)))
+               .Assign(seen, Rvalue.Binary(BinaryOp.Sub, Copy(seen), Copy(bit)))
+               .StoreGlobal(1, Copy(seen))
+               .Return();
+            return fin;
+        }
+        var finField = Finalizer("fin_field", (fin, now) =>
+        {
+            int holder = fin.Local(gcHolder, "holder", mutable: true);
+            fin.Assign(holder, new GlobalRvalue(0)).Assign(now, Copy(new Place(holder).Deref().Field(0)));
+        });
+        var finGlobal = Finalizer("fin_global", (fin, now) => fin.Assign(now, new GlobalRvalue(2)));
+
+        // make_field(x) / make_global(x): a counted Point {x, x} with that finalizer.
+        FunctionBuilder Maker(string name, int finalizer)
+        {
+            var make = new FunctionBuilder(name, gcPoint);
+            int x = make.Argument(IrType.I32, "x");
+            int p = make.Local(Point, "p", mutable: true);
+            int f = make.Local(new FunctionType([gcPoint], IrType.Unit), "finalizer", mutable: true);
+            make.Assign(new Place(p).Field(0), Copy(x)).Assign(new Place(p).Field(1), Copy(x))
+                .Assign(f, new FunctionRefRvalue(finalizer, []))
+                .Assign(FunctionBuilder.ReturnPlace, new AllocRvalue(AllocKind.Gc, Move(p), Copy(f)))
+                .Return();
+            return make;
+        }
+        var makeField = Maker("make_field", 0);
+        var makeGlobal = Maker("make_global", 1);
+
+        var main = new FunctionBuilder("rc_store_order", IrType.I32) { Unsafe = true };
+        int c = main.Local(gcPoint, "c", mutable: true);
+        int value = main.Local(holderType, "value", mutable: true);
+        int holder = main.Local(gcHolder, "holder", mutable: true);
+        int[] next = [.. Enumerable.Range(0, 4).Select(_ => main.NewBlock())];
+        main.Call(2, [Int(1)], c, next[0]);
+        main.At(next[0]).Assign(new Place(value).Field(0), Move(c)).Assign(new Place(value).Field(1), Int(0))
+            .Assign(holder, new AllocRvalue(AllocKind.Gc, Move(value))).StoreGlobal(0, Copy(holder))
+            .Call(2, [Int(2)], c, next[1]);
+        // Point 1 dies here: its finalizer must find Point 2 in the field.
+        main.At(next[1]).Assign(new Place(holder).Deref().Field(0), Move(c)).Call(3, [Int(3)], c, next[2]);
+        main.At(next[2]).StoreGlobal(2, Move(c)).Call(3, [Int(4)], c, next[3]);
+        // Point 3 dies here: its finalizer must find Point 4 in the global.
+        main.At(next[3]).StoreGlobal(2, Move(c)).Assign(FunctionBuilder.ReturnPlace, new GlobalRvalue(1)).Return();
+
+        return new IrModule(GcPrograms.StructDefs, [finField.Build(), finGlobal.Build(), makeField.Build(), makeGlobal.Build(), main.Build()])
+            { Globals = [new GlobalDef("holder", gcHolder), new GlobalDef("seen", IrType.I32), new GlobalDef("g", gcPoint)] };
+    }
+
     public static IrModule RegionProgram()
     {
         var f = new FunctionBuilder("in_region", IrType.I32);
