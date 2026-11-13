@@ -35,7 +35,15 @@ namespace Larva.Hir.Lowering
         private Rvalue Arithmetic(BinaryOp op, Operand left, Operand right, IrType type)
         {
             if (type is Larva.IR.PointerType pointer)
-                return PointerOffset(op, left, right, pointer);
+            {
+                if (op is not (BinaryOp.Eq or BinaryOp.Ne or BinaryOp.Lt or BinaryOp.Le or BinaryOp.Gt or BinaryOp.Ge))
+                    return PointerOffset(op, left, right, pointer);
+                // Two references that are raw pointers (manual memory): the same object when the addresses are equal.
+                int leftAddress = Temp(IrType.U64), rightAddress = Temp(IrType.U64);
+                b.Unsafe = true;
+                b.Assign(leftAddress, Rvalue.Cast(left, IrType.U64)).Assign(rightAddress, Rvalue.Cast(right, IrType.U64));
+                return Rvalue.Binary(op, Operand.Copy(leftAddress), Operand.Copy(rightAddress));
+            }
             if (!overflowChecks || !type.IsInteger || op is not (BinaryOp.Add or BinaryOp.Sub or BinaryOp.Mul))
                 return Rvalue.Binary(op, left, right);
             int a = Temp(type), c = Temp(type), r = Temp(type), bad = Temp(IrType.Bool);
