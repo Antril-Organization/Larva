@@ -261,6 +261,41 @@ public sealed unsafe class AotTests : CheckedTest
     }
 
     /// <summary>
+    /// A program compiled in partitions (one object per thread): a small function another partition defines is copied
+    /// (available_externally) into the partitions that call it, so LLVM can inline it across them; large functions are not
+    /// copied, the copies leave no second definition (the executable links) and the result is the same.
+    /// </summary>
+    [Fact]
+    public void Llvm_partitions_copy_small_callees_for_inlining()
+    {
+        const int fillers = 400;
+        var module = NativePrograms.WideProgram(fillers);
+        var owner = ParallelCodegen.Assign(module, 2);
+        var copies = ParallelCodegen.Copies(module, owner, 2);
+        int other = 1 - owner[0];
+        Check("the partition without twice copies it (its fillers call it), the owner does not",
+            copies[other].Contains(0) && !copies[owner[0]].Contains(0), $"owner {owner[0]}: {string.Join(", ", copies[other])} | {string.Join(", ", copies[owner[0]])}");
+        Check("fillers and main are too large to copy", copies.All(c => c.All(f => f == 0)), string.Join(", ", copies.SelectMany(c => c)));
+
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        var linked = Linker.Link([LinkerPrograms.Object(module)], new LinkOptions { Entry = "wide::wide_main", LowerToIl = false });
+        Check("wide links", linked.Success, string.Join(" | ", linked.Errors));
+        if (!linked.Success)
+            return;
+        var objects = LlvmBackend.CompileObjects(linked, new LlvmOptions { OptimizationLevel = 2 }, Directory, "wide");
+        Check($"{fillers + 2} functions compile in partitions", objects.Objects is { Count: > 1 } || Environment.ProcessorCount < 2, objects.Error ?? $"{objects.Objects?.Count} objects");
+        string exe = Path.Combine(Directory, "wide-llvm.exe");
+        var (built, message) = ExecutableBuilder.Build(linked, exe, new ExecutableOptions { Compilation = CompilationOptions.Default });
+        Check("llvm: wide.exe built (one definition of twice)", built, message);
+        if (!built)
+            return;
+        var (exit, output, errors) = Execute(exe);
+        Check($"llvm: wide.exe = {NativePrograms.WideExpected(fillers)}", exit == 0 && output.Trim() == NativePrograms.WideExpected(fillers).ToString(),
+            $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
+    /// <summary>
     /// Mixed GC domains: an object promoted out of the nursery keeps its header's domain byte (worker_promote and evacuate
     /// rebuilt the header without it: retain and release then counted an uncounted object, or stopped counting a counted
     /// one). The in-process runtime of the linker tests is not larva_rt.c: this runs the program as an executable.

@@ -154,13 +154,20 @@ namespace Larva.Llvm
         /// <summary>Which functions get a body here (the others are declared: another object defines them); null: all.</summary>
         private readonly Func<int, bool>? defines;
 
+        /// <summary>
+        /// Functions another object defines whose body is copied here too, as <c>available_externally</c>, so LLVM can
+        /// inline them (see <see cref="ParallelCodegen"/>); null: none.
+        /// </summary>
+        private readonly Func<int, bool>? copies;
+
         /// <summary>One object among several of a program: its Larva globals are link-once (each object defines the ones it uses).</summary>
         private readonly bool partitioned;
 
         public LlvmCodegen(IrModule module, GcConfig gc, bool noalias, string name, bool eliminateBoundsChecks = true, string? symbolPrefix = null,
             bool flagExceptions = false, LLVMContextRef? context = null, Func<int, bool>? defines = null, bool[]? compilable = null,
-            bool inlinePolls = true, bool stackRoots = true, bool threadLocalExceptions = false)
+            bool inlinePolls = true, bool stackRoots = true, bool threadLocalExceptions = false, Func<int, bool>? copies = null)
         {
+            this.copies = defines is null ? null : copies;
             this.threadLocalExceptions = threadLocalExceptions;
             this.inlinePolls = inlinePolls;
             this.stackRoots = stackRoots;
@@ -193,7 +200,7 @@ namespace Larva.Llvm
             for (int f = 0; f < module.Functions.Length; f++)
             {
                 // One object of several declares the rest when its code first names them.
-                if (compilable[f] && (defines is null || defines(f)))
+                if (compilable[f] && (defines is null || defines(f) || copies is not null && copies(f)))
                     Declare(f);
                 else if (!compilable[f])
                     Skipped[module.Functions[f].Name] = LlvmBackend.Supports(module.Functions[f], module)
@@ -203,8 +210,16 @@ namespace Larva.Llvm
             var mayCollect = Larva.IR.Analysis.Safepoints.MayCollect(module);
             for (int f = 0; f < module.Functions.Length; f++)
             {
-                if (functions[f].Handle != IntPtr.Zero && !module.Functions[f].IsDeclaration && (defines is null || defines(f)))
+                if (functions[f].Handle == IntPtr.Zero || module.Functions[f].IsDeclaration)
+                    continue;
+                if (defines is null || defines(f))
                     new FunctionEmitter(this, module.Functions[f], functions[f]) { EntryPoll = entryPolls[f], MayCollect = mayCollect[f] }.Emit();
+                else if (copies is not null && copies(f))
+                {
+                    // A copy for inlining only: LLVM drops its body after optimization (the owner's object defines it).
+                    new FunctionEmitter(this, module.Functions[f], functions[f]) { EntryPoll = entryPolls[f], MayCollect = mayCollect[f] }.Emit();
+                    functions[f].Linkage = LLVMLinkage.LLVMAvailableExternallyLinkage;
+                }
             }
         }
 
@@ -1036,6 +1051,10 @@ namespace Larva.Llvm
                     AddParameterAttribute(functions[index], -1, "optsize");
                 }
             }
+            // A body that never returns (it only throws, panics or loops): `noreturn` on the declaration too, so callers in
+            // other objects of a partitioned program know their failure paths end there (LLVM infers it only from a body).
+            if (!function.IsDeclaration && function.Blocks.Length > 0 && !function.Blocks.Any(x => x.Terminator is ReturnTerminator))
+                AddParameterAttribute(functions[index], -1, "noreturn");
             // The borrow checker guarantees what `noalias` promises: no other access while a borrow is alive.
             if (noalias)
             {
