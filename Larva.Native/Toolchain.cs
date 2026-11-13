@@ -107,7 +107,7 @@ namespace Larva.Native
         /// </summary>
         private (string[]? Libraries, string Log) SystemLibraries()
         {
-            string target = Path.Combine(CacheFolder, $"ntdll-crt-{Hash(NtdllExports + VcVars)}.lib");
+            string target = Path.Combine(CacheFolder, $"ntdll-crt-{Hash(NtdllExports + VcVars + InstallationStamp())}.lib");
             if (!File.Exists(target))
             {
                 Directory.CreateDirectory(CacheFolder);
@@ -182,7 +182,7 @@ namespace Larva.Native
         private (string? Path, string Log) CachedRuntime()
         {
             string source = RuntimeSource();
-            string target = Path.Combine(CacheFolder, $"larva_rt-{Hash(source + RuntimeFlags + VcVars)}.obj");
+            string target = Path.Combine(CacheFolder, $"larva_rt-{Hash(source + RuntimeFlags + VcVars + InstallationStamp())}.obj");
             if (File.Exists(target))
                 return (target, "");
             Directory.CreateDirectory(CacheFolder);
@@ -218,12 +218,11 @@ namespace Larva.Native
         {
             if (developer is not null)
                 return developer;
-            string stamp = File.Exists(VcVars) ? File.GetLastWriteTimeUtc(VcVars).Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture) : "";
-            string file = Path.Combine(CacheFolder, $"vcvars-{Hash(VcVars + stamp)}.env");
+            string file = Path.Combine(CacheFolder, $"vcvars-{Hash(VcVars + InstallationStamp())}.env");
             string text;
-            if (File.Exists(file))
+            if (File.Exists(file) && File.ReadAllText(file) is { } cached && Find(Parse(cached), "cl.exe") is not null)
             {
-                text = File.ReadAllText(file);
+                text = cached;
             }
             else
             {
@@ -254,6 +253,13 @@ namespace Larva.Native
                     // Kept by another build, or not at all: this one has it.
                 }
             }
+            var variables = Parse(text);
+            return developer = variables.ContainsKey("PATH") && variables.ContainsKey("INCLUDE") ? variables : null;
+        }
+
+        /// <summary>The output of <c>set</c> as variables.</summary>
+        private static Dictionary<string, string> Parse(string text)
+        {
             var variables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var line in text.Split('\n'))
             {
@@ -261,7 +267,29 @@ namespace Larva.Native
                 if (equals > 0)
                     variables[line[..equals]] = line[(equals + 1)..].TrimEnd('\r');
             }
-            return developer = variables.ContainsKey("PATH") && variables.ContainsKey("INCLUDE") ? variables : null;
+            return variables;
+        }
+
+        /// <summary>
+        /// What identifies the installed toolchain, for the cached environment: vcvars64.bat's last write and size, and
+        /// the default tools version next to it (<c>Microsoft.VCToolsVersion.default.txt</c>: it changes with every update,
+        /// vcvars64.bat itself usually does not). The environment names the tools' folders, so it goes stale with them.
+        /// </summary>
+        private string InstallationStamp()
+        {
+            var stamp = new System.Text.StringBuilder();
+            if (File.Exists(VcVars))
+            {
+                var info = new FileInfo(VcVars);
+                stamp.Append(info.LastWriteTimeUtc.Ticks).Append(':').Append(info.Length);
+                foreach (var name in new[] { "Microsoft.VCToolsVersion.default.txt", "Microsoft.VCRedistVersion.default.txt" })
+                {
+                    string version = Path.Combine(info.DirectoryName ?? "", name);
+                    if (File.Exists(version))
+                        stamp.Append(':').Append(File.ReadAllText(version).Trim()).Append(':').Append(File.GetLastWriteTimeUtc(version).Ticks);
+                }
+            }
+            return stamp.ToString();
         }
 
         // ── Native libraries (DLLs) ─────────────────────────────
