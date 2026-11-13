@@ -202,7 +202,7 @@ namespace Larva.IR.Encoding
         {
             string name = ReadName(ref reader);
             var type = ReadType(ref reader);
-            int flags = ReadCount(ref reader);
+            int flags = ReadInt(ref reader, "global flags");
             var linkage = (Linkage)(flags >> 1 & 3);
             string? symbol = linkage == Linkage.Import ? ReadName(ref reader) : null;
             System.Numerics.BigInteger? initial = (flags & 1) != 0 ? reader.ReadSignedBig(type.BitWidth ?? 512) : null;
@@ -571,7 +571,7 @@ namespace Larva.IR.Encoding
                 case IrFormat.ExtendedFixedArray:
                 {
                     var element = ReadType(ref reader);
-                    int count = ReadCount(ref reader);
+                    int count = ReadInt(ref reader, "array length");
                     var sizeOf = reader.ReadNibble() != 0 ? ReadType(ref reader) : null;
                     return new FixedArrayType(element, count, sizeOf);
                 }
@@ -645,7 +645,7 @@ namespace Larva.IR.Encoding
                 case IrFormat.ConstraintNot:
                     return new NotConstraint(ReadConstraint(ref reader));
                 case IrFormat.ConstraintSize:
-                    return new SizeAtMostConstraint(ReadCount(ref reader));
+                    return new SizeAtMostConstraint(ReadInt(ref reader, "size constraint"));
                 default:
                     throw new InvalidDataException($"Unknown constraint tag {tag} at nibble {reader.Position}.");
             }
@@ -667,7 +667,16 @@ namespace Larva.IR.Encoding
             return System.Text.Encoding.UTF8.GetString(bytes);
         }
 
-        /// <summary>Reads an unsigned varint used as a count or index, rejecting values that cannot be valid.</summary>
+        /// <summary>Reads an unsigned varint that is a value (a length, a size, flags), not an index or count of the stream: anything that fits an int.</summary>
+        internal static int ReadInt(ref NibbleReader reader, string what)
+        {
+            ulong value = reader.ReadUnsigned();
+            if (value > int.MaxValue)
+                throw new InvalidDataException($"{what} {value} at nibble {reader.Position} does not fit.");
+            return (int)value;
+        }
+
+        /// <summary>Reads an unsigned varint used as a count or index into the stream, rejecting values that cannot be valid.</summary>
         internal static int ReadCount(ref NibbleReader reader)
         {
             ulong value = reader.ReadUnsigned();

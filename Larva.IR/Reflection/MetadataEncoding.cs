@@ -90,8 +90,8 @@ namespace Larva.IR.Reflection
             TypeLayout? layout = null;
             if (reader.ReadNibble() != 0)
             {
-                int size = IrDecoder.ReadCount(ref reader);
-                int align = IrDecoder.ReadCount(ref reader);
+                int size = IrDecoder.ReadInt(ref reader, "layout size");
+                int align = IrDecoder.ReadInt(ref reader, "layout alignment");
                 var flags = (WitnessFlags)reader.ReadNibble();
                 layout = new TypeLayout(size, align, flags, ReadInts(ref reader));
             }
@@ -191,9 +191,10 @@ namespace Larva.IR.Reflection
 
         private static int[] ReadInts(ref NibbleReader reader)
         {
+            // Byte offsets: values, not indexes into the stream.
             var values = new int[IrDecoder.ReadCount(ref reader)];
             for (int i = 0; i < values.Length; i++)
-                values[i] = IrDecoder.ReadCount(ref reader);
+                values[i] = IrDecoder.ReadInt(ref reader, "offset");
             return values;
         }
     }

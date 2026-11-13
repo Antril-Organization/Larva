@@ -332,7 +332,7 @@ namespace Larva.IR.Lowering
             {
                 bool isArgument = reader.ReadNibble() != 0;
                 int slot = Count(ref reader);
-                int[]? offsets = reader.ReadNibble() != 0 ? ReadInts(ref reader) : null;
+                int[]? offsets = reader.ReadNibble() != 0 ? ReadValues(ref reader) : null;
                 roots[i] = new GcRoot(isArgument, slot, offsets);
             }
             return roots;
@@ -348,9 +348,9 @@ namespace Larva.IR.Lowering
 
         private static TypeLayout ReadLayout(ref NibbleReader reader)
         {
-            int size = Count(ref reader), align = Count(ref reader);
+            int size = IrDecoder.ReadInt(ref reader, "layout size"), align = IrDecoder.ReadInt(ref reader, "layout alignment");
             var flags = (WitnessFlags)reader.ReadNibble();
-            return new TypeLayout(size, align, flags, ReadInts(ref reader));
+            return new TypeLayout(size, align, flags, ReadValues(ref reader));
         }
 
         private static void WriteInts(NibbleWriter writer, int[] values)
@@ -360,11 +360,21 @@ namespace Larva.IR.Lowering
                 writer.WriteUnsigned((ulong)value);
         }
 
+        /// <summary>Indexes (type tokens).</summary>
         private static int[] ReadInts(ref NibbleReader reader)
         {
             var values = new int[Count(ref reader)];
             for (int i = 0; i < values.Length; i++)
                 values[i] = Count(ref reader);
+            return values;
+        }
+
+        /// <summary>Values (byte offsets): not bounded by the stream's size.</summary>
+        private static int[] ReadValues(ref NibbleReader reader)
+        {
+            var values = new int[Count(ref reader)];
+            for (int i = 0; i < values.Length; i++)
+                values[i] = IrDecoder.ReadInt(ref reader, "offset");
             return values;
         }
 

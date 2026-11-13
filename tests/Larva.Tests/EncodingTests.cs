@@ -63,4 +63,21 @@ public sealed class EncodingTests : CheckedTest
         var constants = read.Functions[0].Blocks[0].Statements.OfType<AssignStatement>().Select(s => ((UseRvalue)s.Value).Operand).OfType<ConstOperand>().Select(o => o.Bits).ToArray();
         Check("the bits are exact", constants.SequenceEqual([ulong.MaxValue, U128Max, long.MinValue, U256Max]), string.Join(", ", constants));
     }
+
+    [Fact]
+    public void Array_types_of_100000_elements_and_large_constraints_survive_the_ir_encoding()
+    {
+        var buffer = new StructDef("Buffer", new FixedArrayType(IrType.U8, 100_000)) { FieldNames = ["bytes"] };
+        var holder = new StructDef("Holder", IrType.U8) { Generics = [new GenericParam("T", new SizeAtMostConstraint(100_000))] };
+        var main = new FunctionBuilder("main", IrType.U64);
+        int local = main.Local(new FixedArrayType(IrType.U8, 100_000), "big");
+        main.Assign(FunctionBuilder.ReturnPlace, Rvalue.SizeOf(new FixedArrayType(IrType.U8, 100_000))).Return();
+        var module = new IrModule([buffer, holder], [main.Build()]) { Name = "arrays", Globals = [new GlobalDef("g", IrType.U8) { GenericCount = 300 }] };
+        var read = RoundTrip(module);
+        Check("a [u8; 100000] field, local and sizeof read back", read.ToString() == module.ToString(), read.ToString());
+        Check("the field's length is 100000", read.Structs[0].Fields[0] is FixedArrayType { Count: 100_000 });
+        Check("a size constraint of 100000 bits reads back", read.Structs[1].Generics[0].Constraint is SizeAtMostConstraint { Bits: 100_000 });
+        Check("a global with 300 type parameters reads back", read.Globals[0].GenericCount == 300, $"{read.Globals[0].GenericCount}");
+        Check("the local's type is kept", read.Functions[0].Locals[local].Type is FixedArrayType { Count: 100_000 });
+    }
 }
