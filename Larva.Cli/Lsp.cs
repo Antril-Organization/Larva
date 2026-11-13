@@ -304,8 +304,13 @@ internal sealed class LspServer
                 return true;
             }
             case "workspace/didChangeWatchedFiles":
-                // A .queen or source file changed on disk: projects are read again, open documents analyzed again.
-                Reload();
+                // A .queen changed, or a file added or removed: projects are read again, open documents analyzed again.
+                // Only sources changed (saved): the projects stay as they are (they name the same files), the open
+                // documents are analyzed again (their languages read the other sources from disk).
+                if (NeedsReload(parameters?["changes"] as JsonArray))
+                    Reload();
+                else
+                    Refresh();
                 return true;
             case "textDocument/didSave":
                 // A project file saved in the editor: what it allows (the borrow checker, the default access…) applies now,
@@ -479,6 +484,7 @@ internal sealed class LspServer
         if (SourceBuild.CoreLibrary(coreFolder, noCache: false, out _, out string? corePath) is not { } bytes)
             return null;
         coreKey = "core|" + (corePath ?? "data");
+        coreBytes = bytes;
         // System.Bindings too: a binding profile is analyzed against what it derives from.
         bindingsBytes = BindProfile.BindingsLibrary(bytes, out string? bindingsPath, quiet: true);
         bindings = bindingsBytes is not null
@@ -486,6 +492,9 @@ internal sealed class LspServer
             : null;
         return core = SourceBuild.CoreReference(bytes, corePath);
     }
+
+    /// <summary>System.Core itself, as read with <see cref="core"/>: linked into the background borrow check (read again only on a reload).</summary>
+    private byte[]? coreBytes;
 
     /// <summary>System.Bindings (when there is one), given to every analysis with System.Core.</summary>
     private JsonObject? bindings;
@@ -669,6 +678,61 @@ internal sealed class LspServer
             Changed(openUri, openText);
     }
 
+    /// <summary>Every open source analyzed again (a source of theirs changed on disk), with the projects and libraries as they are.</summary>
+    private void Refresh()
+    {
+        foreach (var (openUri, openText) in documents.ToList())
+        {
+            if (!IsQueen(openUri))
+                Changed(openUri, openText);
+        }
+    }
+
+    /// <summary>
+    /// Whether watched files changed so that the projects must be read again: a `.queen` (created, changed or deleted), a
+    /// file created or deleted (a project's patterns may name it), anything that is not a source (or that is not said),
+    /// or a source of System.Core or System.Bindings (the libraries are compiled again). A source only changed does not.
+    /// </summary>
+    private bool NeedsReload(JsonArray? changes)
+    {
+        if (changes is null || changes.Count == 0)
+            return true;
+        foreach (var change in changes)
+        {
+            if (change?["uri"]?.GetValue<string>() is not { } uri || change["type"]?.GetValue<int>() != 2)
+                return true;
+            string path = PathOf(uri);
+            if (IsQueen(uri) || !uri.StartsWith("file:", StringComparison.OrdinalIgnoreCase) || !LanguageRegistry.IsSource(path))
+                return true;
+            string full = Path.GetFullPath(path);
+            if (LibrarySourceFolders().Any(folder => full.StartsWith(folder, StringComparison.OrdinalIgnoreCase)))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>The folders of System.Core's and System.Bindings' sources when this larva compiles them from sources (a working copy).</summary>
+    private List<string> LibrarySourceFolders() => librarySourceFolders ??= FindLibrarySourceFolders();
+
+    private List<string>? librarySourceFolders;
+
+    private List<string> FindLibrarySourceFolders()
+    {
+        var folders = new List<string>();
+        void Add(string? folder)
+        {
+            if (folder is not null && Directory.Exists(folder))
+                folders.Add(Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder)) + Path.DirectorySeparatorChar);
+        }
+        Add(coreFolder ?? Environment.GetEnvironmentVariable("LARVA_CORE"));
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            Add(Path.Combine(dir.FullName, "Library", "System.Core"));
+            Add(Path.Combine(dir.FullName, "Library", "System.Bindings"));
+        }
+        return folders;
+    }
+
     /// <summary>A document's new text: kept, and the document analyzed a moment after its last change (<see cref="Debounce"/>).</summary>
     private void Changed(string uri, string text)
     {
@@ -734,20 +798,34 @@ internal sealed class LspServer
             sources.Add(path);
         var openInProject = documents.Keys.Where(u => sources.Contains(PathOf(u), StringComparer.OrdinalIgnoreCase)).ToList();
         var analyses = openInProject.ToDictionary(u => u, u => (JsonArray)(analysisDiagnostics.GetValueOrDefault(u) ?? []).DeepClone());
+        // The libraries as this thread read them (System.Core once, until a reload).
+        var libraries = new List<byte[]>();
+        if (coreBytes is not null)
+            libraries.Add(coreBytes);
+        if (bindingsBytes is not null)
+            libraries.Add(bindingsBytes);
         Task.Run(async () =>
         {
             await Task.Delay(400);
             if (generation != Volatile.Read(ref borrowGeneration))
                 return;
             IReadOnlyList<Larva.IR.Analysis.BorrowError> errors;
+            // One borrow check at a time: one that waited for another is not run when a newer edit came meanwhile.
+            await borrowChecking.WaitAsync();
             try
             {
-                errors = BorrowErrors(pack, project, sources, texts);
+                if (generation != Volatile.Read(ref borrowGeneration))
+                    return;
+                errors = BorrowErrors(pack, project, sources, texts, libraries);
             }
             catch (Exception e)
             {
                 Console.Error.WriteLine($"larva lsp: borrow check: {e.Message}");
                 return;
+            }
+            finally
+            {
+                borrowChecking.Release();
             }
             if (generation != Volatile.Read(ref borrowGeneration))
                 return;
@@ -780,9 +858,9 @@ internal sealed class LspServer
     }
 
     /// <summary>The program compiled as the editor has it, linked with its libraries, lowered, and its own functions borrow checked.</summary>
-    private IReadOnlyList<Larva.IR.Analysis.BorrowError> BorrowErrors(LanguagePack pack, Project project, List<string> sources, Dictionary<string, string> texts)
+    private IReadOnlyList<Larva.IR.Analysis.BorrowError> BorrowErrors(LanguagePack pack, Project project, List<string> sources, Dictionary<string, string> texts, List<byte[]> libraries)
     {
-        if (SourceBuild.CoreLibrary(coreFolder, noCache: false, out _, out _) is not { } coreBytes)
+        if (libraries.Count == 0)
             return Failed("System.Core not found");
         var references = project.References.Select(r => (JsonObject)r!.DeepClone()).ToList();
         var compiled = SourceBuild.Compile(pack, sources, "Program", references, texts: texts, options: project.Options, quiet: true);
@@ -790,11 +868,7 @@ internal sealed class LspServer
             return Failed("the program did not compile (its analysis found no error)");
         // The same libraries a build links: System.Core, System.Bindings (the analysis compiled against it, so the
         // program may reference it) and the project's assemblies.
-        var libraries = new List<byte[]> { coreBytes };
-        if (bindingsBytes is not null)
-            libraries.Add(bindingsBytes);
-        libraries.AddRange(project.Assemblies.Select(File.ReadAllBytes));
-        var linked = Larva.Hir.Linking.HirLinker.Link("Program", [.. libraries, programBytes]);
+        var linked = Larva.Hir.Linking.HirLinker.Link("Program", [.. libraries, .. project.Assemblies.Select(AssemblyBytes), programBytes]);
         if (!linked.Success)
             return Failed("link: " + string.Join("; ", linked.Errors));
         var lowered = Larva.Hir.Lowering.HirLowerer.Lower(linked.Assembly!, new Larva.Hir.Lowering.LoweringOptions
@@ -814,6 +888,22 @@ internal sealed class LspServer
             errors.AddRange(Larva.IR.Analysis.BorrowChecker.Check(function, module));
         }
         return errors;
+    }
+
+    /// <summary>One background borrow check at a time.</summary>
+    private readonly SemaphoreSlim borrowChecking = new(1, 1);
+
+    /// <summary>The project assemblies the borrow check links, as last read (read again when the file is written).</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime Written, long Length, byte[] Bytes)> assemblyBytes = new(StringComparer.OrdinalIgnoreCase);
+
+    private static byte[] AssemblyBytes(string path)
+    {
+        var file = new FileInfo(path);
+        if (assemblyBytes.TryGetValue(path, out var known) && known.Written == file.LastWriteTimeUtc && known.Length == file.Length)
+            return known.Bytes;
+        byte[] bytes = File.ReadAllBytes(path);
+        assemblyBytes[path] = (file.LastWriteTimeUtc, bytes.Length, bytes);
+        return bytes;
     }
 
     /// <summary>A background borrow check that could not run: said in the server's log (never silently nothing), no errors.</summary>
