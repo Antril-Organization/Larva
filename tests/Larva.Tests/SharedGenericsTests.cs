@@ -74,4 +74,38 @@ public sealed class SharedGenericsTests : CheckedTest
         var mixed = Layouts.Of(IrType.Struct(MixedStruct), module)!;
         Check("Mixed layout", mixed is { Size: 24, Align: 8, GcOffsets: [8] } && mixed.Flags.HasFlag(WitnessFlags.Managed), mixed.ToString());
     }
+
+    [Fact]
+    public void Layouts_place_handles_through_inline_arrays_and_measure_deep_nesting_once()
+    {
+        // Pair { u8, gc i32 }: 16 bytes, handle @8. Holder { i16, [Pair; 3], box i32, &i32 }: the array @8 (handles @16, 32,
+        // 48), the box @56, the reference @64: 72 bytes.
+        StructDef[] structs =
+        [
+            new("Pair", IrType.U8, IrType.Gc(IrType.I32)),
+            new("Holder", IrType.I16, new FixedArrayType(IrType.Struct(0), 3), IrType.Box(IrType.I32), IrType.Ref(IrType.I32)),
+        ];
+        var module = new IrModule(structs, []);
+        var holder = Layouts.Of(IrType.Struct(1), module)!;
+        Check("Holder layout", holder is { Size: 72, Align: 8, GcOffsets: [16, 32, 48] }, holder.ToString());
+        Check("Holder field offsets", Layouts.FieldOffsets((StructType)IrType.Struct(1), module) is [0, 8, 56, 64]);
+        var map = Layouts.PointerMap(IrType.Struct(1), module);
+        Check("Holder pointer map", map is { Handles: [16, 32, 48], Cells: [56], Ambiguous: true },
+            map is { } m ? $"[{string.Join(", ", m.Handles)}] [{string.Join(", ", m.Cells)}] {m.Ambiguous}" : "null");
+        Check("asked again: the same layout", Layouts.Of(IrType.Struct(1), module) is { Size: 72, GcOffsets: [16, 32, 48] });
+
+        // S0 { i32, i64 }, Sk { S(k-1), i64 }: 40 levels (measuring each field twice took 2^40 steps), and a 64 MB inline array.
+        List<StructDef> nested = [new("S0", IrType.I32, IrType.I64)];
+        for (int k = 1; k <= 40; k++)
+            nested.Add(new StructDef($"S{k}", IrType.Struct(k - 1), IrType.I64));
+        var deep = new IrModule([.. nested], []);
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var s40 = Layouts.Of(IrType.Struct(40), deep);
+        var bytes = Layouts.Of(new FixedArrayType(IrType.U8, 1 << 26), deep);
+        var handles = Layouts.PointerMap(new FixedArrayType(IrType.Struct(40), 1 << 20), deep);
+        Check("S40 is 16 + 8 * 40 bytes", s40 is { Size: 336, Align: 8, GcOffsets: [] }, s40?.ToString());
+        Check("[u8; 64 MB]", bytes is { Size: 1 << 26, Align: 1, GcOffsets: [] }, bytes?.ToString());
+        Check("[S40; 1 M] holds no handles", handles is { Handles: [], Cells: [], Ambiguous: false });
+        Check("measured at once", watch.ElapsedMilliseconds < 2000, $"{watch.ElapsedMilliseconds} ms");
+    }
 }

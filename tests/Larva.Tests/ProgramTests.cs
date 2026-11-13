@@ -322,6 +322,53 @@ public sealed class ProgramTests : CheckedTest
     }
 
     /// <summary>
+    /// Two chains of 1,000 conditions (<c>a &amp;&amp; b &amp;&amp; …</c>), the second starting where every block of the
+    /// first one fails to: the forward analyses run each block once (taken first in, first out, the join and the whole
+    /// second chain ran again for every edge into it: minutes). A move in the first block still reaches the join.
+    /// </summary>
+    [Fact]
+    public void Borrow_checker_and_lowering_solve_long_condition_chains_in_one_pass()
+    {
+        const int Terms = 1000;
+        IrFunction Chains(bool moveFirst)
+        {
+            var f = Fn(moveFirst ? "chains_moved" : "chains", IrType.I32);
+            int p = f.Argument(Owner, "p");
+            int x = f.Argument(IrType.I32, "x");
+            int q = f.Local(Owner, "q");
+            // A temporary per term, as a frontend lowers them: every block's state then holds thousands of locals.
+            var tests = Enumerable.Range(0, 2 * Terms).Select(_ => f.Temp(IrType.Bool)).ToArray();
+            var first = Enumerable.Range(0, Terms).Select(_ => f.NewBlock()).ToArray();
+            var second = Enumerable.Range(0, Terms).Select(_ => f.NewBlock()).ToArray();
+            int join = f.NewBlock(), yes = f.NewBlock(), no = f.NewBlock();
+            f.Goto(first[0]);
+            for (int i = 0; i < Terms; i++)
+            {
+                f.At(first[i]);
+                if (moveFirst && i == 0)
+                    f.Assign(q, Move(p));
+                f.Assign(tests[i], Rvalue.Binary(BinaryOp.Gt, Copy(x), Int(-i)));
+                f.If(Copy(tests[i]), i + 1 < Terms ? first[i + 1] : yes, join);
+            }
+            f.At(join).Assign(FunctionBuilder.ReturnPlace, Copy(new Place(p).Field(0))).Goto(second[0]);
+            for (int i = 0; i < Terms; i++)
+            {
+                f.At(second[i]).Assign(tests[Terms + i], Rvalue.Binary(BinaryOp.Lt, Copy(x), Int(i)));
+                f.If(Copy(tests[Terms + i]), i + 1 < Terms ? second[i + 1] : no, no);
+            }
+            f.At(yes).Assign(FunctionBuilder.ReturnPlace, Int(1)).Return();
+            f.At(no).Return();
+            return f.Build();
+        }
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Expect(Chains(moveFirst: true), BorrowErrorKind.UseOfMoved);
+        var compiled = Compiler.Compile(new IrModule(BorrowStructs, [Chains(moveFirst: false)]), new CompilationOptions { Entry = "" });
+        Check("the chains compile", compiled.Success, string.Join(" | ", compiled.TypeErrors.Concat<object>(compiled.Diagnostics).Take(4)));
+        Check("in seconds", watch.ElapsedMilliseconds < 30_000, $"{watch.ElapsedMilliseconds} ms");
+    }
+
+    /// <summary>
     /// A reference to a reference (or to a struct holding one) carries the loans of what it points at: what is read back
     /// through it (<c>*rr</c>, <c>(*h).field</c>) still borrows the original place, which can neither change nor die meanwhile.
     /// </summary>

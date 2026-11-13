@@ -26,6 +26,13 @@ namespace Larva.IR.Analysis
         private Dictionary<int, Dictionary<Place, UninitOrigin>> partial = [];
         private bool partialShared;
 
+        public MoveState()
+        {
+        }
+
+        /// <summary>A state with room for <paramref name="locals"/> whole locals (a function's: it never grows).</summary>
+        public MoveState(int locals) => whole = new UninitOrigin?[locals];
+
         public IEnumerable<KeyValuePair<Place, UninitOrigin>> Entries
         {
             get
@@ -51,7 +58,8 @@ namespace Larva.IR.Analysis
                 return;
             if (wholeShared || local >= whole.Length)
             {
-                var copy = new UninitOrigin?[Math.Max(local + 1, whole.Length)];
+                // Grows geometrically: filling a state local by local stays linear.
+                var copy = new UninitOrigin?[local < whole.Length ? whole.Length : Math.Max(local + 1, whole.Length * 2)];
                 Array.Copy(whole, copy, whole.Length);
                 whole = copy;
                 wholeShared = false;
@@ -306,7 +314,7 @@ namespace Larva.IR.Analysis
     {
         public MoveState Entry()
         {
-            MoveState state = new();
+            MoveState state = new(function.Locals.Length);
             for (int local = 0; local < function.Locals.Length; local++)
             {
                 if (!function.IsArgument(local))
