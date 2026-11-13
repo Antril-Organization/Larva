@@ -6,7 +6,7 @@ namespace Larva.Runtime.Vm
 {
     public sealed partial class Interpreter
     {
-        /// <summary><c>add</c>/<c>sub</c>/<c>mul</c>: integers (wrapped to the operand type), floats, or pointer ± offset.</summary>
+        /// <summary><c>add</c>/<c>sub</c>/<c>mul</c>: integers (wrapped to the operand type), floats, or pointer ± offset (64-bit integers are done in the loop).</summary>
         private Value Arithmetic(OpCode op, Value a, Value b)
         {
             if (a.Kind == ValueKind.Pointer && b.Kind == ValueKind.Int && op is OpCode.Add or OpCode.Sub)
@@ -26,6 +26,20 @@ namespace Larva.Runtime.Vm
         }
 
         private static double AsDouble(Value value) => value.Kind == ValueKind.Float ? value.Float : (double)Heap.AsInteger(value);
+
+        /// <summary><paramref name="type"/> when it is an integer type of 64 bits or less (its operations run on longs).</summary>
+        private static IrType? SmallType(IrType? type) => type is PrimitiveType p && Numbers.SmallInteger(p.Kind) ? type : null;
+
+        /// <summary>The order of two integers, bools or addresses held in 64 bits (false for wider ones, floats and others).</summary>
+        private static bool TryOrder(Value a, Value b, out int order)
+        {
+            order = 0;
+            if (a.Kind is ValueKind.Float or ValueKind.Deferred || b.Kind is ValueKind.Float or ValueKind.Deferred || !a.TryBits(out long x) || !b.TryBits(out long y))
+                return false;
+            bool highA = a.IsHighUnsigned, highB = b.IsHighUnsigned;
+            order = highA != highB ? (highA ? 1 : -1) : highA ? ((ulong)x).CompareTo((ulong)y) : x.CompareTo(y);
+            return true;
+        }
 
         /// <summary>Whether a float operation on these runs on wide bits (either operand an f128/f256).</summary>
         private static IrType? WideType(Value a, Value b) =>
@@ -100,7 +114,7 @@ namespace Larva.Runtime.Vm
                     _ => throw new VmException($"cmp.{condition} is not a boolean condition"),
                 };
             }
-            int order = Ordinal(a, b);
+            int order = TryOrder(a, b, out int small) ? small : Ordinal(a, b);
             return condition switch
             {
                 Condition.Eq => order == 0,
@@ -114,12 +128,13 @@ namespace Larva.Runtime.Vm
         }
 
         private static int Ordinal(Value a, Value b) =>
+            TryOrder(a, b, out int small) ? small :
             WideType(a, b) is { } wide ? SoftFloat.Compare(WideBits(a, wide), WideBits(b, wide), Numbers.FormatOf(wide)) ?? 0 :
             a.Kind == ValueKind.Float || b.Kind == ValueKind.Float
                 ? AsDouble(a).CompareTo(AsDouble(b))
                 : Heap.AsInteger(a).CompareTo(Heap.AsInteger(b));
 
-        private void Alu(List<Value> stack, AluOp op)
+        private void Alu(ValueStack stack, AluOp op)
         {
             switch (op)
             {
@@ -129,6 +144,11 @@ namespace Larva.Runtime.Vm
                     if (op == AluOp.Not && a.Kind == ValueKind.Bool)
                     {
                         stack.Add(Value.FromBool(!a.IsTrue));
+                        break;
+                    }
+                    if (SmallType(a.Type) is { } small && a.TryBits(out long bits))
+                    {
+                        stack.Add(Value.FromInt(unchecked(op switch { AluOp.Neg => -bits, AluOp.Not => ~bits, AluOp.Inc => bits + 1, _ => bits - 1 }), small));
                         break;
                     }
                     var v = Heap.AsInteger(a);
@@ -144,8 +164,13 @@ namespace Larva.Runtime.Vm
                         stack.Add(Value.FromBool(op switch { AluOp.And => a.IsTrue && b.IsTrue, AluOp.Or => a.IsTrue || b.IsTrue, _ => a.IsTrue ^ b.IsTrue }));
                         break;
                     }
-                    var (x, y) = (Heap.AsInteger(a), Heap.AsInteger(b));
                     var type = a.Type ?? b.Type;
+                    if (SmallType(type) is { } smallType && SmallAlu(op, a, b, smallType) is { } fast)
+                    {
+                        stack.Add(fast);
+                        break;
+                    }
+                    var (x, y) = (Heap.AsInteger(a), Heap.AsInteger(b));
                     int width = type?.BitWidth ?? 64;
                     var mask = (BigInteger.One << width) - 1;
                     // Shift and rotate amounts are masked by the operand width (`& 31`, `& 63`, `& 127`, `& 255`), the way
@@ -172,7 +197,52 @@ namespace Larva.Runtime.Vm
             }
         }
 
-        private void Fpu(List<Value> stack, FloatOp op)
+        /// <summary>
+        /// A binary <c>alu</c> operation on integers of 64 bits or less, on longs: bit operations and shifts on the bits,
+        /// shifts right and division on the exact values. Null when it needs the general path (an operand that is not held
+        /// in 64 bits, a rotate, a division that overflows a long).
+        /// </summary>
+        private static Value? SmallAlu(AluOp op, Value a, Value b, IrType type)
+        {
+            if (a.Kind is ValueKind.Float or ValueKind.Deferred || b.Kind is ValueKind.Float or ValueKind.Deferred || !a.TryBits(out long x) || !b.TryBits(out long y))
+                return null;
+            int width = type.BitWidth!.Value;
+            int shift = (int)(y & (width - 1));
+            long result;
+            switch (op)
+            {
+                case AluOp.Div or AluOp.Rem:
+                    if (a.IsHighUnsigned || b.IsHighUnsigned || x == long.MinValue && y == -1)
+                        return null;
+                    if (y == 0)
+                        throw new VmException("division by zero");
+                    result = op == AluOp.Div ? x / y : x % y;
+                    break;
+                case AluOp.And:
+                    result = x & y;
+                    break;
+                case AluOp.Or:
+                    result = x | y;
+                    break;
+                case AluOp.Xor:
+                    result = x ^ y;
+                    break;
+                case AluOp.Shl:
+                    result = x << shift;
+                    break;
+                case AluOp.Shr:
+                    result = a.IsHighUnsigned ? (long)((ulong)x >> shift) : x >> shift;
+                    break;
+                case AluOp.UShr:
+                    result = (long)((width == 64 ? (ulong)x : (ulong)x & ((1UL << width) - 1)) >> shift);
+                    break;
+                default:
+                    return null;
+            }
+            return Value.FromInt(result, type);
+        }
+
+        private void Fpu(ValueStack stack, FloatOp op)
         {
             if (op is FloatOp.Add or FloatOp.Sub or FloatOp.Mul or FloatOp.Div or FloatOp.Rem or FloatOp.Min or FloatOp.Max)
             {

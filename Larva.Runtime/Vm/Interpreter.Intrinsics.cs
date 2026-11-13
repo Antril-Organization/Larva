@@ -17,10 +17,10 @@ namespace Larva.Runtime.Vm
             switch (id)
             {
                 case 0:
-                    output.Write(Heap.AsInteger(Heap.Coerce(Pop(stack), IrType.I64)).ToString(CultureInfo.InvariantCulture));
+                    output.Write(Heap.AsLong(Heap.Coerce(Pop(stack), IrType.I64)).ToString(CultureInfo.InvariantCulture));
                     break;
                 case 1:
-                    output.Write(((ulong)Heap.AsInteger(Heap.Coerce(Pop(stack), IrType.U64))).ToString(CultureInfo.InvariantCulture));
+                    output.Write(((ulong)Heap.AsLong(Heap.Coerce(Pop(stack), IrType.U64))).ToString(CultureInfo.InvariantCulture));
                     break;
                 case 2:
                     output.Write(FormatFloat(Heap.Coerce(Pop(stack), IrType.F64).Float));
@@ -29,30 +29,14 @@ namespace Larva.Runtime.Vm
                     output.Write(Pop(stack).IsTrue ? "true" : "false");
                     break;
                 case 4:
-                {
-                    var text = Heap.AsAddress(Pop(stack));
-                    var (header, stride) = Heap.ArrayLayout(IrType.U16);
-                    long length = (long)Heap.AsInteger(Heap.Read(IrType.U64, text));
-                    var chars = new char[length];
-                    for (long i = 0; i < length; i++)
-                        chars[i] = (char)Heap.AsInteger(Heap.Read(IrType.U16, text.Plus(header + (int)i * stride)));
-                    output.Write(chars);
+                    output.Write(TextAt(Heap.AsAddress(Pop(stack))));
                     break;
-                }
                 case 5:
                     output.Write('\n');
                     break;
                 case 59:
-                {
-                    var text = Heap.AsAddress(Pop(stack));
-                    var (header, stride) = Heap.ArrayLayout(IrType.U8);
-                    long length = (long)Heap.AsInteger(Heap.Read(IrType.U64, text));
-                    var bytes = new byte[length];
-                    for (long i = 0; i < length; i++)
-                        bytes[i] = (byte)Heap.AsInteger(Heap.Read(IrType.U8, text.Plus(header + (int)i * stride)));
-                    output.Write(System.Text.Encoding.UTF8.GetString(bytes));
+                    output.Write(System.Text.Encoding.UTF8.GetString(Heap.ArrayBytes(Heap.AsAddress(Pop(stack)), IrType.U8, writable: false, out _)));
                     break;
-                }
                 case 6:
                     line = (options.Input ?? Console.In).ReadLine();
                     stack.Add(Value.FromInt(line?.Length ?? -1, IrType.I64));
@@ -96,7 +80,7 @@ namespace Larva.Runtime.Vm
                     stack.Add(Value.FromInt(Stats.Collections, IrType.I64));
                     break;
                 case 15:
-                    stack.Add(Value.FromInt(Heap.Live.Count(a => a.Kind == AllocationKind.Gc), IrType.I64));
+                    stack.Add(Value.FromInt(Heap.GcObjects.Count, IrType.I64));
                     break;
                 case 43:
                     stack.Add(Value.FromFloat(Math.Sqrt(PopDouble(stack)), IrType.F64));
@@ -190,12 +174,9 @@ namespace Larva.Runtime.Vm
                     var target = Heap.AsAddress(Pop(stack));
                     if (count > 0)
                     {
-                        // Through a copy: the ranges may overlap.
-                        var moved = new Value[count];
-                        for (long i = 0; i < count; i++)
-                            moved[i] = Heap.Read(IrType.U8, source.Plus(i));
-                        for (long i = 0; i < count; i++)
-                            Heap.Write(IrType.U8, target.Plus(i), moved[i]);
+                        // One span copy of the backing bytes (it handles overlapping ranges, like memmove).
+                        var from = Heap.ReadableBytes(source, count);
+                        from.CopyTo(Heap.WritableBytes(target, count));
                     }
                     break;
                 }
@@ -211,8 +192,26 @@ namespace Larva.Runtime.Vm
                     var right = Heap.AsAddress(Pop(stack));
                     var left = Heap.AsAddress(Pop(stack));
                     long order = 0;
-                    for (long i = 0; i < count && order == 0; i++)
-                        order = (long)Heap.Read(IrType.U8, left.Plus(i)).Int - (long)Heap.Read(IrType.U8, right.Plus(i)).Int;
+                    if (count > 0)
+                    {
+                        // The difference of the first bytes that differ; reading past either end is an error only when
+                        // the bytes before it are equal (what a byte-by-byte loop finds).
+                        var a = Heap.Get(left, "read");
+                        var b = Heap.Get(right, "read");
+                        long available = Math.Max(0, Math.Min(count, Math.Min(a.Length - (long)left.Offset, b.Length - (long)right.Offset)));
+                        var x = Heap.ReadableBytes(left, available);
+                        var y = Heap.ReadableBytes(right, available);
+                        int same = x.CommonPrefixLength(y);
+                        if (same < available)
+                        {
+                            order = x[same] - y[same];
+                        }
+                        else if (available < count)
+                        {
+                            Heap.Read(IrType.U8, left.Plus(available));
+                            Heap.Read(IrType.U8, right.Plus(available));
+                        }
+                    }
                     stack.Add(Value.FromInt(order, IrType.I64));
                     break;
                 }
@@ -242,15 +241,8 @@ namespace Larva.Runtime.Vm
         private string? environmentValue;
 
         /// <summary>A <c>str</c>'s text, from its units in memory.</summary>
-        private string TextAt(Address text)
-        {
-            var (header, stride) = Heap.ArrayLayout(IrType.U16);
-            long length = (long)Heap.AsInteger(Heap.Read(IrType.U64, text));
-            var chars = new char[length];
-            for (long i = 0; i < length; i++)
-                chars[i] = (char)Heap.AsInteger(Heap.Read(IrType.U16, text.Plus(header + (int)i * stride)));
-            return new string(chars);
-        }
+        private string TextAt(Address text) =>
+            new(System.Runtime.InteropServices.MemoryMarshal.Cast<byte, char>(Heap.ArrayBytes(text, IrType.U16, writable: false, out _)));
 
         private static long Status(Action action)
         {
@@ -288,11 +280,8 @@ namespace Larva.Runtime.Vm
                 }
                 case 20:
                 {
-                    var target = Heap.AsAddress(Pop(stack));
-                    var (header, stride) = Heap.ArrayLayout(IrType.U8);
-                    long length = (long)Heap.AsInteger(Heap.Read(IrType.U64, target));
-                    for (long i = 0; i < Math.Min(length, fileBuffer.Length); i++)
-                        Heap.Write(IrType.U8, target.Plus(header + (int)i * stride), Value.FromInt(fileBuffer[i], IrType.U8));
+                    var target = Heap.ArrayBytes(Heap.AsAddress(Pop(stack)), IrType.U8, writable: true, out long length);
+                    fileBuffer.AsSpan(0, (int)Math.Min(length, fileBuffer.Length)).CopyTo(target);
                     return true;
                 }
                 case 21:
@@ -300,11 +289,7 @@ namespace Larva.Runtime.Vm
                     bool append = PopLong(stack) != 0;
                     var source = Heap.AsAddress(Pop(stack));
                     string path = TextAt(Heap.AsAddress(Pop(stack)));
-                    var (header, stride) = Heap.ArrayLayout(IrType.U8);
-                    long length = (long)Heap.AsInteger(Heap.Read(IrType.U64, source));
-                    var data = new byte[length];
-                    for (long i = 0; i < length; i++)
-                        data[i] = (byte)Heap.AsInteger(Heap.Read(IrType.U8, source.Plus(header + (int)i * stride)));
+                    var data = Heap.ArrayBytes(source, IrType.U8, writable: false, out _).ToArray();
                     stack.Add(Value.FromInt(Status(() =>
                     {
                         using var file = new FileStream(path, append ? FileMode.Append : FileMode.Create, FileAccess.Write);
@@ -454,13 +439,12 @@ namespace Larva.Runtime.Vm
                     {
                         // A connection's read waits for the network: other threads of the program run meanwhile.
                         moved = Streams.IsSocket(handle) ? Blocking(() => Streams.Read(handle, buffer)) : Streams.Read(handle, buffer);
-                        for (long i = 0; i < moved; i++)
-                            Heap.Write(IrType.U8, array.Plus(header + (int)(offset + i) * stride), Value.FromInt(buffer[i], IrType.U8));
+                        if (moved > 0)
+                            buffer.AsSpan(0, (int)moved).CopyTo(Heap.WritableBytes(array.Plus(header + (int)offset * stride), moved));
                     }
                     else
                     {
-                        for (long i = 0; i < count; i++)
-                            buffer[i] = (byte)Heap.AsInteger(Heap.Read(IrType.U8, array.Plus(header + (int)(offset + i) * stride)));
+                        Heap.ReadableBytes(array.Plus(header + (int)offset * stride), count).CopyTo(buffer);
                         moved = Streams.Write(handle, buffer);
                     }
                     stack.Add(Value.FromInt(moved, IrType.I64));
@@ -511,24 +495,15 @@ namespace Larva.Runtime.Vm
         }
 
         /// <summary>A str argument (its length, then UTF-16 units) as text.</summary>
-        private string TextOf(Value value)
-        {
-            var text = Heap.AsAddress(value);
-            var (header, stride) = Heap.ArrayLayout(IrType.U16);
-            long length = (long)Heap.AsInteger(Heap.Read(IrType.U64, text));
-            var chars = new char[length];
-            for (long i = 0; i < length; i++)
-                chars[i] = (char)Heap.AsInteger(Heap.Read(IrType.U16, text.Plus(header + (int)i * stride)));
-            return new string(chars);
-        }
+        private string TextOf(Value value) => TextAt(Heap.AsAddress(value));
 
         /// <summary><c>GC.Collect()</c> asked for a collection: the next safepoint runs one.</summary>
         private bool collectRequested;
         private string formatted = "";
 
-        private long PopLong(List<Value> stack) => (long)Heap.AsInteger(Heap.Coerce(Pop(stack), IrType.I64));
+        private long PopLong(ValueStack stack) => Heap.AsLong(Heap.Coerce(Pop(stack), IrType.I64));
 
-        private double PopDouble(List<Value> stack) => Heap.Coerce(Pop(stack), IrType.F64).Float;
+        private double PopDouble(ValueStack stack) => Heap.Coerce(Pop(stack), IrType.F64).Float;
 
         /// <summary>Up to 15 significant digits, written like C's <c>%.15g</c> (what native code prints).</summary>
         internal static string FormatFloat(double value)

@@ -16,7 +16,7 @@ namespace Larva.Runtime.Vm
                 {
                     var type = frame.Resolve(a0);
                     var allocation = Heap.Allocate(AllocationKind.Gc, type);
-                    allocation.Region = regions.Count > 0 ? regions.Peek().Instance : null;
+                    Heap.PlaceInRegion(allocation, regions.Count > 0 ? regions.Peek().Instance : null);
                     allocation.Domain = frame.Function.Domain;
                     allocation.Counted = il.Counts(frame.Function.Domain);
                     Heap.Write(type, new Address(allocation.Id, 0), Pop(stack));
@@ -31,7 +31,7 @@ namespace Larva.Runtime.Vm
                     var allocation = Heap.Allocate(AllocationKind.Gc, type);
                     allocation.Domain = frame.Function.Domain;
                     allocation.Counted = il.Counts(frame.Function.Domain);
-                    allocation.Region = regions.Count > 0 ? regions.Peek().Instance : null;
+                    Heap.PlaceInRegion(allocation, regions.Count > 0 ? regions.Peek().Instance : null);
                     allocation.Finalizer = finalizer.Kind == ValueKind.Function ? finalizer.Function : FunctionOf(Heap.AsInteger(finalizer));
                     Heap.Write(type, new Address(allocation.Id, 0), Pop(stack));
                     allocatedSinceCollect++;
@@ -79,7 +79,7 @@ namespace Larva.Runtime.Vm
                 {
                     var element = frame.Resolve(a0);
                     var array = Heap.AllocateArray(AllocationKind.Gc, element, Heap.AsInteger(Pop(stack)));
-                    array.Region = regions.Count > 0 ? regions.Peek().Instance : null;
+                    Heap.PlaceInRegion(array, regions.Count > 0 ? regions.Peek().Instance : null);
                     array.Domain = frame.Function.Domain;
                     array.Counted = il.Counts(frame.Function.Domain);
                     allocatedSinceCollect++;
@@ -90,7 +90,7 @@ namespace Larva.Runtime.Vm
                 {
                     var owner = frame.Resolve(a0) as StructType ?? throw new VmException("newtrail needs a struct");
                     var made = Heap.AllocateTrailing(AllocationKind.Gc, owner, Heap.AsInteger(Pop(stack)));
-                    made.Region = regions.Count > 0 ? regions.Peek().Instance : null;
+                    Heap.PlaceInRegion(made, regions.Count > 0 ? regions.Peek().Instance : null);
                     made.Domain = frame.Function.Domain;
                     made.Counted = il.Counts(frame.Function.Domain);
                     allocatedSinceCollect++;
@@ -127,7 +127,7 @@ namespace Larva.Runtime.Vm
         private void ExitRegion()
         {
             int region = regions.Pop().Instance;
-            var dying = Heap.Live.Where(x => x.Kind == AllocationKind.Gc && x.Region == region).ToList();
+            var dying = Heap.TakeRegion(region);
             // Finalizers first, while everything in the region is still there for them to read.
             foreach (var allocation in dying)
                 Finalize(allocation);
@@ -226,7 +226,9 @@ namespace Larva.Runtime.Vm
         {
             Stats.Collections++;
             allocatedSinceCollect = 0;
-            foreach (var allocation in Heap.Live)
+            // Only the live gc objects and the memory scanned for handles are visited, never every allocation.
+            var objects = Heap.GcObjects;
+            foreach (var allocation in objects)
                 allocation.Marked = false;
 
             foreach (var frame in callStack)
@@ -234,11 +236,10 @@ namespace Larva.Runtime.Vm
                 var roots = frame.Function.Safepoints.FirstOrDefault(s => s.Operation == frame.Pc).Roots ?? frame.Function.GcRoots;
                 foreach (var root in roots)
                 {
-                    var slot = root.IsArgument ? frame.Arguments[root.Slot] : frame.Locals[root.Slot];
                     var type = root.IsArgument ? frame.ArgumentTypes[root.Slot] : frame.LocalTypes[root.Slot];
                     var offsets = root.Offsets ?? Heap.LayoutOf(type).GcOffsets;
                     foreach (int offset in offsets)
-                        Mark(Heap.AsAddress(Heap.Read(IrType.U64, slot.Plus(offset))));
+                        Mark(Address.Unpack(frame.SlotWord(root.IsArgument, root.Slot, offset)));
                 }
                 foreach (var value in frame.Stack)
                     MarkValue(value);
@@ -246,21 +247,30 @@ namespace Larva.Runtime.Vm
                     MarkValue(exception);
             }
 
-            foreach (var allocation in Heap.Live.ToList())
+            foreach (var allocation in objects)
             {
-                if (allocation.Kind == AllocationKind.Gc && allocation.Pins > 0)
-                    Mark(new Address(allocation.Id, 0));
-                else if (allocation.Kind is AllocationKind.Heap or AllocationKind.Buffer || allocation.Kind == AllocationKind.Static && !allocation.Sealed)
-                    ScanContents(allocation); // heap cells and globals
+                if (allocation.Pins > 0 && !allocation.Marked)
+                {
+                    allocation.Marked = true;
+                    markWork.Push(allocation);
+                }
             }
+            Drain();
+            foreach (var allocation in Heap.Scanned)
+            {
+                if (allocation.Kind is AllocationKind.Heap || allocation.Kind == AllocationKind.Static && !allocation.Sealed)
+                    ScanContents(allocation); // heap cells and globals (invoke buffers are untyped bytes)
+            }
+            Drain();
 
             // Unreachable objects with a finalizer survive this collection (with what they reach): their finalizers run
             // after the sweep, and a later collection frees them once they are unreachable again.
-            var finalizing = Heap.Live.Where(a => a.Kind == AllocationKind.Gc && !a.Marked && a.Region is null && a.Finalizer is not null).ToList();
+            var finalizing = objects.Where(a => !a.Marked && a.Region is null && a.Finalizer is not null).OrderBy(a => a.Id).ToList();
             foreach (var allocation in finalizing)
                 Mark(new Address(allocation.Id, 0));
 
-            foreach (var allocation in Heap.Live.Where(a => a.Kind == AllocationKind.Gc && !a.Marked && a.Region is null).ToList())
+            var dead = objects.Where(a => !a.Marked && a.Region is null).ToList();
+            foreach (var allocation in dead)
             {
                 Heap.Free(new Address(allocation.Id, 0), "collect");
                 Stats.Reclaimed++;
@@ -311,29 +321,42 @@ namespace Larva.Runtime.Vm
                 ScanContents(markWork.Pop());
         }
 
-        /// <summary>Queues every handle stored in <paramref name="allocation"/> (an object, array, heap cell or global).</summary>
+        /// <summary>Where an allocation of <paramref name="type"/> holds handles: offsets, and for an array its header and stride (0 otherwise).</summary>
+        private (int[] Offsets, int Header, int Stride) ScanShape(IrType type)
+        {
+            if (type is ArrayType array)
+            {
+                var (header, stride) = Heap.ArrayLayout(array.Element);
+                return (Heap.LayoutOf(array.Element).GcOffsets, header, stride);
+            }
+            return (Heap.LayoutOf(type).GcOffsets, 0, 0);
+        }
+
+        /// <summary>
+        /// Queues every handle stored in <paramref name="allocation"/> (an object, array, heap cell or global); the caller
+        /// drains the queue, so marking never recurses (a long chain or a large array of objects uses the work stack).
+        /// </summary>
         private void ScanContents(Allocation allocation)
         {
             if (allocation.Kind is AllocationKind.Buffer or AllocationKind.Native)
                 return; // untyped bytes, or memory outside the interpreter (no handles in it)
-            if (allocation.Type is ArrayType array)
+            var (offsets, header, stride) = allocation.Scan ??= ScanShape(allocation.Type);
+            if (offsets.Length == 0)
+                return;
+            var data = allocation.Data;
+            if (stride == 0)
             {
-                var offsets = Heap.LayoutOf(array.Element).GcOffsets;
-                if (offsets.Length == 0)
-                    return;
-                var (header, stride) = Heap.ArrayLayout(array.Element);
-                ulong length = BitConverter.ToUInt64(allocation.Data, 0);
-                for (ulong i = 0; i < length; i++)
-                {
-                    foreach (int offset in offsets)
-                        Push(Address.Unpack(BitConverter.ToUInt64(allocation.Data, header + (int)i * stride + offset)));
-                }
-                Drain();
+                foreach (int offset in offsets)
+                    Push(Address.Unpack(BitConverter.ToUInt64(data, offset)));
                 return;
             }
-            foreach (int offset in Heap.LayoutOf(allocation.Type).GcOffsets)
-                Push(Address.Unpack(BitConverter.ToUInt64(allocation.Data, offset)));
-            Drain();
+            ulong length = BitConverter.ToUInt64(data, 0);
+            for (ulong i = 0; i < length; i++)
+            {
+                int element = header + (int)i * stride;
+                foreach (int offset in offsets)
+                    Push(Address.Unpack(BitConverter.ToUInt64(data, element + offset)));
+            }
         }
     }
 }

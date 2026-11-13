@@ -389,6 +389,223 @@ public sealed class InterpreterTests : CheckedTest
         Check("collections happened while the list was live", vm.Stats.Collections > 0, vm.Stats.ToString());
     }
 
+    /// <summary>
+    /// Marking drains one work stack: scanning an object only queues what it holds (scanning used to drain the queue
+    /// itself, a host call per queued object, so a large array of objects overflowed the host stack). Run on a small
+    /// stack; the live set is what collections sweep (garbage from the fill is reclaimed, the array's objects stay).
+    /// </summary>
+    [Fact]
+    public void Marking_a_large_array_of_objects_does_not_overflow_a_small_host_stack()
+    {
+        // unsafe fn fill(count: i64) -> i32 { let arr = gc [gc Point; count]; for i in 0..count { arr[i] = gc Point{i, i}; gc Point{0, 0}; } arr[count - 1].1 }
+        var point = GcPrograms.PointType;
+        var gcPoint = IrType.Gc(point);
+        var f = new FunctionBuilder("fill", IrType.I32) { Unsafe = true };
+        int count = f.Argument(IrType.I64, "count");
+        int arr = f.Local(IrType.Gc(new ArrayType(gcPoint)), "arr");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int p = f.Local(point, "p", mutable: true);
+        int garbage = f.Local(gcPoint, "garbage", mutable: true);
+        int last = f.Local(gcPoint, "last", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int loop = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(arr, Rvalue.NewArray(AllocKind.Gc, gcPoint, Copy(count))).Assign(i, Int(0, IrType.I64)).Goto(loop);
+        f.At(loop).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(count))).If(Copy(c), body, exit);
+        f.At(body).Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+         .Assign(new Place(arr).Deref().Index(i), Rvalue.Gc(Move(p)))
+         .Assign(new Place(p).Field(0), Int(0)).Assign(new Place(p).Field(1), Int(0))
+         .Assign(garbage, Rvalue.Gc(Move(p)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(loop);
+        f.At(exit).Assign(i, Rvalue.Binary(BinaryOp.Sub, Copy(count), Int(1, IrType.I64)))
+         .Assign(last, Copy(new Place(arr).Deref().Index(i)))
+         .Assign(FunctionBuilder.ReturnPlace, Copy(new Place(last).Deref().Field(1))).Return();
+
+        var vm = Vm(new IrModule(GcPrograms.StructDefs, [f.Build()]), gc: GcConfig.Default);
+        object? result = null;
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { result = vm.Run("fill", 20000L); }
+            catch (Exception e) { failure = e; }
+        }, 256 * 1024);
+        thread.Start();
+        thread.Join();
+        Check("fill(20000) = 19999 on a 256 KB host stack", failure is null && Equal(result, 19999L), failure?.Message ?? vm.Stats.ToString());
+        Check("collections ran while the array was live and reclaimed the garbage", vm.Stats.Collections > 0 && vm.Stats.Reclaimed > 0, vm.Stats.ToString());
+    }
+
+    /// <summary>
+    /// mem.copy and mem.cmp work on spans of the backing bytes: overlapping copies forward and backward, the first
+    /// difference, a compare that stops at a difference before the end of memory, and a copy past the end that fails
+    /// before writing anything.
+    /// </summary>
+    [Fact]
+    public void Mem_copy_and_compare_move_whole_spans()
+    {
+        var bytes = IrType.PtrMut(IrType.U8);
+        var f = new FunctionBuilder("mem", IrType.I64) { Unsafe = true };
+        int a = f.Local(IrType.Box(new ArrayType(IrType.U8)), "a", mutable: true);
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int unit = f.Local(IrType.Unit, "unit", mutable: true);
+        int digits = f.Local(IrType.I64, "digits", mutable: true);
+        int fill = f.NewBlock(), store = f.NewBlock(), read = f.NewBlock(), digit = f.NewBlock(), done = f.NewBlock();
+        int Pointer(int index)
+        {
+            int at = f.Temp(IrType.I64), borrow = f.Temp(IrType.RefMut(IrType.U8)), pointer = f.Temp(bytes);
+            f.Assign(at, Int(index, IrType.I64)).Assign(borrow, Rvalue.RefMut(new Place(a).Deref().Index(at))).Assign(pointer, Rvalue.Cast(Move(borrow), bytes));
+            return pointer;
+        }
+        void Print(Rvalue value)
+        {
+            int t = f.Temp(IrType.I64);
+            f.Assign(t, value).Assign(unit, new IntrinsicRvalue("print.i64", [Move(t)]));
+        }
+
+        f.Assign(a, Rvalue.NewArray(AllocKind.Box, IrType.U8, Int(8, IrType.I64))).Assign(i, Int(0, IrType.I64)).Goto(fill);
+        f.At(fill).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(8, IrType.I64))).If(Copy(c), store, read);
+        int plusOne = f.Temp(IrType.I64);
+        f.At(store).Assign(plusOne, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Assign(new Place(a).Deref().Index(i), Rvalue.Cast(Move(plusOne), IrType.U8))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(fill);
+        f.At(read);
+        int to = Pointer(2), from = Pointer(0);
+        f.Assign(unit, new IntrinsicRvalue("mem.copy", [Copy(to), Copy(from), Int(4, IrType.I64)]));      // 1 2 1 2 3 4 7 8 (forward overlap)
+        to = Pointer(0);
+        from = Pointer(1);
+        f.Assign(unit, new IntrinsicRvalue("mem.copy", [Copy(to), Copy(from), Int(4, IrType.I64)]));      // 2 1 2 3 3 4 7 8 (backward overlap)
+        int left = Pointer(0), right = Pointer(4);
+        Print(new IntrinsicRvalue("mem.cmp", [Copy(left), Copy(right), Int(2, IrType.I64)]));              // 2 - 3 = -1
+        left = Pointer(2);
+        right = Pointer(0);
+        Print(new IntrinsicRvalue("mem.cmp", [Copy(left), Copy(right), Int(2, IrType.I64)]));              // [2 3] vs [2 1]: 3 - 1 = 2
+        left = Pointer(4);
+        right = Pointer(6);
+        Print(new IntrinsicRvalue("mem.cmp", [Copy(left), Copy(right), Int(100, IrType.I64)]));            // differs at once (3 - 7 = -4), never reads past the end
+        f.Assign(digits, Int(0, IrType.I64)).Assign(i, Int(0, IrType.I64)).Goto(digit);
+        f.At(digit).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(8, IrType.I64))).If(Copy(c), done + 1, done);
+        f.At(done).Assign(FunctionBuilder.ReturnPlace, Copy(digits)).Return();
+        int next = f.NewBlock();
+        int element = f.Temp(IrType.U8), wide = f.Temp(IrType.I64), shifted = f.Temp(IrType.I64);
+        f.At(next).Assign(element, Copy(new Place(a).Deref().Index(i))).Assign(wide, Rvalue.Cast(Move(element), IrType.I64))
+         .Assign(shifted, Rvalue.Binary(BinaryOp.Mul, Copy(digits), Int(10, IrType.I64)))
+         .Assign(digits, Rvalue.Binary(BinaryOp.Add, Move(shifted), Move(wide)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(digit);
+
+        var past = new FunctionBuilder("past_the_end", IrType.U8) { Unsafe = true };
+        int pa = past.Local(IrType.Box(new ArrayType(IrType.U8)), "a", mutable: true);
+        int six = past.Local(IrType.I64, "six"), zero = past.Local(IrType.I64, "zero");
+        int r1 = past.Temp(IrType.RefMut(IrType.U8)), r2 = past.Temp(IrType.RefMut(IrType.U8)), p1 = past.Temp(bytes), p2 = past.Temp(bytes);
+        int moved = past.Temp(IrType.Unit);
+        past.Assign(pa, Rvalue.NewArray(AllocKind.Box, IrType.U8, Int(8, IrType.I64))).Assign(six, Int(6, IrType.I64)).Assign(zero, Int(0, IrType.I64))
+            .Assign(r1, Rvalue.RefMut(new Place(pa).Deref().Index(six))).Assign(p1, Rvalue.Cast(Move(r1), bytes))
+            .Assign(r2, Rvalue.RefMut(new Place(pa).Deref().Index(zero))).Assign(p2, Rvalue.Cast(Move(r2), bytes))
+            .Assign(moved, new IntrinsicRvalue("mem.copy", [Copy(p1), Copy(p2), Int(4, IrType.I64)]))
+            .Assign(FunctionBuilder.ReturnPlace, Copy(new Place(pa).Deref().Index(six)))
+            .Return();
+
+        var output = new StringWriter();
+        // Raw pointers into one array taken one after another: the borrow checker would see overlapping borrows.
+        var compiled = Compiler.Compile(new IrModule([], [f.Build(), past.Build()]), new CompilationOptions { BorrowCheck = BorrowCheckMode.Off });
+        Check("the program compiles", compiled.Success, string.Join("; ", compiled.TypeErrors.Concat<object>(compiled.Diagnostics)));
+        var vm = new Interpreter(compiled.Il!, options: new InterpreterOptions { Output = output });
+        Check("overlapping copies forward and backward give 2 1 2 3 3 4 7 8", Equal(vm.Run("mem"), 21233478L));
+        Check("mem.cmp gives the first difference: -1, 2, -4", output.ToString() == "-12-4", output.ToString());
+        Check("a copy past the end of the array is an error", Throws<VmException>(() => vm.Run("past_the_end"), "overruns"));
+    }
+
+    /// <summary>
+    /// Integers of 64 bits or less run on longs (wrapping casts, unsigned 64-bit values held as their bits) and slots
+    /// whose address is never taken hold their values: every operation, on edge values of each width, gives what exact
+    /// arithmetic wrapped to the type gives, the same with the left operand in a value slot or in memory (`&amp;mut` taken).
+    /// </summary>
+    [Fact]
+    public void Narrow_integers_compute_like_exact_arithmetic_in_value_and_memory_slots()
+    {
+        var types = new[] { IrType.I8, IrType.U8, IrType.I32, IrType.U32, IrType.I64, IrType.U64 };
+        var ops = new[] { BinaryOp.Add, BinaryOp.Sub, BinaryOp.Mul, BinaryOp.Div, BinaryOp.Rem, BinaryOp.And, BinaryOp.Or, BinaryOp.Xor, BinaryOp.Shl, BinaryOp.Shr, BinaryOp.Lt };
+        var functions = new List<IrFunction>();
+        foreach (var type in types)
+        {
+            foreach (var op in ops)
+            {
+                foreach (bool inMemory in new[] { false, true })
+                {
+                    var result = op == BinaryOp.Lt ? IrType.Bool : type;
+                    var f = new FunctionBuilder($"{op}_{type}_{(inMemory ? "mem" : "val")}", result);
+                    int a = f.Argument(type, "a"), b = f.Argument(type, "b");
+                    int t = f.Local(type, "t", mutable: true);
+                    if (inMemory)
+                    {
+                        // t = 0; *(&mut t) = a: the left operand is read back from memory
+                        int borrow = f.Temp(IrType.RefMut(type));
+                        f.Assign(t, Int(0, type)).Assign(borrow, Rvalue.RefMut(t)).Assign(new Place(borrow).Deref(), Copy(a));
+                    }
+                    else
+                    {
+                        f.Assign(t, Copy(a));
+                    }
+                    f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Copy(t), Copy(b))).Return();
+                    functions.Add(f.Build());
+                }
+            }
+        }
+        var vm = Vm(new IrModule([], [.. functions]));
+
+        int failures = 0;
+        string first = "";
+        foreach (var type in types)
+        {
+            int bits = type.BitWidth!.Value;
+            bool signed = type.IsSigned;
+            var modulus = BigInteger.One << bits;
+            BigInteger Wrap(BigInteger v)
+            {
+                var w = ((v % modulus) + modulus) % modulus;
+                return signed && w >= modulus >> 1 ? w - modulus : w;
+            }
+            BigInteger min = signed ? -(modulus >> 1) : 0, max = signed ? (modulus >> 1) - 1 : modulus - 1;
+            var samples = new[] { min, min + 1, -1, 0, 1, 2, 7, max - 1, max }.Where(v => v >= min && v <= max).Distinct().ToArray();
+            foreach (var op in ops)
+            {
+                foreach (var x in samples)
+                {
+                    foreach (var y in samples)
+                    {
+                        if (op is BinaryOp.Div or BinaryOp.Rem && y.IsZero)
+                            continue;
+                        int shift = (int)(y & (bits - 1));
+                        object expected = op switch
+                        {
+                            BinaryOp.Lt => x < y,
+                            _ => Box(Wrap(op switch
+                            {
+                                BinaryOp.Add => x + y,
+                                BinaryOp.Sub => x - y,
+                                BinaryOp.Mul => x * y,
+                                BinaryOp.Div => BigInteger.Divide(x, y),
+                                BinaryOp.Rem => BigInteger.Remainder(x, y),
+                                BinaryOp.And => x & y,
+                                BinaryOp.Or => x | y,
+                                BinaryOp.Xor => x ^ y,
+                                BinaryOp.Shl => x << shift,
+                                _ => x >> shift,
+                            })),
+                        };
+                        foreach (var slot in new[] { "val", "mem" })
+                        {
+                            var actual = vm.Run($"{op}_{type}_{slot}", Box(x), Box(y));
+                            if (!Equals(actual, expected) && failures++ == 0)
+                                first = $"{op} {type} ({slot}) {x}, {y}: {actual} instead of {expected}";
+                        }
+                    }
+                }
+            }
+
+            object Box(BigInteger v) => signed ? (long)v : (ulong)v;
+        }
+        Check("every operation on every width matches exact arithmetic wrapped to the type", failures == 0, $"{failures} mismatches; first: {first}");
+    }
+
     [Fact]
     public void Shift_amounts_are_masked_by_the_operand_width()
     {
