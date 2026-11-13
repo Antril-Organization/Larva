@@ -11,7 +11,39 @@ into namespace System.Reactive
 	/// What effects depend on: tracked when read inside one, notifying its observers when written.
 	public final class Source
 	{
-		List<Effect> observers = new List<Effect>();
+		static i64 made;
+
+		/// Its observers in the order they began to observe; an effect that stops leaves a null slot (taken out together
+		/// by Compact once they are half of them), so adding or removing one is a step, not a search.
+		List<Effect?> observers = new List<Effect?>();
+		/// For each slot, where this source is in its effect's list of sources.
+		List<i32> backs = new List<i32>();
+		i32 live;
+		/// The effect, and which of its runs, that tracked it last: reading it again in that run is found at once.
+		Effect? markEffect;
+		i64 markRun;
+
+		/// Takes out the null slots, keeping the order, and tells each effect that moves its new slot.
+		Compact()
+		{
+			i32 kept = 0;
+			loop (i32 i = 0..observers.Count)
+			{
+				if (observers[i] is Effect effect)
+				{
+					i32 back = backs[i];
+					observers[kept] = effect;
+					backs[kept] = back;
+					effect.Moved(back, kept);
+					kept++;
+				}
+			}
+			loop (observers.Count > kept)
+			{
+				observers.Pop();
+				backs.Pop();
+			}
+		}
 
 		public:
 			/// Makes the running effect (if any) an observer.
@@ -19,37 +51,57 @@ into namespace System.Reactive
 			{
 				if (Reactive.Current is Effect current)
 				{
-					loop (i32 i = 0..observers.Count)
-					{
-						if (observers[i] == current)
-							return;
-					}
+					if (markEffect == current && markRun == current.Runs)
+						return;
+					markEffect = current;
+					markRun = current.Runs;
+					if (current.Reads(this))
+						return;
+					backs.Add(current.Watching(this, observers.Count));
 					observers.Add(current);
-					current.Watching(this);
+					live++;
 				}
 			}
 
 			/// The number of effects it runs.
-			i32 Observers { get => observers.Count; }
+			i32 Observers { get => live; }
 
-		internal Forget(Effect effect)
+		/// Its number (Effect keeps the numbers of its sources in a set once it has many).
+		internal i64 Id = NextId();
+
+		static NextId() : i64
 		{
-			loop (i32 i = 0..observers.Count)
-			{
-				if (observers[i] == effect)
-				{
-					observers.RemoveAt(i);
-					return;
-				}
-			}
+			made++;
+			return made;
+		}
+
+		/// The effect in `slot` no longer observes it.
+		internal Unlink(i32 slot)
+		{
+			observers[slot] = null;
+			live--;
+			if (observers.Count >= 32 && live * 2 < observers.Count)
+				Compact();
 		}
 
 			/// Runs every observer again (once each, at the end of a batch).
 			Notify()
 			{
-				Effect[] running = observers.ToArray();
-				loop (i32 i = 0..running.Length)
-					Reactive.Schedule(running[i]);
+				Effect?[] running = new Effect?[live];
+				i32 count = 0;
+				loop (i32 i = 0..observers.Count)
+				{
+					if (observers[i] is Effect effect)
+					{
+						running[count] = effect;
+						count++;
+					}
+				}
+				loop (i32 i = 0..count)
+				{
+					if (running[i] is Effect effect)
+						Reactive.Schedule(effect);
+				}
 			}
 	}
 
@@ -60,24 +112,66 @@ into namespace System.Reactive
 		bool running;
 		bool disposed;
 		List<Source> sources = new List<Source>();
+		/// For each source, its slot in that source's observers.
+		List<i32> slots = new List<i32>();
+		/// The ids of `sources` once there are more than a few (below that a search of the list is quicker).
+		HashSet<i64>? ids;
 
 		internal bool Pending;
+		/// Where it is in the batch's pending effects (while Pending).
+		internal i32 PendingAt;
+		/// How many times it let go of its sources: a Source's mark of one of its runs holds until then.
+		internal i64 Runs;
 
 		/// A lazy effect (a Computed's) does not run when notified: it goes stale, and tells `Dependents`.
 		internal bool Lazy;
 		internal bool Stale;
 		internal Source? Dependents;
 
-		internal Watching(Source source)
+		/// Whether this run read `source` already.
+		internal Reads(Source source) : bool
+		{
+			if (ids is HashSet<i64> known)
+				return known.Contains(source.Id);
+			loop (i32 i = 0..sources.Count)
+			{
+				if (sources[i] == source)
+					return true;
+			}
+			return false;
+		}
+
+		/// `source` keeps it in `slot`: where the source is in its list.
+		internal Watching(Source source, i32 slot) : i32
 		{
 			sources.Add(source);
+			slots.Add(slot);
+			if (ids is HashSet<i64> known)
+				known.Add(source.Id);
+			else if (sources.Count > 8)
+			{
+				HashSet<i64> all = new HashSet<i64>();
+				loop (i32 i = 0..sources.Count)
+					all.Add(sources[i].Id);
+				ids = all;
+			}
+			return sources.Count - 1;
+		}
+
+		/// The source at `back` moved it to `slot`.
+		internal Moved(i32 back, i32 slot)
+		{
+			slots[back] = slot;
 		}
 
 		Release()
 		{
 			loop (i32 i = 0..sources.Count)
-				sources[i].Forget(this);
+				sources[i].Unlink(slots[i]);
 			sources.Clear();
+			slots.Clear();
+			ids = null;
+			Runs++;
 		}
 
 		public:
@@ -186,7 +280,7 @@ into namespace System.Reactive
 	public static class Reactive
 	{
 		static i32 depth;
-		static List<Effect> pending = new List<Effect>();
+		static List<Effect?> pending = new List<Effect?>();
 
 		public:
 			/// The effect running now (what a Source being read should track), or null.
@@ -228,6 +322,7 @@ into namespace System.Reactive
 				if (!effect.Pending)
 				{
 					effect.Pending = true;
+					effect.PendingAt = pending.Count;
 					pending.Add(effect);
 				}
 			}
@@ -240,14 +335,10 @@ into namespace System.Reactive
 			if (tracker.Pending)
 			{
 				tracker.Pending = false;
-				loop (i32 i = 0..pending.Count)
-				{
-					if (pending[i] == tracker)
-					{
-						pending.RemoveAt(i);
-						break;
-					}
-				}
+				// Its slot in the batch's list is emptied (Flush passes over it); one being flushed is not in that list.
+				i32 at = tracker.PendingAt;
+				if (at < pending.Count && pending[at] == tracker)
+					pending[at] = null;
 				tracker.Trigger();
 			}
 			if (tracker.Stale)
@@ -256,12 +347,15 @@ into namespace System.Reactive
 
 		static Flush()
 		{
-			List<Effect> due = pending;
-			pending = new List<Effect>();
+			List<Effect?> due = pending;
+			pending = new List<Effect?>();
 			loop (i32 i = 0..due.Count)
 			{
-				due[i].Pending = false;
-				due[i].Trigger();
+				if (due[i] is Effect effect)
+				{
+					effect.Pending = false;
+					effect.Trigger();
+				}
 			}
 		}
 	}
