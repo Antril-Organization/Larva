@@ -205,7 +205,7 @@ namespace Larva.IR.Encoding
             int flags = ReadCount(ref reader);
             var linkage = (Linkage)(flags >> 1 & 3);
             string? symbol = linkage == Linkage.Import ? ReadName(ref reader) : null;
-            System.Numerics.BigInteger? initial = (flags & 1) != 0 ? reader.ReadSigned() : null;
+            System.Numerics.BigInteger? initial = (flags & 1) != 0 ? reader.ReadSignedBig(type.BitWidth ?? 512) : null;
             return new GlobalDef(name, type, initial) { GenericCount = flags >> 3, Linkage = linkage, Symbol = symbol };
         }
 
@@ -213,8 +213,9 @@ namespace Larva.IR.Encoding
         {
             var element = ReadType(ref reader);
             var values = new System.Numerics.BigInteger[ReadCount(ref reader)];
+            int bits = element.BitWidth ?? 512;
             for (int v = 0; v < values.Length; v++)
-                values[v] = reader.ReadSigned();
+                values[v] = reader.ReadSignedBig(bits);
             return new StaticData(element, values);
         }
 
