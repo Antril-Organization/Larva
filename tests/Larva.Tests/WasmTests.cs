@@ -86,6 +86,42 @@ public sealed class WasmTests : CheckedTest
         Check("atomic.add.i32, mem.copy, mem.cmp and gc.domain give 5 15 7 0 0", Lines(output).SequenceEqual(["5", "15", "7", "0", "0"]), string.Join(" ", Lines(output)));
     }
 
+    /// <summary>
+    /// The module is generated once: a runtime function is imported when the code first calls it (here only in the second
+    /// function, after the first one's calls were emitted), and every function index (calls, table, exports) is resolved
+    /// when the module is written, imports first. Only what the code calls is imported.
+    /// </summary>
+    [Fact]
+    public void Runtime_functions_are_imported_on_first_use()
+    {
+        var main = new FunctionBuilder("main", IrType.Unit);
+        int bits = main.Local(IrType.I64, "bits", mutable: true);
+        int x = main.Local(IrType.F64, "x", mutable: true);
+        int y = main.Local(IrType.F64, "y");
+        int after = main.NewBlock();
+        main.Assign(bits, Int(BitConverter.DoubleToInt64Bits(7.5), IrType.I64))
+            .Assign(x, new IntrinsicRvalue("f64.from_bits", [Copy(bits)]))
+            .Call(1, [Copy(x)], new Place(y), after);
+        main.At(after);
+        Print(main, "print.f64", new UseRvalue(Copy(y)));
+        main.Return();
+        var helper = new FunctionBuilder("helper", IrType.F64);
+        int argument = helper.Argument(IrType.F64, "a");
+        int two = helper.Local(IrType.F64, "two", mutable: true);
+        int twoBits = helper.Local(IrType.I64, "bits", mutable: true);
+        helper.Assign(twoBits, Int(BitConverter.DoubleToInt64Bits(2.0), IrType.I64))
+            .Assign(two, new IntrinsicRvalue("f64.from_bits", [Copy(twoBits)]))
+            .Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(argument), Copy(two)))
+            .Return();
+        var module = new IrModule([], [main.Build(), helper.Build()]) { Name = "late" };
+        var (exit, output, errors) = Node(module);
+        Check("the module is valid and runs", exit == 0, errors);
+        Check("helper(7.5) = 7.5 % 2 = 1.5", Lines(output).SequenceEqual(["1.5"]), string.Join(" ", Lines(output)));
+        string text = System.Text.Encoding.ASCII.GetString(Wasm(module));
+        Check("larva_f64_rem (first called by the second function) and the printers are imported, nothing unused",
+            text.Contains("larva_f64_rem") && text.Contains("larva_print_f64") && !text.Contains("larva_gc_new") && !text.Contains("larva_mulhi_u64"), text.Length.ToString());
+    }
+
     /// <summary>Float `%` is fmod (the dividend's sign), through the runtime's `larva_f64_rem`; singles go through doubles exactly.</summary>
     [Fact]
     public void Float_remainder_is_fmod()
@@ -164,21 +200,15 @@ public sealed class WasmTests : CheckedTest
 
     internal static string[] Lines(string output) => output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.TrimEnd('\r')).ToArray();
 
+    /// <summary>The module's <c>.wasm</c> bytes.</summary>
+    internal static byte[] Wasm(IrModule module, GcConfig? gc = null) => Compile(module, gc).Module;
+
     /// <summary>The module linked as a program, compiled by the wasm back end, written next to its runtime and run by Node.</summary>
     internal static (int Exit, string Output, string Errors) Node(IrModule module, GcConfig? gc = null, params string[] arguments)
     {
-        var options = new CompilationOptions { Gc = gc ?? GcConfig.Default, BorrowCheck = BorrowCheckMode.Off };
-        var compiled = Compiler.CompileObject(module, options);
-        if (!compiled.Success)
-            throw new InvalidOperationException(string.Join("\n", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
-        var linked = Linker.Link([compiled.Object!], new LinkOptions { Entry = "main", Compilation = options });
-        if (!linked.Success)
-            throw new InvalidOperationException(string.Join("\n", linked.Errors));
-        var result = WasmBackend.Compile(linked, new WasmOptions { Compilation = options });
-        if (!result.Success)
-            throw new InvalidOperationException(result.ToString());
+        var program = Compile(module, gc);
         string folder = TestEnvironment.TempFolder("wasm");
-        string js = result.Program!.Write(Path.Combine(folder, module.Name + ".wasm"))[1];
+        string js = program.Write(Path.Combine(folder, module.Name + ".wasm"))[1];
         var start = new ProcessStartInfo("node") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         start.ArgumentList.Add(js);
         foreach (string argument in arguments)
@@ -194,5 +224,21 @@ public sealed class WasmTests : CheckedTest
                 process.Kill();
             return (process.ExitCode, output, errors.Result);
         }
+    }
+
+    /// <summary>The module linked as a program and compiled by the wasm back end.</summary>
+    internal static WasmProgram Compile(IrModule module, GcConfig? gc = null)
+    {
+        var options = new CompilationOptions { Gc = gc ?? GcConfig.Default, BorrowCheck = BorrowCheckMode.Off };
+        var compiled = Compiler.CompileObject(module, options);
+        if (!compiled.Success)
+            throw new InvalidOperationException(string.Join("\n", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
+        var linked = Linker.Link([compiled.Object!], new LinkOptions { Entry = "main", Compilation = options });
+        if (!linked.Success)
+            throw new InvalidOperationException(string.Join("\n", linked.Errors));
+        var result = WasmBackend.Compile(linked, new WasmOptions { Compilation = options });
+        if (!result.Success)
+            throw new InvalidOperationException(result.ToString());
+        return result.Program!;
     }
 }

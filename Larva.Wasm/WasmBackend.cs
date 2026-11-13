@@ -94,10 +94,8 @@ namespace Larva.Wasm
         {
             try
             {
-                // First pass: which runtime functions the code calls (only those are imported); second: the module.
-                var used = new HashSet<string>();
-                new WasmCodegen(concrete, options.Compilation.Gc, options.BoundsCheckElimination, used, null).Generate();
-                var codegen = new WasmCodegen(concrete, options.Compilation.Gc, options.BoundsCheckElimination, null, used);
+                // One pass: the runtime functions are imported as the code first calls them.
+                var codegen = new WasmCodegen(concrete, options.Compilation.Gc, options.BoundsCheckElimination);
                 codegen.Generate();
                 return new WasmResult(new WasmProgram(codegen.Wasm.ToArray())
                 {

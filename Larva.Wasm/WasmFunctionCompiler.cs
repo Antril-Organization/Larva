@@ -76,7 +76,7 @@ namespace Larva.Wasm
             return temps[tempCursor++].Offset;
         }
 
-        public (ValType[] Locals, byte[] Code) Compile()
+        public (ValType[] Locals, Code Code) Compile()
         {
             for (int l = 0; l < function.Locals.Length; l++)
             {
@@ -172,7 +172,6 @@ namespace Larva.Wasm
             }
             c.End();
             c.Unreachable();
-            var body = c.ToArray();
 
             // Prologue: the frame, the stack check, the arguments, drop flags and exception slots.
             int frameSize = Align(frame, 16);
@@ -227,8 +226,8 @@ namespace Larva.Wasm
                 p.I64ExtendI32U();
                 p.I64Store(regionDepth);
             }
-            var prologue = p.ToArray();
-            return (Locals, [.. prologue, .. body]);
+            p.Append(c);
+            return (Locals, p);
         }
 
         // ── Control ────────────────────────────────────────────
