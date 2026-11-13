@@ -258,6 +258,21 @@ namespace Larva.Build
             return settings;
         }
 
+        /// <summary>
+        /// The project a build without a <c>.queen</c> has: nothing but this machine's defaults (<c>larva config</c>), read
+        /// as a project's BUILD chunk is, so that every key applies the same way with or without a project file.
+        /// </summary>
+        public static QueenProject FromDefaults(string name)
+        {
+            var diagnostics = new List<QueenDiagnostic>();
+            string path = Path.Combine(Directory.GetCurrentDirectory(), name + Extension);
+            var document = QueenParser.Parse($"queen 1.0;\n\nchunk PROJ:\n   name: {name}\n", path, diagnostics)
+                ?? QueenParser.Parse("queen 1.0;\n\nchunk PROJ:\n   name: program\n", path, diagnostics)!;
+            var project = new QueenProject { File = path, Document = document };
+            project.Read(diagnostics);
+            return project;
+        }
+
         /// <summary>Whether the project's BUILD chunk sets <paramref name="key"/> itself (not a default).</summary>
         public bool Sets(string key) =>
             Document.Chunks.Where(c => c.Name == "BUILD").SelectMany(c => c.Entries).Any(e => e.Key == key) || LarvaDefaults.Configured().ContainsKey(key);

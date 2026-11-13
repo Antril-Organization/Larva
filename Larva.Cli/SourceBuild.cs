@@ -257,12 +257,7 @@ internal static class SourceBuild
             // optimization, output (bin/NAME.exe by default), a library as a DLL, reflection, borrow checking, generics.
             if (projectCompilation is null)
             {
-                if (!backendGiven && project.Sets("backend") && project.Backend != Larva.Build.ProjectBackend.Vm)
-                    backend = project.Backend == Larva.Build.ProjectBackend.X64 ? "x64" : "llvm";
-                if (!targetGiven && project.Sets("target") && project.Target == Larva.Build.ProjectTarget.Wasm)
-                    target = backend == "x64" ? "wasm" : "wasm-llvm";
-                if (!optimizationGiven && project.Sets("optimization"))
-                    optimization = project.Optimization;
+                ApplySettings(project);
                 if (project.Kind == Larva.Build.ProjectKind.Library)
                     dll = true;
                 if (output is null && !check)
@@ -271,14 +266,40 @@ internal static class SourceBuild
                     output = target != "native" ? Path.ChangeExtension(chosen, ".js") : dll ? Path.ChangeExtension(chosen, ".dll") : chosen;
                     Directory.CreateDirectory(Path.GetDirectoryName(output)!);
                 }
-                projectCompilation = project.Compilation;
-                frontendOptions = project.FrontendOptions();
-                cpu ??= project.Cpu;
-                if (borrowGiven is { } overridden)
-                {
-                    projectCompilation = projectCompilation with { BorrowCheck = overridden };
-                    frontendOptions["borrows"] = overridden != BorrowCheckMode.Off;
-                }
+            }
+        }
+        // Without a project: this machine's defaults (`larva config`) are the BUILD settings, every key read as a
+        // project's would be (the same function), where the command line does not say otherwise.
+        if (projectCompilation is null)
+        {
+            var defaults = Larva.Build.QueenProject.FromDefaults(Path.GetFileNameWithoutExtension(output ?? inputs.FirstOrDefault() ?? "program"));
+            ApplySettings(defaults);
+            // `unsafe: deny`: the sources given are the project's own (a project lists its own files as the safe ones).
+            if (!defaults.AllowUnsafe)
+            {
+                frontendOptions["unsafe"] = false;
+                frontendOptions["safe"] = new JsonArray([.. inputs.Where(i => !Larva.Build.QueenProject.IsAssembly(i)).Select(i => (JsonNode)Path.GetFullPath(i))]);
+            }
+        }
+
+        // The effective BUILD settings of `settings` (a project's chunk over the machine's defaults, or the defaults
+        // alone) applied to this build: what the command line does not say.
+        void ApplySettings(Larva.Build.QueenProject settings)
+        {
+            if (!backendGiven && settings.Sets("backend") && settings.Backend != Larva.Build.ProjectBackend.Vm)
+                backend = settings.Backend == Larva.Build.ProjectBackend.X64 ? "x64" : "llvm";
+            if (!targetGiven && settings.Sets("target") && settings.Target == Larva.Build.ProjectTarget.Wasm)
+                target = backend == "x64" ? "wasm" : "wasm-llvm";
+            if (!optimizationGiven && settings.Sets("optimization"))
+                optimization = settings.Optimization;
+            rootGc = settings.Gc;
+            projectCompilation = settings.Compilation;
+            frontendOptions = settings.FrontendOptions();
+            cpu ??= settings.Cpu;
+            if (borrowGiven is { } overridden)
+            {
+                projectCompilation = projectCompilation with { BorrowCheck = overridden };
+                frontendOptions["borrows"] = overridden != BorrowCheckMode.Off;
             }
         }
         for (int i = inputs.Count - 1; i >= 0; i--)
@@ -430,7 +451,7 @@ internal static class SourceBuild
             Backend = backend == "x64" ? Backend.X64 : Backend.Llvm,
             OptimizationLevel = optimization,
             Compilation = compilation,
-            Cpu = cpu ?? (projectCompilation is null ? Larva.Build.LarvaDefaults.Effective().GetValueOrDefault("cpu") : null),
+            Cpu = cpu,
         };
         var (success, message) = dll ? ExecutableBuilder.BuildLibrary(ir, output, executableOptions) : ExecutableBuilder.Build(ir, output, executableOptions);
         timings.Mark($"native ({backend})");
