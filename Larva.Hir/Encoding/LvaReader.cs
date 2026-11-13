@@ -22,7 +22,30 @@ namespace Larva.Hir.Encoding
             this.map = map;
         }
 
-        public static HirAssembly Read(byte[] data, TokenMap? map = null) => new LvaReader(LvaContainer.Unwrap(data), map).Assembly();
+        /// <summary>Reads an assembly; a damaged file is one <see cref="HirFormatException"/> naming the problem.</summary>
+        public static HirAssembly Read(byte[] data, TokenMap? map = null)
+        {
+            try
+            {
+                return new LvaReader(LvaContainer.Unwrap(data), map).Assembly();
+            }
+            catch (Exception e) when (IsIncidental(e))
+            {
+                throw new HirFormatException($"damaged assembly: {e.Message}");
+            }
+        }
+
+        /// <summary>Whether an exception is one a damaged file raises on its way through the reader, not a format error already.</summary>
+        private static bool IsIncidental(Exception e) =>
+            e is IndexOutOfRangeException or ArgumentOutOfRangeException or InvalidCastException or OverflowException
+                or InsufficientExecutionStackException or NullReferenceException or ArgumentException;
+
+        /// <summary>Fails when the tree nests deeper than the stack can take (a damaged file, never real code).</summary>
+        private static void Nest(ref ByteSource b)
+        {
+            if (!System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                throw new HirFormatException($"nested too deeply at byte {b.Position}");
+        }
 
         private HirAssembly Assembly()
         {
@@ -32,23 +55,23 @@ namespace Larva.Hir.Encoding
             int version = s.UInt();
             if (version != LvaFormat.Version)
                 throw new HirFormatException($"format version {version}; this Larva reads version {LvaFormat.Version}");
-            strings = new string[s.UInt()];
+            strings = new string[s.Count()];
             for (int i = 0; i < strings.Length; i++)
                 strings[i] = s.Utf8();
-            types = new HirType[s.UInt()];
+            types = new HirType[s.Count()];
             for (int i = 0; i < types.Length; i++)
                 types[i] = TypeEntry(ref s);
-            int metaLength = s.UInt();
+            int metaLength = s.Count();
             int metaStart = s.Position;
             s.Position += metaLength;
-            s.UInt(); // bodies' length
+            s.Count(); // bodies' length
             bodiesStart = s.Position;
-            var m = new ByteSource(data, metaStart);
+            var m = new ByteSource(data.AsSpan(0, metaStart + metaLength), metaStart);
             var assembly = Metadata(ref m);
             // The language's data, when the metadata goes on past the types.
             if (m.Position < metaStart + metaLength)
             {
-                int count = m.UInt();
+                int count = m.Count();
                 for (int i = 0; i < count; i++)
                     assembly.LanguageData.Add(new HirResource(Str(ref m), m.Raw(m.UInt()).ToArray()));
             }
@@ -103,7 +126,7 @@ namespace Larva.Hir.Encoding
 
         private HirType[] Types(ref ByteSource s)
         {
-            int count = s.UInt();
+            int count = s.Count();
             if (count == 0)
                 return [];
             var list = new HirType[count];
@@ -114,7 +137,7 @@ namespace Larva.Hir.Encoding
 
         private static int[] Ints(ref ByteSource s)
         {
-            var values = new int[s.UInt()];
+            var values = new int[s.Count()];
             for (int i = 0; i < values.Length; i++)
                 values[i] = (int)s.Int();
             return values;
@@ -148,32 +171,32 @@ namespace Larva.Hir.Encoding
         private HirAssembly Metadata(ref ByteSource m)
         {
             var assembly = new HirAssembly { Name = Str(ref m), Version = Ints(ref m) };
-            int count = m.UInt();
+            int count = m.Count();
             for (int i = 0; i < count; i++)
                 assembly.References.Add(new AssemblyRef(Str(ref m), Ints(ref m)));
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 var reference = new TypeRef(m.UInt(), Str(ref m), Str(ref m), m.UInt());
                 if (map is null)
                     assembly.TypeRefs.Add(reference);
             }
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 var reference = new MemberRef((MemberKind)m.Byte(), new TypeToken((int)m.Int()), Str(ref m), m.UInt(), Types(ref m), Type(ref m));
                 if (map is null)
                     assembly.MemberRefs.Add(reference);
             }
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
                 assembly.Files.Add(Str(ref m));
             assembly.Attributes.AddRange(Attributes(ref m));
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
                 assembly.Resources.Add(new HirResource(Str(ref m), m.Raw(m.UInt()).ToArray()));
             assembly.EntryPoint = OptMember(ref m);
-            count = m.UInt();
+            count = m.Count();
             assembly.Types.Capacity = count;
             for (int i = 0; i < count; i++)
                 assembly.Types.Add(TypeDefinition(ref m));
@@ -182,17 +205,17 @@ namespace Larva.Hir.Encoding
 
         private HirAttribute[] Attributes(ref ByteSource m)
         {
-            int count = m.UInt();
+            int count = m.Count();
             if (count == 0)
                 return [];
             var list = new HirAttribute[count];
             for (int i = 0; i < count; i++)
             {
                 var constructor = Member(ref m);
-                var arguments = new HirConstant[m.UInt()];
+                var arguments = new HirConstant[m.Count()];
                 for (int a = 0; a < arguments.Length; a++)
                     arguments[a] = Constant(ref m);
-                var named = new (string, HirConstant)[m.UInt()];
+                var named = new (string, HirConstant)[m.Count()];
                 for (int n = 0; n < named.Length; n++)
                     named[n] = (Str(ref m), Constant(ref m));
                 list[i] = new HirAttribute(constructor, arguments) { Named = named };
@@ -202,7 +225,7 @@ namespace Larva.Hir.Encoding
 
         private void Generics(ref ByteSource m, List<GenericParam> into)
         {
-            int count = m.UInt();
+            int count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 string name = Str(ref m);
@@ -210,12 +233,12 @@ namespace Larva.Hir.Encoding
                 var kinds = (ConstraintKinds)m.UInt();
                 var bases = Types(ref m);
                 var oneOf = Types(ref m);
-                var operators = new OperatorRequirement[m.UInt()];
+                var operators = new OperatorRequirement[m.Count()];
                 for (int o = 0; o < operators.Length; o++)
                     operators[o] = new OperatorRequirement(Str(ref m), Types(ref m), Type(ref m));
                 var convertsTo = Types(ref m);
                 var convertsFrom = Types(ref m);
-                var constructors = new HirType[m.UInt()][];
+                var constructors = new HirType[m.Count()][];
                 for (int c = 0; c < constructors.Length; c++)
                     constructors[c] = Types(ref m);
                 int fixedSize = (int)m.UInt();
@@ -242,7 +265,7 @@ namespace Larva.Hir.Encoding
             type.Base = OptType(ref m);
             type.Interfaces.AddRange(Types(ref m));
             type.Underlying = OptType(ref m);
-            int count = m.UInt();
+            int count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 type.Fields.Add(new FieldDef(Str(ref m), Type(ref m))
@@ -251,11 +274,11 @@ namespace Larva.Hir.Encoding
                     Location = Location(ref m), Doc = OptStr(ref m),
                 });
             }
-            count = m.UInt();
+            count = m.Count();
             type.Methods.Capacity = count;
             for (int i = 0; i < count; i++)
                 type.Methods.Add(Method(ref m));
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 type.Properties.Add(new PropertyDef(Str(ref m), Type(ref m))
@@ -264,7 +287,7 @@ namespace Larva.Hir.Encoding
                     Access = (Access)m.Byte(), Attributes = Attributes(ref m), Location = Location(ref m), Doc = OptStr(ref m),
                 });
             }
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 type.Events.Add(new EventDef(Str(ref m), Type(ref m))
@@ -273,7 +296,7 @@ namespace Larva.Hir.Encoding
                     Attributes = Attributes(ref m),
                 });
             }
-            count = m.UInt();
+            count = m.Count();
             for (int i = 0; i < count; i++)
             {
                 type.Operators.Add(new OperatorDef(Str(ref m), (Fixity)m.Byte(), m.UInt())
@@ -295,7 +318,7 @@ namespace Larva.Hir.Encoding
             var access = (Access)m.Byte();
             var generics = new List<GenericParam>();
             Generics(ref m, generics);
-            var parameters = new Parameter[m.UInt()];
+            var parameters = new Parameter[m.Count()];
             for (int i = 0; i < parameters.Length; i++)
             {
                 parameters[i] = new Parameter(Str(ref m), Type(ref m))
@@ -315,16 +338,23 @@ namespace Larva.Hir.Encoding
             method.Attributes.AddRange(Attributes(ref m));
             method.Location = Location(ref m);
             method.Doc = OptStr(ref m);
-            int length = m.UInt();
-            if (length > 0)
+            int length = m.UInt() - 1; // the writer stores the length + 1 (0: no body)
+            if (length >= 0)
             {
-                int start = bodiesStart + m.UInt();
-                if (start + length - 1 > data.Length)
-                    throw new HirFormatException("method body out of range");
+                long start = bodiesStart + (long)m.UInt();
+                if (start + length > data.Length)
+                    throw new HirFormatException($"method body of `{name}` out of range");
                 method.LoadBodyLater(() =>
                 {
-                    var b = new ByteSource(data, start);
-                    return Body(ref b);
+                    try
+                    {
+                        var b = new ByteSource(data.AsSpan(0, (int)(start + length)), (int)start);
+                        return Body(ref b);
+                    }
+                    catch (Exception e) when (IsIncidental(e))
+                    {
+                        throw new HirFormatException($"damaged body of `{name}`: {e.Message}");
+                    }
                 });
             }
             return method;
@@ -334,6 +364,7 @@ namespace Larva.Hir.Encoding
 
         private HirConstant Constant(ref ByteSource m)
         {
+            Nest(ref m);
             var tag = (ConstantTag)m.Byte();
             switch (tag)
             {
@@ -349,7 +380,7 @@ namespace Larva.Hir.Encoding
                 case ConstantTag.Array:
                 {
                     var element = Type(ref m);
-                    var items = new HirConstant[m.UInt()];
+                    var items = new HirConstant[m.Count()];
                     for (int i = 0; i < items.Length; i++)
                         items[i] = Constant(ref m);
                     return new ArrayConstant(element, items);
@@ -362,15 +393,15 @@ namespace Larva.Hir.Encoding
 
         private HirBody Body(ref ByteSource b)
         {
-            var locals = new HirLocal[b.UInt()];
+            var locals = new HirLocal[b.Count()];
             for (int i = 0; i < locals.Length; i++)
                 locals[i] = new HirLocal(Str(ref b), Type(ref b), b.Bool());
-            return new HirBody(locals, (BlockStmt)Statement(ref b));
+            return new HirBody(locals, Block(ref b));
         }
 
         private Stmt[] Statements(ref ByteSource b)
         {
-            int count = b.UInt();
+            int count = b.Count();
             if (count == 0)
                 return [];
             var list = new Stmt[count];
@@ -387,6 +418,7 @@ namespace Larva.Hir.Encoding
 
         private Stmt Statement(ref ByteSource b)
         {
+            Nest(ref b);
             var tag = (StmtTag)b.Byte();
             Stmt statement;
             switch (tag)
@@ -402,7 +434,7 @@ namespace Larva.Hir.Encoding
                 case StmtTag.Switch:
                 {
                     var value = Expr(ref b);
-                    var sections = new SwitchSection[b.UInt()];
+                    var sections = new SwitchSection[b.Count()];
                     for (int i = 0; i < sections.Length; i++)
                         sections[i] = new SwitchSection(Patterns(ref b), OptExpr(ref b), Statement(ref b));
                     statement = new SwitchStmt(value, sections, (int)b.Int());
@@ -415,7 +447,7 @@ namespace Larva.Hir.Encoding
                 case StmtTag.Try:
                 {
                     var body = Block(ref b);
-                    var catches = new CatchClause[b.UInt()];
+                    var catches = new CatchClause[b.Count()];
                     for (int i = 0; i < catches.Length; i++)
                         catches[i] = new CatchClause(OptType(ref b), (int)b.Int(), OptExpr(ref b), Block(ref b));
                     statement = new TryStmt(body, catches, OptBlock(ref b));
@@ -440,7 +472,7 @@ namespace Larva.Hir.Encoding
 
         private Expr[] Exprs(ref ByteSource b)
         {
-            int count = b.UInt();
+            int count = b.Count();
             if (count == 0)
                 return [];
             var list = new Expr[count];
@@ -453,7 +485,7 @@ namespace Larva.Hir.Encoding
 
         private MemberInit[] Inits(ref ByteSource b)
         {
-            int count = b.UInt();
+            int count = b.Count();
             if (count == 0)
                 return [];
             var list = new MemberInit[count];
@@ -468,6 +500,7 @@ namespace Larva.Hir.Encoding
 
         private Expr Expr(ref ByteSource b)
         {
+            Nest(ref b);
             var tag = (ExprTag)b.Byte();
             var type = Type(ref b);
             switch (tag)
@@ -507,7 +540,7 @@ namespace Larva.Hir.Encoding
                 case ExprTag.Switch:
                 {
                     var value = Expr(ref b);
-                    var arms = new SwitchArm[b.UInt()];
+                    var arms = new SwitchArm[b.Count()];
                     for (int i = 0; i < arms.Length; i++)
                         arms[i] = new SwitchArm(Pattern(ref b), OptExpr(ref b), Expr(ref b));
                     return new SwitchExpr(value, arms, type);
@@ -517,7 +550,7 @@ namespace Larva.Hir.Encoding
                 case ExprTag.ConditionalAccess: return new ConditionalAccessExpr(Expr(ref b), Expr(ref b), type);
                 case ExprTag.Lambda:
                 {
-                    var parameters = new int[b.UInt()];
+                    var parameters = new int[b.Count()];
                     for (int i = 0; i < parameters.Length; i++)
                         parameters[i] = b.UInt();
                     return new LambdaExpr(parameters, Statement(ref b), type) { Async = b.Bool() };
@@ -535,7 +568,7 @@ namespace Larva.Hir.Encoding
                 case ExprTag.Range: return new RangeExpr(OptExpr(ref b), OptExpr(ref b), b.Bool(), type);
                 case ExprTag.Interpolated:
                 {
-                    var parts = new InterpolationPart[b.UInt()];
+                    var parts = new InterpolationPart[b.Count()];
                     for (int i = 0; i < parts.Length; i++)
                         parts[i] = new InterpolationPart(Expr(ref b), OptStr(ref b), (int)b.Int());
                     return new InterpolatedExpr(parts, type);
@@ -556,7 +589,7 @@ namespace Larva.Hir.Encoding
 
         private Pattern[] Patterns(ref ByteSource b)
         {
-            int count = b.UInt();
+            int count = b.Count();
             if (count == 0)
                 return [];
             var list = new Pattern[count];
@@ -567,6 +600,7 @@ namespace Larva.Hir.Encoding
 
         private Pattern Pattern(ref ByteSource b)
         {
+            Nest(ref b);
             var tag = (PatternTag)b.Byte();
             switch (tag)
             {
@@ -582,7 +616,7 @@ namespace Larva.Hir.Encoding
                 case PatternTag.Property:
                 {
                     var type = OptType(ref b);
-                    var members = new PropertySubpattern[b.UInt()];
+                    var members = new PropertySubpattern[b.Count()];
                     for (int i = 0; i < members.Length; i++)
                     {
                         var member = Member(ref b);

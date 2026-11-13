@@ -313,6 +313,7 @@ internal static class SourceBuild
             timings.Mark($"{dependency.Name} ({dependency.Gc.Mode})");
         }
         var assemblyBytes = new List<byte[]>();
+        var assemblyNames = new List<string>();
         foreach (string assembly in assemblies.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (!File.Exists(assembly))
@@ -321,7 +322,18 @@ internal static class SourceBuild
                 return 1;
             }
             byte[] bytes = File.ReadAllBytes(assembly);
+            // Checked here (its metadata only; bodies stay unread), before the frontend gets a damaged file to trip over.
+            try
+            {
+                LvaFormat.Read(bytes);
+            }
+            catch (HirFormatException e)
+            {
+                Console.Error.WriteLine($"larva: {assembly}: {e.Message}");
+                return 1;
+            }
             assemblyBytes.Add(bytes);
+            assemblyNames.Add(assembly);
             references.Add(LanguagePack.Reference(assembly));
             timings.Mark(Path.GetFileName(assembly));
         }
@@ -337,7 +349,17 @@ internal static class SourceBuild
         timings.Mark("frontend");
         if (program?.Assembly is not { } programBytes)
             return 1;
-        var linked = HirLinker.Link(name, [coreBytes, .. externalBytes, .. assemblyBytes, programBytes]);
+        HirLinkResult linked;
+        try
+        {
+            linked = HirLinker.Link(name, [coreBytes, .. externalBytes, .. assemblyBytes, programBytes],
+                [corePath ?? "System.Core", .. externals.Select(e => e.Name), .. assemblyNames, name]);
+        }
+        catch (HirFormatException e)
+        {
+            Console.Error.WriteLine($"larva: {e.Message}");
+            return 1;
+        }
         timings.Mark("HIR link");
         if (!linked.Success)
         {
@@ -472,7 +494,16 @@ internal static class SourceBuild
         var compiled = Compile(language, sources, dependency.Name, [coreReference], options: dependency.FrontendOptions());
         if (compiled?.Assembly is not { } lva)
             return null;
-        var linked = HirLinker.Link(dependency.Name, [coreBytes, lva]);
+        HirLinkResult linked;
+        try
+        {
+            linked = HirLinker.Link(dependency.Name, [coreBytes, lva], ["System.Core", dependency.Name]);
+        }
+        catch (HirFormatException e)
+        {
+            Console.Error.WriteLine($"larva: {e.Message}");
+            return null;
+        }
         if (!linked.Success)
         {
             foreach (var error in linked.Errors)

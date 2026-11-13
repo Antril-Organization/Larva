@@ -80,6 +80,18 @@ namespace Larva.IR.Linking
 
         public static LarvaObject Read(ReadOnlySpan<byte> file)
         {
+            try
+            {
+                return ReadChecked(file);
+            }
+            catch (Exception e) when (IrDecoder.IsIncidental(e))
+            {
+                throw IrDecoder.Corrupt(e);
+            }
+        }
+
+        private static LarvaObject ReadChecked(ReadOnlySpan<byte> file)
+        {
             if (file.Length < Magic.Length + 1 || !file[..Magic.Length].SequenceEqual(Magic))
                 throw new InvalidDataException("not a Larva object (missing LRVO header)");
             byte version = file[Magic.Length];
@@ -95,10 +107,17 @@ namespace Larva.IR.Linking
                 payload = payload[1..];
                 if (compressed)
                 {
-                    using var input = new BrotliStream(new MemoryStream(payload.ToArray()), CompressionMode.Decompress);
-                    using var output = new MemoryStream();
-                    input.CopyTo(output);
-                    unpacked = output.ToArray();
+                    try
+                    {
+                        using var input = new BrotliStream(new MemoryStream(payload.ToArray()), CompressionMode.Decompress);
+                        using var output = new MemoryStream();
+                        input.CopyTo(output);
+                        unpacked = output.ToArray();
+                    }
+                    catch (Exception e) when (e is InvalidOperationException or IOException)
+                    {
+                        throw new InvalidDataException("corrupt Larva object (its compressed data does not decode)", e);
+                    }
                     payload = unpacked;
                 }
             }
@@ -108,6 +127,7 @@ namespace Larva.IR.Linking
             var capabilities = (GcCapabilities)reader.ReadUnsigned();
             string plugin = IrDecoder.ReadName(ref reader);
             var module = IrDecoder.Decode(ref reader, attributes: version >= 3);
+            IrDecoder.Validate(module);
             var obj = new LarvaObject(module, new GcConfig(mode, capabilities, plugin.Length == 0 ? null : plugin));
             if (version == 1)
                 return obj;

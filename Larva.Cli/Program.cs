@@ -86,7 +86,7 @@ try
 }
 catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException)
 {
-    Console.Error.WriteLine($"larva: cannot load {args[1]}: {e.Message}");
+    Console.Error.WriteLine($"larva: {args[1]}: {e.Message}");
     return 1;
 }
 
@@ -191,7 +191,7 @@ static int Link(string[] args, bool native)
         }
         catch (Exception e) when (e is IOException or InvalidDataException or UnauthorizedAccessException)
         {
-            Console.Error.WriteLine($"larva: cannot load {input}: {e.Message}");
+            Console.Error.WriteLine($"larva: {input}: {e.Message}");
             return 1;
         }
     }

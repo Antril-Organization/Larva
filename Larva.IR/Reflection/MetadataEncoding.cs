@@ -28,14 +28,21 @@ namespace Larva.IR.Reflection
 
         public static ModuleMetadata Decode(ReadOnlySpan<byte> bytes)
         {
-            NibbleReader reader = new(bytes);
-            var structs = new StructMetadata[IrDecoder.ReadCount(ref reader)];
-            for (int i = 0; i < structs.Length; i++)
-                structs[i] = ReadStruct(ref reader);
-            var methods = new MethodMetadata[IrDecoder.ReadCount(ref reader)];
-            for (int i = 0; i < methods.Length; i++)
-                methods[i] = ReadMethod(ref reader);
-            return new ModuleMetadata(structs, methods);
+            try
+            {
+                NibbleReader reader = new(bytes);
+                var structs = new StructMetadata[IrDecoder.ReadCount(ref reader)];
+                for (int i = 0; i < structs.Length; i++)
+                    structs[i] = ReadStruct(ref reader);
+                var methods = new MethodMetadata[IrDecoder.ReadCount(ref reader)];
+                for (int i = 0; i < methods.Length; i++)
+                    methods[i] = ReadMethod(ref reader);
+                return new ModuleMetadata(structs, methods);
+            }
+            catch (Exception e) when (IrDecoder.IsIncidental(e))
+            {
+                throw IrDecoder.Corrupt(e);
+            }
         }
 
         // ── Structs ────────────────────────────────────────────────

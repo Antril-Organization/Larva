@@ -22,11 +22,26 @@ namespace Larva.Hir.Linking
         /// Links <paramref name="inputs"/> (the bytes of <c>.lva</c> files, in any order: each comes after the assemblies it
         /// references) into an assembly named <paramref name="name"/>. The entry point is the last one an input has.
         /// </summary>
-        public static HirLinkResult Link(string name, IReadOnlyList<byte[]> inputs)
+        public static HirLinkResult Link(string name, IReadOnlyList<byte[]> inputs) => Link(name, inputs, null);
+
+        /// <param name="inputNames">What to call each input (its file) in the message of a damaged one; null for its index.</param>
+        public static HirLinkResult Link(string name, IReadOnlyList<byte[]> inputs, IReadOnlyList<string>? inputNames)
         {
+            HirAssembly Read(int i, TokenMap? map)
+            {
+                try
+                {
+                    return LvaReader.Read(inputs[i], map);
+                }
+                catch (HirFormatException e)
+                {
+                    throw new HirFormatException($"{(inputNames is not null && i < inputNames.Count ? inputNames[i] : $"input {i}")}: {e.Message}");
+                }
+            }
+
             var errors = new List<string>();
             // Pass 1: each assembly's own view (its references unresolved), to number the types of all of them.
-            var views = inputs.Select(bytes => LvaFormat.Read(bytes)).ToList();
+            var views = inputs.Select((_, i) => Read(i, null)).ToList();
             var order = Order(views, errors);
             if (order is null)
                 return new HirLinkResult { Assembly = null, Errors = errors };
@@ -83,7 +98,7 @@ namespace Larva.Hir.Linking
                 MemberToken MapMember(MemberToken token) =>
                     token.IsDefinition ? MemberToken.Def(offset + token.Type, token.Member)
                     : token.Member < members.Length ? members[token.Member] : throw new HirFormatException($"{view.Name}: member reference {token.Member} is out of range");
-                var linked = LvaReader.Read(inputs[a], new TokenMap(MapType, MapMember, fileOffsets[a]));
+                var linked = Read(a, new TokenMap(MapType, MapMember, fileOffsets[a]));
                 merged.Types.AddRange(linked.Types);
                 merged.Files.AddRange(linked.Files);
                 merged.Attributes.AddRange(linked.Attributes);

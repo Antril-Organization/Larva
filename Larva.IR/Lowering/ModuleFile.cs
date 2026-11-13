@@ -74,7 +74,104 @@ namespace Larva.IR.Lowering
             return [.. Magic, Version, .. writer.ToArray()];
         }
 
+        /// <summary>Reads a module file; a damaged one is one <see cref="InvalidDataException"/> naming the problem.</summary>
         public static IlModule Read(ReadOnlySpan<byte> file)
+        {
+            try
+            {
+                var module = ReadChecked(file);
+                Validate(module);
+                return module;
+            }
+            catch (Exception e) when (IrDecoder.IsIncidental(e))
+            {
+                throw IrDecoder.Corrupt(e);
+            }
+        }
+
+        /// <summary>
+        /// Checks every token and index the module holds against its tables (types, fields, constants, functions, locals,
+        /// arguments, labels, handlers, safepoints, roots, the entry), so the VM never runs off a table of a damaged file.
+        /// </summary>
+        public static void Validate(IlModule module)
+        {
+            static int Index(int id, int count, string what) =>
+                id >= 0 && id < count ? id : throw new InvalidDataException($"{what} {id} is out of range (the module has {count}).");
+            int types = module.Types.Length, structs = module.Metadata.Structs.Length;
+            // Struct ids inside IL types index the metadata's structs (the runtime's shapes).
+            var ids = new Linking.IdMap(s => Index(s, structs, "struct"), f => f, g => g, d => d);
+            foreach (var type in module.Types)
+                ids.Type(type);
+            foreach (var field in module.Fields)
+                ids.Type(field.Owner);
+            foreach (var constant in module.Constants)
+                ids.Type(constant.Type);
+            foreach (var witness in module.Witnesses)
+                Index(witness.Type, types, "type");
+            foreach (var data in module.Data)
+                ids.Type(data.Element);
+            foreach (var global in module.Globals)
+                ids.Global(global);
+            if (module.Entry != -1)
+                Index(module.Entry, module.Functions.Length, "entry function");
+            foreach (var function in module.Functions)
+            {
+                string name = $"`{function.Name}`:";
+                if (function.ArgumentTypes.Length != function.ArgumentCount)
+                    throw new InvalidDataException($"{name} {function.ArgumentCount} arguments but {function.ArgumentTypes.Length} argument types.");
+                foreach (int t in function.ArgumentTypes)
+                    Index(t, types, $"{name} type");
+                foreach (int t in function.LocalTypes)
+                    Index(t, types, $"{name} type");
+                var operations = function.Body.Operations;
+                foreach (var handler in function.Handlers)
+                {
+                    Index(handler.Start, operations.Length + 1, $"{name} handler start");
+                    Index(handler.End, operations.Length + 1, $"{name} handler end");
+                    Index(handler.Handler, operations.Length, $"{name} handler target");
+                    if (handler.CatchType is int caught)
+                        Index(caught, types, $"{name} type");
+                }
+                foreach (var root in function.GcRoots)
+                    Index(root.Slot, root.IsArgument ? function.ArgumentCount : function.LocalTypes.Length, $"{name} root slot");
+                foreach (var safepoint in function.Safepoints)
+                {
+                    Index(safepoint.Operation, operations.Length, $"{name} safepoint");
+                    foreach (var root in safepoint.Roots)
+                        Index(root.Slot, root.IsArgument ? function.ArgumentCount : function.LocalTypes.Length, $"{name} root slot");
+                }
+                foreach (var operation in operations)
+                {
+                    var info = OpCodes.Get(operation.OpCode);
+                    var shape = info.IsFamily && info.TryGetSubOp(operation.SubOp, out var sub) ? sub.Operands : info.Operands;
+                    for (int i = 0, o = 0; i < shape.Length && o < operation.Operands.Length; i++)
+                    {
+                        if (shape[i] == OperandKind.LabelTable)
+                        {
+                            for (; o < operation.Operands.Length; o++)
+                                Index(checked((int)operation.Operands[o]), operations.Length + 1, $"{name} label");
+                            break;
+                        }
+                        long value = operation.Operands[o++];
+                        int count = shape[i] switch
+                        {
+                            OperandKind.Local => function.LocalTypes.Length,
+                            OperandKind.Argument => function.ArgumentCount,
+                            OperandKind.Field => module.Fields.Length,
+                            OperandKind.Function => module.Functions.Length,
+                            OperandKind.Type => types,
+                            OperandKind.Constant => module.Constants.Length,
+                            OperandKind.Label => operations.Length + 1,
+                            _ => -1,
+                        };
+                        if (count >= 0)
+                            Index(value is >= int.MinValue and <= int.MaxValue ? (int)value : -1, count, $"{name} {shape[i].Prefix()}operand");
+                    }
+                }
+            }
+        }
+
+        private static IlModule ReadChecked(ReadOnlySpan<byte> file)
         {
             if (file.Length < Magic.Length + 1 || !file[..Magic.Length].SequenceEqual(Magic))
                 throw new InvalidDataException("not a Larva module (missing LRVA header)");
