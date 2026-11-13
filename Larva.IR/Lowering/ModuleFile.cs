@@ -9,12 +9,12 @@ namespace Larva.IR.Lowering
     /// The on-disk form of a compiled module (<c>.lvm</c>): everything a runtime needs, nothing from the compiler.
     /// <code>
     /// file      = "LRVA" version:byte body
-    /// body      = gc entry:sv types fields constants witnesses functions metadata      (nibble stream)
-    /// gc        = mode:4 capabilities:uv plugin:name
+    /// body      = gc domains entry:sv types fields constants witnesses functions metadata data globals      (nibble stream)
+    /// gc        = mode:4 capabilities:uv plugin:name            domains = n:uv gc*     (empty: one domain, the program's gc)
     /// types     = n:uv type*                       fields    = n:uv {owner:type field:uv}*
     /// constants = n:uv {type bits:sv}*             witnesses = n:uv {type:uv layout}*
     /// layout    = size:uv align:uv flags:4 gc:uv offset:uv*
-    /// function  = name args:uv witnesses:uv argTypes localTypes roots safepoints handlers body:bytes
+    /// function  = name args:uv witnesses:uv domain:uv argTypes localTypes roots safepoints handlers native body:bytes
     /// roots     = n:uv {isArg:4 slot:uv hasOffsets:4 [offsets]}*
     /// safepoint = op:uv roots            handler = start:uv end:uv hasType:4 [type:uv] target:uv
     /// metadata  = bytes (see MetadataEncoding)           bytes = n:uv byte*
@@ -23,16 +23,18 @@ namespace Larva.IR.Lowering
     public static class ModuleFile
     {
         public const string Extension = ".lvm";
-        public const byte Version = 1;
+        /// <summary>Version 2 added the GC domains (the program's and each function's); readers of version 1 refuse it by the number.</summary>
+        public const byte Version = 2;
         private static readonly byte[] Magic = "LRVA"u8.ToArray();
 
         public static byte[] Write(IlModule module)
         {
             NibbleWriter writer = new();
 
-            writer.WriteNibble((int)module.Gc.Mode);
-            writer.WriteUnsigned((ulong)module.Gc.Capabilities);
-            IrEncoder.WriteName(writer, module.Gc.PluginName ?? "");
+            WriteGc(writer, module.Gc);
+            writer.WriteUnsigned((ulong)module.Domains.Length);
+            foreach (var domain in module.Domains)
+                WriteGc(writer, domain);
             writer.WriteSigned(module.Entry);
 
             writer.WriteUnsigned((ulong)module.Types.Length);
@@ -74,7 +76,105 @@ namespace Larva.IR.Lowering
             return [.. Magic, Version, .. writer.ToArray()];
         }
 
+        /// <summary>Reads a module file; a damaged one is one <see cref="InvalidDataException"/> naming the problem.</summary>
         public static IlModule Read(ReadOnlySpan<byte> file)
+        {
+            try
+            {
+                var module = ReadChecked(file);
+                Validate(module);
+                return module;
+            }
+            catch (Exception e) when (IrDecoder.IsIncidental(e))
+            {
+                throw IrDecoder.Corrupt(e);
+            }
+        }
+
+        /// <summary>
+        /// Checks every token and index the module holds against its tables (types, fields, constants, functions, locals,
+        /// arguments, labels, handlers, safepoints, roots, the entry), so the VM never runs off a table of a damaged file.
+        /// </summary>
+        public static void Validate(IlModule module)
+        {
+            static int Index(int id, int count, string what) =>
+                id >= 0 && id < count ? id : throw new InvalidDataException($"{what} {id} is out of range (the module has {count}).");
+            int types = module.Types.Length, structs = module.Metadata.Structs.Length;
+            // Struct ids inside IL types index the metadata's structs (the runtime's shapes).
+            var ids = new Linking.IdMap(s => Index(s, structs, "struct"), f => f, g => g, d => d);
+            foreach (var type in module.Types)
+                ids.Type(type);
+            foreach (var field in module.Fields)
+                ids.Type(field.Owner);
+            foreach (var constant in module.Constants)
+                ids.Type(constant.Type);
+            foreach (var witness in module.Witnesses)
+                Index(witness.Type, types, "type");
+            foreach (var data in module.Data)
+                ids.Type(data.Element);
+            foreach (var global in module.Globals)
+                ids.Global(global);
+            if (module.Entry != -1)
+                Index(module.Entry, module.Functions.Length, "entry function");
+            foreach (var function in module.Functions)
+            {
+                string name = $"`{function.Name}`:";
+                Index(function.Domain, Math.Max(1, module.Domains.Length), $"{name} GC domain");
+                if (function.ArgumentTypes.Length != function.ArgumentCount)
+                    throw new InvalidDataException($"{name} {function.ArgumentCount} arguments but {function.ArgumentTypes.Length} argument types.");
+                foreach (int t in function.ArgumentTypes)
+                    Index(t, types, $"{name} type");
+                foreach (int t in function.LocalTypes)
+                    Index(t, types, $"{name} type");
+                var operations = function.Body.Operations;
+                foreach (var handler in function.Handlers)
+                {
+                    Index(handler.Start, operations.Length + 1, $"{name} handler start");
+                    Index(handler.End, operations.Length + 1, $"{name} handler end");
+                    Index(handler.Handler, operations.Length, $"{name} handler target");
+                    if (handler.CatchType is int caught)
+                        Index(caught, types, $"{name} type");
+                }
+                foreach (var root in function.GcRoots)
+                    Index(root.Slot, root.IsArgument ? function.ArgumentCount : function.LocalTypes.Length, $"{name} root slot");
+                foreach (var safepoint in function.Safepoints)
+                {
+                    Index(safepoint.Operation, operations.Length, $"{name} safepoint");
+                    foreach (var root in safepoint.Roots)
+                        Index(root.Slot, root.IsArgument ? function.ArgumentCount : function.LocalTypes.Length, $"{name} root slot");
+                }
+                foreach (var operation in operations)
+                {
+                    var info = OpCodes.Get(operation.OpCode);
+                    var shape = info.IsFamily && info.TryGetSubOp(operation.SubOp, out var sub) ? sub.Operands : info.Operands;
+                    for (int i = 0, o = 0; i < shape.Length && o < operation.Operands.Length; i++)
+                    {
+                        if (shape[i] == OperandKind.LabelTable)
+                        {
+                            for (; o < operation.Operands.Length; o++)
+                                Index(checked((int)operation.Operands[o]), operations.Length + 1, $"{name} label");
+                            break;
+                        }
+                        long value = operation.Operands[o++];
+                        int count = shape[i] switch
+                        {
+                            OperandKind.Local => function.LocalTypes.Length,
+                            OperandKind.Argument => function.ArgumentCount,
+                            OperandKind.Field => module.Fields.Length,
+                            OperandKind.Function => module.Functions.Length,
+                            OperandKind.Type => types,
+                            OperandKind.Constant => module.Constants.Length,
+                            OperandKind.Label => operations.Length + 1,
+                            _ => -1,
+                        };
+                        if (count >= 0)
+                            Index(value is >= int.MinValue and <= int.MaxValue ? (int)value : -1, count, $"{name} {shape[i].Prefix()}operand");
+                    }
+                }
+            }
+        }
+
+        private static IlModule ReadChecked(ReadOnlySpan<byte> file)
         {
             if (file.Length < Magic.Length + 1 || !file[..Magic.Length].SequenceEqual(Magic))
                 throw new InvalidDataException("not a Larva module (missing LRVA header)");
@@ -82,10 +182,10 @@ namespace Larva.IR.Lowering
                 throw new InvalidDataException($"unsupported module version {file[Magic.Length]} (expected {Version})");
 
             NibbleReader reader = new(file[(Magic.Length + 1)..]);
-            var mode = (GcMode)reader.ReadNibble();
-            var capabilities = (GcCapabilities)reader.ReadUnsigned();
-            string plugin = IrDecoder.ReadName(ref reader);
-            var gc = new GcConfig(mode, capabilities, plugin.Length == 0 ? null : plugin);
+            var gc = ReadGc(ref reader);
+            var domains = new GcConfig[Count(ref reader)];
+            for (int i = 0; i < domains.Length; i++)
+                domains[i] = ReadGc(ref reader);
             int entry = checked((int)reader.ReadSigned());
 
             var types = new IrType[Count(ref reader)];
@@ -124,7 +224,24 @@ namespace Larva.IR.Lowering
             var globals = new GlobalDef[IrDecoder.ReadCount(ref reader)];
             for (int i = 0; i < globals.Length; i++)
                 globals[i] = IrDecoder.ReadGlobal(ref reader);
-            return new IlModule(types, fields, constants, witnesses, functions) { Metadata = metadata, Gc = gc, Entry = entry, Data = data, Globals = globals };
+            return new IlModule(types, fields, constants, witnesses, functions) { Metadata = metadata, Gc = gc, Domains = domains, Entry = entry, Data = data, Globals = globals };
+        }
+
+        private static void WriteGc(NibbleWriter writer, GcConfig gc)
+        {
+            writer.WriteNibble((int)gc.Mode);
+            writer.WriteUnsigned((ulong)gc.Capabilities);
+            IrEncoder.WriteName(writer, gc.PluginName ?? "");
+        }
+
+        private static GcConfig ReadGc(ref NibbleReader reader)
+        {
+            int mode = reader.ReadNibble();
+            if (mode > (int)GcMode.Plugin)
+                throw new InvalidDataException($"unknown GC mode {mode}");
+            var capabilities = (GcCapabilities)reader.ReadUnsigned();
+            string plugin = IrDecoder.ReadName(ref reader);
+            return new GcConfig((GcMode)mode, capabilities, plugin.Length == 0 ? null : plugin);
         }
 
         public static void Save(IlModule module, string path) => File.WriteAllBytes(path, Write(module));
@@ -138,6 +255,7 @@ namespace Larva.IR.Lowering
             IrEncoder.WriteName(writer, function.Name);
             writer.WriteUnsigned((ulong)function.ArgumentCount);
             writer.WriteUnsigned((ulong)function.TypeParameterCount);
+            writer.WriteUnsigned((ulong)function.Domain);
             WriteInts(writer, function.ArgumentTypes);
             WriteInts(writer, function.LocalTypes);
             WriteRoots(writer, function.GcRoots);
@@ -175,6 +293,7 @@ namespace Larva.IR.Lowering
             string name = IrDecoder.ReadName(ref reader);
             int arguments = Count(ref reader);
             int typeParameters = Count(ref reader);
+            int domain = IrDecoder.ReadInt(ref reader, "domain");
             var argumentTypes = ReadInts(ref reader);
             var localTypes = ReadInts(ref reader);
             var roots = ReadRoots(ref reader);
@@ -205,6 +324,7 @@ namespace Larva.IR.Lowering
             return new IlFunction(name, arguments, localTypes, body)
             {
                 TypeParameterCount = typeParameters,
+                Domain = domain,
                 ArgumentTypes = argumentTypes,
                 GcRoots = roots,
                 Safepoints = safepoints,
@@ -235,7 +355,7 @@ namespace Larva.IR.Lowering
             {
                 bool isArgument = reader.ReadNibble() != 0;
                 int slot = Count(ref reader);
-                int[]? offsets = reader.ReadNibble() != 0 ? ReadInts(ref reader) : null;
+                int[]? offsets = reader.ReadNibble() != 0 ? ReadValues(ref reader) : null;
                 roots[i] = new GcRoot(isArgument, slot, offsets);
             }
             return roots;
@@ -251,9 +371,9 @@ namespace Larva.IR.Lowering
 
         private static TypeLayout ReadLayout(ref NibbleReader reader)
         {
-            int size = Count(ref reader), align = Count(ref reader);
+            int size = IrDecoder.ReadInt(ref reader, "layout size"), align = IrDecoder.ReadInt(ref reader, "layout alignment");
             var flags = (WitnessFlags)reader.ReadNibble();
-            return new TypeLayout(size, align, flags, ReadInts(ref reader));
+            return new TypeLayout(size, align, flags, ReadValues(ref reader));
         }
 
         private static void WriteInts(NibbleWriter writer, int[] values)
@@ -263,11 +383,21 @@ namespace Larva.IR.Lowering
                 writer.WriteUnsigned((ulong)value);
         }
 
+        /// <summary>Indexes (type tokens).</summary>
         private static int[] ReadInts(ref NibbleReader reader)
         {
             var values = new int[Count(ref reader)];
             for (int i = 0; i < values.Length; i++)
                 values[i] = Count(ref reader);
+            return values;
+        }
+
+        /// <summary>Values (byte offsets): not bounded by the stream's size.</summary>
+        private static int[] ReadValues(ref NibbleReader reader)
+        {
+            var values = new int[Count(ref reader)];
+            for (int i = 0; i < values.Length; i++)
+                values[i] = IrDecoder.ReadInt(ref reader, "offset");
             return values;
         }
 

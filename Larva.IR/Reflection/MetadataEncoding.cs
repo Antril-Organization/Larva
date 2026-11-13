@@ -28,14 +28,21 @@ namespace Larva.IR.Reflection
 
         public static ModuleMetadata Decode(ReadOnlySpan<byte> bytes)
         {
-            NibbleReader reader = new(bytes);
-            var structs = new StructMetadata[IrDecoder.ReadCount(ref reader)];
-            for (int i = 0; i < structs.Length; i++)
-                structs[i] = ReadStruct(ref reader);
-            var methods = new MethodMetadata[IrDecoder.ReadCount(ref reader)];
-            for (int i = 0; i < methods.Length; i++)
-                methods[i] = ReadMethod(ref reader);
-            return new ModuleMetadata(structs, methods);
+            try
+            {
+                NibbleReader reader = new(bytes);
+                var structs = new StructMetadata[IrDecoder.ReadCount(ref reader)];
+                for (int i = 0; i < structs.Length; i++)
+                    structs[i] = ReadStruct(ref reader);
+                var methods = new MethodMetadata[IrDecoder.ReadCount(ref reader)];
+                for (int i = 0; i < methods.Length; i++)
+                    methods[i] = ReadMethod(ref reader);
+                return new ModuleMetadata(structs, methods);
+            }
+            catch (Exception e) when (IrDecoder.IsIncidental(e))
+            {
+                throw IrDecoder.Corrupt(e);
+            }
         }
 
         // ── Structs ────────────────────────────────────────────────
@@ -83,8 +90,8 @@ namespace Larva.IR.Reflection
             TypeLayout? layout = null;
             if (reader.ReadNibble() != 0)
             {
-                int size = IrDecoder.ReadCount(ref reader);
-                int align = IrDecoder.ReadCount(ref reader);
+                int size = IrDecoder.ReadInt(ref reader, "layout size");
+                int align = IrDecoder.ReadInt(ref reader, "layout alignment");
                 var flags = (WitnessFlags)reader.ReadNibble();
                 layout = new TypeLayout(size, align, flags, ReadInts(ref reader));
             }
@@ -184,9 +191,10 @@ namespace Larva.IR.Reflection
 
         private static int[] ReadInts(ref NibbleReader reader)
         {
+            // Byte offsets: values, not indexes into the stream.
             var values = new int[IrDecoder.ReadCount(ref reader)];
             for (int i = 0; i < values.Length; i++)
-                values[i] = IrDecoder.ReadCount(ref reader);
+                values[i] = IrDecoder.ReadInt(ref reader, "offset");
             return values;
         }
     }

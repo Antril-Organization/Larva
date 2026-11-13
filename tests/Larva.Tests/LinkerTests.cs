@@ -20,6 +20,39 @@ public sealed unsafe class LinkerTests : CheckedTest
         Check("object file round trip", roundTrip.Module.ToString() == app.Module.ToString() && roundTrip.Gc == app.Gc);
     }
 
+    /// <summary>
+    /// Struct attributes (the struct's and its fields') name types by the object's own struct ids: linked, they must be
+    /// renumbered like the fields are. app is linked first so that its ids differ from the merged ones (its Point import
+    /// is 0 in app and 1 after geom comes in; its Holder is 1 in app and 0 merged).
+    /// </summary>
+    [Fact]
+    public void Struct_attributes_are_renumbered_when_objects_merge()
+    {
+        const int HolderId = 1;
+        var holder = new StructDef("Holder", Point, IrType.I32)
+        {
+            FieldNames = ["point", "n"],
+            Attributes = [new IrAttribute("holds", [new TypeArgument(Point), new TypeArgument(IrType.Ref(IrType.Struct(HolderId))), new TextArgument("x")])],
+            FieldAttributes = [[new IrAttribute("field", [new TypeArgument(IrType.ArrayOf(Point))])], []],
+        };
+        var app = App() with { Structs = [PointDef(Linkage.Import, "geom::Point"), holder] };
+        var linked = Linker.Link([Object(app), Object(Geom())], new LinkOptions { LowerToIl = false });
+        Check("app (first) and geom link", linked.Success, string.Join(" | ", linked.Errors));
+        if (!linked.Success)
+            return;
+        var merged = linked.Merged!;
+        int point = Array.FindIndex(merged.Structs, s => s.Name == "geom::Point"), mergedHolder = Array.FindIndex(merged.Structs, s => s.Name == "app::Holder");
+        Check("both structs are in the merged module, with different ids than in app", point >= 0 && mergedHolder >= 0 && point != PointId, $"Point {point}, Holder {mergedHolder}");
+        var def = merged.Structs[mergedHolder];
+        Check("Holder's point field is geom's Point", def.Fields[0] is StructType { Id: var fieldId } && fieldId == point);
+        Check("the struct attribute's type arguments are renumbered (Point and &Holder)",
+            def.Attributes is [{ Name: "holds", Arguments: [TypeArgument { Type: StructType { Id: var a } }, TypeArgument { Type: ReferenceType { Pointee: StructType { Id: var h } } }, TextArgument { Value: "x" }] }]
+            && a == point && h == mergedHolder, string.Join(", ", def.Attributes.SelectMany(x => x.Arguments)));
+        Check("the field attribute's type argument is renumbered ([Point])",
+            def.FieldAttributes is [[{ Arguments: [TypeArgument { Type: ArrayType { Element: StructType { Id: var f } } }] }], []] && f == point,
+            string.Join(", ", def.FieldAttributes.SelectMany(x => x).SelectMany(x => x.Arguments)));
+    }
+
     [Fact]
     public void Geom_and_app_link_specialize_and_drop_dead_code()
     {
@@ -109,6 +142,48 @@ public sealed unsafe class LinkerTests : CheckedTest
         var lowered = Linker.Link([geom, rcApp], new LinkOptions { MixedDomains = true });
         Check("…and the mixed program still lowers and runs (the back ends use domain 0 until stage 2)", lowered.Success && Equals(new Interpreter(lowered.Il!).Run("app::main"), 7L),
             string.Join(" | ", lowered.Errors.Select(e => e.Message)));
+    }
+
+    /// <summary>The .lvm module file keeps the GC domains (the program's and each function's), as the VM and `larva dis` use them.</summary>
+    [Fact]
+    public void Module_files_keep_the_gc_domains()
+    {
+        var lowered = Linker.Link([Object(Geom()), Object(App(), GcConfig.RefCount)], new LinkOptions { MixedDomains = true });
+        Check("geom + refcounted app link", lowered.Success, string.Join(" | ", lowered.Errors.Select(e => e.Message)));
+        if (!lowered.Success)
+            return;
+        var il = lowered.Il!;
+        Check("the lowered module has two domains and app's functions are in domain 1", il.Domains is [{ Mode: GcMode.Default }, { Mode: GcMode.RefCount }]
+            && il.Functions.Where(f => f.Name.StartsWith("app::")).All(f => f.Domain == 1) && il.Functions.Where(f => f.Name.StartsWith("geom::")).All(f => f.Domain == 0));
+        var bytes = ModuleFile.Write(il);
+        var reread = ModuleFile.Read(bytes);
+        Check("the domains survive the file", reread.Domains.SequenceEqual(il.Domains), string.Join(", ", reread.Domains.Select(d => d.ToString())));
+        Check("each function's domain survives the file", reread.Functions.Select(f => f.Domain).SequenceEqual(il.Functions.Select(f => f.Domain)) && reread.Functions.Any(f => f.Domain == 1));
+        Check("the text form (larva dis) shows them", reread.ToString() is var text && text.Contains(".domain 0 = ") && text.Contains(".domain 1 = ") && text.Contains("domain: 1, args:"), reread.ToString()[..200]);
+        Check("the reread program runs on the VM with its domains: main() = 7", Equals(new Interpreter(reread).Run("app::main"), 7L));
+        var olderVersion = (byte[])bytes.Clone();
+        olderVersion[4] = 1;
+        string refusal = "";
+        try
+        {
+            ModuleFile.Read(olderVersion);
+        }
+        catch (InvalidDataException e)
+        {
+            refusal = e.Message;
+        }
+        Check("a version 1 file is refused by its version (as a version 1 reader refuses this one)", refusal.Contains("version 1") && refusal.Contains("expected 2"), refusal);
+        var badDomain = il with { Functions = [il.Functions[0] with { Domain = 7 }, .. il.Functions[1..]] };
+        refusal = "";
+        try
+        {
+            ModuleFile.Read(ModuleFile.Write(badDomain));
+        }
+        catch (InvalidDataException e)
+        {
+            refusal = e.Message;
+        }
+        Check("a function in a domain the file does not declare is refused", refusal.Contains("GC domain 7"), refusal);
     }
 
     // ── Mixed GC domains (stage 2 on): each pair run on the VM, LLVM and x64 ──

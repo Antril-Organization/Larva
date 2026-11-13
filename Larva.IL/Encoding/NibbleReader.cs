@@ -15,7 +15,7 @@ namespace Larva.IL.Encoding
         public int ReadNibble()
         {
             if (Position >= Length)
-                throw new EndOfStreamException("Unexpected end of IL stream.");
+                throw new InvalidDataException($"Unexpected end of the stream at nibble {Position} (the file is cut short).");
             byte b = bytes[Position >> 1];
             int nibble = (Position & 1) == 0 ? b >> 4 : b & 0xF;
             Position++;

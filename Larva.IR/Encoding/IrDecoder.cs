@@ -1,14 +1,95 @@
+using System.Runtime.CompilerServices;
 using Larva.IL.Encoding;
+using Larva.IR.Analysis;
+using Larva.IR.Linking;
 
 namespace Larva.IR.Encoding
 {
-    /// <summary>Inverse of <see cref="IrEncoder"/>.</summary>
+    /// <summary>
+    /// Inverse of <see cref="IrEncoder"/>. A damaged stream is one <see cref="InvalidDataException"/> with a message: every
+    /// count is bounded by the bytes left, nesting by the stack, and <see cref="Validate"/> checks every index a decoded
+    /// module holds against its tables, so a reader never fails with an out-of-range, a cast or a stack overflow later.
+    /// </summary>
     public static class IrDecoder
     {
         public static IrModule Decode(ReadOnlySpan<byte> bytes)
         {
-            NibbleReader reader = new(bytes);
-            return Decode(ref reader);
+            try
+            {
+                NibbleReader reader = new(bytes);
+                var module = Decode(ref reader);
+                Validate(module);
+                return module;
+            }
+            catch (Exception e) when (IsIncidental(e))
+            {
+                throw Corrupt(e);
+            }
+        }
+
+        /// <summary>Whether an exception is one a damaged stream raises on its way through a reader, not a format error already.</summary>
+        public static bool IsIncidental(Exception e) =>
+            e is IndexOutOfRangeException or ArgumentOutOfRangeException or InvalidCastException or OverflowException
+                or InsufficientExecutionStackException or NullReferenceException or ArgumentException or KeyNotFoundException;
+
+        /// <summary>The one format exception for an incidental failure (see <see cref="IsIncidental"/>).</summary>
+        public static InvalidDataException Corrupt(Exception e) => new($"corrupt file: {e.Message}", e);
+
+        /// <summary>Fails when the structures nest deeper than the stack can take (a damaged stream, never real code).</summary>
+        internal static void Nest(ref NibbleReader reader)
+        {
+            if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                throw new InvalidDataException($"Nested too deeply at nibble {reader.Position}.");
+        }
+
+        /// <summary>
+        /// Checks every index a module holds (struct ids in types, functions, globals, static data, locals, blocks) against
+        /// the tables they index; a module read from a file is checked before it is used.
+        /// </summary>
+        public static void Validate(IrModule module)
+        {
+            static int Index(int id, int count, string what) =>
+                id >= 0 && id < count ? id : throw new InvalidDataException($"{what} {id} is out of range (the module has {count}).");
+            var ids = new IdMap(
+                s => Index(s, module.Structs.Length, "struct"),
+                f => Index(f, module.Functions.Length, "function"),
+                g => Index(g, module.Globals.Length, "global"),
+                d => Index(d, module.Data.Length, "static data"));
+            foreach (var def in module.Structs)
+                ids.Struct(def);
+            foreach (var global in module.Globals)
+                ids.Global(global);
+            foreach (var implementation in module.Implementations)
+                Index(implementation.Function, module.Functions.Length, "function");
+            foreach (var function in module.Functions)
+            {
+                ids.Function(function);
+                if (function.ArgumentCount > function.Locals.Length)
+                    throw new InvalidDataException($"`{function.Name}` has {function.ArgumentCount} arguments but {function.Locals.Length} locals.");
+                foreach (var block in function.Blocks)
+                {
+                    foreach (var statement in block.Statements)
+                    {
+                        foreach (int local in Liveness.Uses(statement))
+                            Index(local, function.Locals.Length, $"`{function.Name}`: local");
+                        int? written = statement switch
+                        {
+                            AssignStatement assign => assign.Target.Local,
+                            StorageLiveStatement live => live.Local,
+                            StorageDeadStatement dead => dead.Local,
+                            _ => null,
+                        };
+                        if (written is int target)
+                            Index(target, function.Locals.Length, $"`{function.Name}`: local");
+                    }
+                    foreach (int local in Liveness.Uses(block.Terminator))
+                        Index(local, function.Locals.Length, $"`{function.Name}`: local");
+                    if (block.Terminator is CallTerminator call)
+                        Index(call.Destination.Local, function.Locals.Length, $"`{function.Name}`: local");
+                    foreach (int successor in block.Terminator.Successors)
+                        Index(successor, function.Blocks.Length, $"`{function.Name}`: block");
+                }
+            }
         }
 
         /// <param name="attributes">Whether the encoding has attributes (objects before version 3 do not).</param>
@@ -121,10 +202,10 @@ namespace Larva.IR.Encoding
         {
             string name = ReadName(ref reader);
             var type = ReadType(ref reader);
-            int flags = ReadCount(ref reader);
+            int flags = ReadInt(ref reader, "global flags");
             var linkage = (Linkage)(flags >> 1 & 3);
             string? symbol = linkage == Linkage.Import ? ReadName(ref reader) : null;
-            System.Numerics.BigInteger? initial = (flags & 1) != 0 ? reader.ReadSigned() : null;
+            System.Numerics.BigInteger? initial = (flags & 1) != 0 ? reader.ReadSignedBig(type.BitWidth ?? 512) : null;
             return new GlobalDef(name, type, initial) { GenericCount = flags >> 3, Linkage = linkage, Symbol = symbol };
         }
 
@@ -132,8 +213,9 @@ namespace Larva.IR.Encoding
         {
             var element = ReadType(ref reader);
             var values = new System.Numerics.BigInteger[ReadCount(ref reader)];
+            int bits = element.BitWidth ?? 512;
             for (int v = 0; v < values.Length; v++)
-                values[v] = reader.ReadSigned();
+                values[v] = reader.ReadSignedBig(bits);
             return new StaticData(element, values);
         }
 
@@ -456,6 +538,7 @@ namespace Larva.IR.Encoding
 
         internal static IrType ReadType(ref NibbleReader reader)
         {
+            Nest(ref reader);
             int tag = reader.ReadNibble();
             return tag switch
             {
@@ -488,7 +571,7 @@ namespace Larva.IR.Encoding
                 case IrFormat.ExtendedFixedArray:
                 {
                     var element = ReadType(ref reader);
-                    int count = ReadCount(ref reader);
+                    int count = ReadInt(ref reader, "array length");
                     var sizeOf = reader.ReadNibble() != 0 ? ReadType(ref reader) : null;
                     return new FixedArrayType(element, count, sizeOf);
                 }
@@ -542,6 +625,7 @@ namespace Larva.IR.Encoding
 
         private static TypeConstraint ReadConstraint(ref NibbleReader reader)
         {
+            Nest(ref reader);
             int tag = reader.ReadNibble();
             switch (tag)
             {
@@ -561,7 +645,7 @@ namespace Larva.IR.Encoding
                 case IrFormat.ConstraintNot:
                     return new NotConstraint(ReadConstraint(ref reader));
                 case IrFormat.ConstraintSize:
-                    return new SizeAtMostConstraint(ReadCount(ref reader));
+                    return new SizeAtMostConstraint(ReadInt(ref reader, "size constraint"));
                 default:
                     throw new InvalidDataException($"Unknown constraint tag {tag} at nibble {reader.Position}.");
             }
@@ -583,7 +667,16 @@ namespace Larva.IR.Encoding
             return System.Text.Encoding.UTF8.GetString(bytes);
         }
 
-        /// <summary>Reads an unsigned varint used as a count or index, rejecting values that cannot be valid.</summary>
+        /// <summary>Reads an unsigned varint that is a value (a length, a size, flags), not an index or count of the stream: anything that fits an int.</summary>
+        internal static int ReadInt(ref NibbleReader reader, string what)
+        {
+            ulong value = reader.ReadUnsigned();
+            if (value > int.MaxValue)
+                throw new InvalidDataException($"{what} {value} at nibble {reader.Position} does not fit.");
+            return (int)value;
+        }
+
+        /// <summary>Reads an unsigned varint used as a count or index into the stream, rejecting values that cannot be valid.</summary>
         internal static int ReadCount(ref NibbleReader reader)
         {
             ulong value = reader.ReadUnsigned();

@@ -54,6 +54,72 @@ public sealed class HirTests : CheckedTest
     }
 
     /// <summary>
+    /// An .lva cut short or with a byte changed at many positions (every one of the head, a spread over the rest, the
+    /// tail) either still reads, bodies included, or is one HirFormatException with a message: never an out-of-range, a
+    /// cast, an overflow, a stack overflow or an out-of-memory.
+    /// </summary>
+    [Fact]
+    public void Damaged_lva_bytes_are_refused_with_one_exception()
+    {
+        var valid = LvaFormat.Write(Sample());
+        var wrong = new List<string>();
+        int accepted = 0, refused = 0;
+        void Try(string what, byte[] bytes)
+        {
+            try
+            {
+                var a = LvaFormat.Read(bytes);
+                foreach (var t in a.Types)
+                    foreach (var m in t.Methods)
+                        _ = m.Body;
+                accepted++;
+            }
+            catch (HirFormatException e)
+            {
+                refused++;
+                if (string.IsNullOrWhiteSpace(e.Message))
+                    wrong.Add($"{what}: HirFormatException without a message");
+            }
+            catch (Exception e)
+            {
+                wrong.Add($"{what}: {e.GetType().Name}: {e.Message.Split('\n')[0]}");
+            }
+        }
+        var positions = Enumerable.Range(0, Math.Min(valid.Length, 96))
+            .Concat(Enumerable.Range(0, 64).Select(i => 96 + i * Math.Max(1, (valid.Length - 96) / 64)).Where(i => i < valid.Length))
+            .Concat(Enumerable.Range(Math.Max(96, valid.Length - 8), 8).Where(i => i < valid.Length));
+        foreach (int at in positions)
+        {
+            Try($"cut at {at}", valid[..at]);
+            foreach (byte value in new byte[] { 0x00, 0xFF, 0x7F, 0x80, (byte)(valid[at] ^ 0x10) })
+            {
+                var damaged = (byte[])valid.Clone();
+                damaged[at] = value;
+                Try($"byte {at} = {value:x2}", damaged);
+            }
+        }
+        TestContext.Current.TestOutputHelper?.WriteLine($"{valid.Length} bytes: {accepted} variants read, {refused} refused, {wrong.Count} wrong");
+        Check("every damaged .lva reads or is a HirFormatException with a message", wrong.Count == 0, $"{wrong.Count} wrong: " + string.Join("; ", wrong.Take(6)));
+        // A string count of 2^28 - 1 (four LEB128 bytes after the version) used to allocate 2 GB before reaching the end of the file.
+        var huge = (byte[])valid.Clone();
+        huge[4] = 0xFF;
+        huge[5] = 0xFF;
+        huge[6] = 0xFF;
+        huge[7] = 0x7F;
+        var watch = Stopwatch.StartNew();
+        string refusal = "";
+        try
+        {
+            LvaFormat.Read(huge);
+        }
+        catch (HirFormatException e)
+        {
+            refusal = e.Message;
+        }
+        Check("a count beyond the bytes left is refused before anything is allocated", refusal.Contains("count") && watch.ElapsedMilliseconds < 1000, $"{refusal} ({watch.ElapsedMilliseconds} ms)");
+    }
+
+    /// <summary>
     /// A library the size of a big base library (4 000 types, 40 000 methods): writing it, reading its metadata (what a
     /// reference costs), and reading every body.
     /// </summary>

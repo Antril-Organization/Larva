@@ -115,6 +115,13 @@ namespace Larva.Hir.Encoding
             return value <= int.MaxValue ? (int)value : throw new HirFormatException("count out of range");
         }
 
+        /// <summary>A count of things still to be read, each at least one byte: bounded by the bytes left.</summary>
+        public int Count()
+        {
+            int count = UInt();
+            return count <= Remaining ? count : throw new HirFormatException($"a count of {count} with {Remaining} bytes left (the file is damaged)");
+        }
+
         public long Int()
         {
             ulong raw = ULong();
