@@ -513,6 +513,99 @@ public sealed class InterpreterTests : CheckedTest
         Check("a copy past the end of the array is an error", Throws<VmException>(() => vm.Run("past_the_end"), "overruns"));
     }
 
+    /// <summary>
+    /// Integers of 64 bits or less run on longs (wrapping casts, unsigned 64-bit values held as their bits) and slots
+    /// whose address is never taken hold their values: every operation, on edge values of each width, gives what exact
+    /// arithmetic wrapped to the type gives, the same with the left operand in a value slot or in memory (`&amp;mut` taken).
+    /// </summary>
+    [Fact]
+    public void Narrow_integers_compute_like_exact_arithmetic_in_value_and_memory_slots()
+    {
+        var types = new[] { IrType.I8, IrType.U8, IrType.I32, IrType.U32, IrType.I64, IrType.U64 };
+        var ops = new[] { BinaryOp.Add, BinaryOp.Sub, BinaryOp.Mul, BinaryOp.Div, BinaryOp.Rem, BinaryOp.And, BinaryOp.Or, BinaryOp.Xor, BinaryOp.Shl, BinaryOp.Shr, BinaryOp.Lt };
+        var functions = new List<IrFunction>();
+        foreach (var type in types)
+        {
+            foreach (var op in ops)
+            {
+                foreach (bool inMemory in new[] { false, true })
+                {
+                    var result = op == BinaryOp.Lt ? IrType.Bool : type;
+                    var f = new FunctionBuilder($"{op}_{type}_{(inMemory ? "mem" : "val")}", result);
+                    int a = f.Argument(type, "a"), b = f.Argument(type, "b");
+                    int t = f.Local(type, "t", mutable: true);
+                    if (inMemory)
+                    {
+                        // t = 0; *(&mut t) = a: the left operand is read back from memory
+                        int borrow = f.Temp(IrType.RefMut(type));
+                        f.Assign(t, Int(0, type)).Assign(borrow, Rvalue.RefMut(t)).Assign(new Place(borrow).Deref(), Copy(a));
+                    }
+                    else
+                    {
+                        f.Assign(t, Copy(a));
+                    }
+                    f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(op, Copy(t), Copy(b))).Return();
+                    functions.Add(f.Build());
+                }
+            }
+        }
+        var vm = Vm(new IrModule([], [.. functions]));
+
+        int failures = 0;
+        string first = "";
+        foreach (var type in types)
+        {
+            int bits = type.BitWidth!.Value;
+            bool signed = type.IsSigned;
+            var modulus = BigInteger.One << bits;
+            BigInteger Wrap(BigInteger v)
+            {
+                var w = ((v % modulus) + modulus) % modulus;
+                return signed && w >= modulus >> 1 ? w - modulus : w;
+            }
+            BigInteger min = signed ? -(modulus >> 1) : 0, max = signed ? (modulus >> 1) - 1 : modulus - 1;
+            var samples = new[] { min, min + 1, -1, 0, 1, 2, 7, max - 1, max }.Where(v => v >= min && v <= max).Distinct().ToArray();
+            foreach (var op in ops)
+            {
+                foreach (var x in samples)
+                {
+                    foreach (var y in samples)
+                    {
+                        if (op is BinaryOp.Div or BinaryOp.Rem && y.IsZero)
+                            continue;
+                        int shift = (int)(y & (bits - 1));
+                        object expected = op switch
+                        {
+                            BinaryOp.Lt => x < y,
+                            _ => Box(Wrap(op switch
+                            {
+                                BinaryOp.Add => x + y,
+                                BinaryOp.Sub => x - y,
+                                BinaryOp.Mul => x * y,
+                                BinaryOp.Div => BigInteger.Divide(x, y),
+                                BinaryOp.Rem => BigInteger.Remainder(x, y),
+                                BinaryOp.And => x & y,
+                                BinaryOp.Or => x | y,
+                                BinaryOp.Xor => x ^ y,
+                                BinaryOp.Shl => x << shift,
+                                _ => x >> shift,
+                            })),
+                        };
+                        foreach (var slot in new[] { "val", "mem" })
+                        {
+                            var actual = vm.Run($"{op}_{type}_{slot}", Box(x), Box(y));
+                            if (!Equals(actual, expected) && failures++ == 0)
+                                first = $"{op} {type} ({slot}) {x}, {y}: {actual} instead of {expected}";
+                        }
+                    }
+                }
+            }
+
+            object Box(BigInteger v) => signed ? (long)v : (ulong)v;
+        }
+        Check("every operation on every width matches exact arithmetic wrapped to the type", failures == 0, $"{failures} mismatches; first: {first}");
+    }
+
     [Fact]
     public void Shift_amounts_are_masked_by_the_operand_width()
     {

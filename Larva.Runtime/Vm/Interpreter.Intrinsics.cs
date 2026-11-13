@@ -17,10 +17,10 @@ namespace Larva.Runtime.Vm
             switch (id)
             {
                 case 0:
-                    output.Write(Heap.AsInteger(Heap.Coerce(Pop(stack), IrType.I64)).ToString(CultureInfo.InvariantCulture));
+                    output.Write(Heap.AsLong(Heap.Coerce(Pop(stack), IrType.I64)).ToString(CultureInfo.InvariantCulture));
                     break;
                 case 1:
-                    output.Write(((ulong)Heap.AsInteger(Heap.Coerce(Pop(stack), IrType.U64))).ToString(CultureInfo.InvariantCulture));
+                    output.Write(((ulong)Heap.AsLong(Heap.Coerce(Pop(stack), IrType.U64))).ToString(CultureInfo.InvariantCulture));
                     break;
                 case 2:
                     output.Write(FormatFloat(Heap.Coerce(Pop(stack), IrType.F64).Float));
@@ -501,9 +501,9 @@ namespace Larva.Runtime.Vm
         private bool collectRequested;
         private string formatted = "";
 
-        private long PopLong(List<Value> stack) => (long)Heap.AsInteger(Heap.Coerce(Pop(stack), IrType.I64));
+        private long PopLong(ValueStack stack) => Heap.AsLong(Heap.Coerce(Pop(stack), IrType.I64));
 
-        private double PopDouble(List<Value> stack) => Heap.Coerce(Pop(stack), IrType.F64).Float;
+        private double PopDouble(ValueStack stack) => Heap.Coerce(Pop(stack), IrType.F64).Float;
 
         /// <summary>Up to 15 significant digits, written like C's <c>%.15g</c> (what native code prints).</summary>
         internal static string FormatFloat(double value)

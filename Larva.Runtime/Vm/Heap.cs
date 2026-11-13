@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Numerics;
 using Larva.IR;
 using Larva.IR.Lowering;
@@ -389,6 +390,16 @@ namespace Larva.Runtime.Vm
             return array.Plus((long)index * stride);
         }
 
+        /// <summary>The size of a value of <paramref name="type"/> (scalars without a layout lookup).</summary>
+        public int SizeOf(IrType type) => type switch
+        {
+            PrimitiveType { Kind: Primitive.Unit } => 0,
+            PrimitiveType { Kind: Primitive.Bool } => 1,
+            PrimitiveType p => p.BitWidth!.Value / 8,
+            GcType or ReferenceType or BoxType or PointerType or FunctionType => 8,
+            _ => LayoutOf(type).Size,
+        };
+
         public TypeLayout LayoutOf(IrType type)
         {
             if (!layouts.TryGetValue(type, out var layout))
@@ -396,8 +407,15 @@ namespace Larva.Runtime.Vm
             return layout;
         }
 
-        public int[] FieldOffsets(StructType type) =>
-            Layouts.FieldOffsets(type, shapes) ?? throw new VmException($"`{IrPrinter.FormatType(type, shapes)}` has no layout");
+        private readonly Dictionary<StructType, int[]> fieldOffsets = [];
+
+        /// <summary>Where each field of <paramref name="type"/> starts (computed once per struct type; callers only read it).</summary>
+        public int[] FieldOffsets(StructType type)
+        {
+            if (!fieldOffsets.TryGetValue(type, out var offsets))
+                fieldOffsets[type] = offsets = Layouts.FieldOffsets(type, shapes) ?? throw new VmException($"`{IrPrinter.FormatType(type, shapes)}` has no layout");
+            return offsets;
+        }
 
         public IrType FieldType(StructType type, int field) => shapes.Structs[type.Id].Fields[field].Substitute(type.Arguments);
 
@@ -406,7 +424,7 @@ namespace Larva.Runtime.Vm
         public Value Read(IrType type, Address address)
         {
             var allocation = Get(address, "read");
-            int size = LayoutOf(type).Size;
+            int size = SizeOf(type);
             if (address.Offset + size > allocation.Length)
                 throw new VmException($"read of {size}B at {address} overruns {allocation}");
             // A pointer in C's memory is a real address (C wrote it): seen as the interpreter sees native addresses, also
@@ -460,7 +478,7 @@ namespace Larva.Runtime.Vm
             var allocation = Get(address, "write");
             if (allocation.Kind == AllocationKind.Static && allocation.Sealed)
                 throw new VmException($"write: {address} is read-only static data");
-            int size = LayoutOf(type).Size;
+            int size = SizeOf(type);
             if (address.Offset + size > allocation.Length)
                 throw new VmException($"write of {size}B at {address} overruns {allocation}");
             Encode(type, Coerce(value, type), allocation.Bytes(address.Offset, size));
@@ -478,7 +496,12 @@ namespace Larva.Runtime.Vm
         }
 
         /// <summary>Converts a value to the representation of <paramref name="type"/> (what storing it into such a slot does).</summary>
-        public Value Coerce(Value value, IrType type)
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public Value Coerce(Value value, IrType type) =>
+            // The common case without the general method's frame: an integer already made for this integer type.
+            type is PrimitiveType scalar && value.IsWrappedInteger(scalar.Kind) ? value : CoerceAny(value, type);
+
+        private Value CoerceAny(Value value, IrType type)
         {
             if (value.Kind == ValueKind.Deferred)
                 return Read(type, value.Address);
@@ -489,6 +512,8 @@ namespace Larva.Runtime.Vm
                     return Value.UnitValue;
                 case PrimitiveType { Kind: Primitive.Bool }:
                     return Value.FromBool(value.IsTrue);
+                case PrimitiveType p when Numbers.SmallInteger(p.Kind):
+                    return value.TryBits(out long bits) ? Value.FromInt(bits, type) : Value.FromInt(AsInteger(value), type);
                 case PrimitiveType { IsInteger: true }:
                     return Value.FromInt(AsInteger(value), type);
                 case PrimitiveType { IsFloat: true }:
@@ -521,11 +546,20 @@ namespace Larva.Runtime.Vm
         {
             bool wideSource = value.Kind == ValueKind.Float && Numbers.IsWide(value.Type);
             if (!Numbers.IsWide(type) && !wideSource)
-                return Value.FromFloat(value.Kind == ValueKind.Float ? value.Float : (double)AsInteger(value), type);
+            {
+                if (value.Kind == ValueKind.Float)
+                    return ReferenceEquals(value.Type, type) ? value : Value.FromFloat(value.Float, type);
+                // Integers up to 2^53 convert exactly either way; larger ones round through the BigInteger as before.
+                return Value.FromFloat(value.TryLong(out long small) && small is >= -(1L << 53) and <= 1L << 53 ? small : (double)AsInteger(value), type);
+            }
             return value.Kind == ValueKind.Float
                 ? Value.FromFloatBits(value.FloatBitsAs(type), type)
                 : Value.FromFloatBits(SoftFloat.FromInteger(AsInteger(value), Numbers.FormatOf(type)), type);
         }
+
+        /// <summary>The low 64 bits of <see cref="AsInteger"/> (two's complement), without a BigInteger for 64-bit values.</summary>
+        public static long AsLong(Value value) =>
+            value.TryBits(out long bits) ? bits : (long)(ulong)(AsInteger(value) & ulong.MaxValue);
 
         public static BigInteger AsInteger(Value value) => value.Kind switch
         {
@@ -540,14 +574,22 @@ namespace Larva.Runtime.Vm
         public static Address AsAddress(Value value) => value.Kind switch
         {
             ValueKind.Pointer or ValueKind.Deferred => value.Address,
-            ValueKind.Int => Address.Unpack((ulong)(value.Int & ulong.MaxValue)),
+            ValueKind.Int => Address.Unpack((ulong)AsLong(value)),
             _ => throw new VmException($"{value} is not an address"),
         };
+
+        /// <summary>A value of <paramref name="type"/> as the bytes memory would hold (what a write stores).</summary>
+        public byte[] EncodeBytes(IrType type, Value value)
+        {
+            var bytes = new byte[SizeOf(type)];
+            Encode(type, Coerce(value, type), bytes);
+            return bytes;
+        }
 
         /// <summary>Decodes a value of <paramref name="type"/> from raw bytes (e.g. a field inside a struct value).</summary>
         public Value DecodeBytes(IrType type, ReadOnlySpan<byte> bytes) => Decode(type, bytes);
 
-        private Value Decode(IrType type, ReadOnlySpan<byte> bytes) => type switch
+        private Value Decode(IrType type, ReadOnlySpan<byte> bytes) => type is PrimitiveType scalar ? DecodeScalar(scalar, bytes) : type switch
         {
             PrimitiveType { Kind: Primitive.Unit } => Value.UnitValue,
             PrimitiveType { Kind: Primitive.Bool } => Value.FromBool(bytes[0] != 0),
@@ -557,6 +599,27 @@ namespace Larva.Runtime.Vm
             FunctionType => Value.FromFunction((int)BitConverter.ToUInt64(bytes)),
             _ => Value.FromStruct(bytes.ToArray(), type),
         };
+
+        private static Value DecodeScalar(PrimitiveType type, ReadOnlySpan<byte> bytes)
+        {
+            switch (type.Kind)
+            {
+                case Primitive.Unit: return Value.UnitValue;
+                case Primitive.Bool: return Value.FromBool(bytes[0] != 0);
+                case Primitive.I8: return Value.FromInt((sbyte)bytes[0], type);
+                case Primitive.U8: return Value.FromInt(bytes[0], type);
+                case Primitive.I16: return Value.FromInt(BinaryPrimitives.ReadInt16LittleEndian(bytes), type);
+                case Primitive.U16: return Value.FromInt(BinaryPrimitives.ReadUInt16LittleEndian(bytes), type);
+                case Primitive.I32: return Value.FromInt(BinaryPrimitives.ReadInt32LittleEndian(bytes), type);
+                case Primitive.U32: return Value.FromInt(BinaryPrimitives.ReadUInt32LittleEndian(bytes), type);
+                case Primitive.I64 or Primitive.U64: return Value.FromInt(BinaryPrimitives.ReadInt64LittleEndian(bytes), type);
+                case Primitive.F64: return Value.FromFloat(BinaryPrimitives.ReadDoubleLittleEndian(bytes), type);
+                case Primitive.F32: return Value.FromFloat(BinaryPrimitives.ReadSingleLittleEndian(bytes), type);
+                case Primitive.F16: return Value.FromFloat((double)BinaryPrimitives.ReadHalfLittleEndian(bytes), type);
+                case Primitive.F128 or Primitive.F256: return Value.FromFloatBits(new BigInteger(bytes, isUnsigned: true), type);
+                default: return Value.FromInt(new BigInteger(bytes, isUnsigned: !type.IsSigned), type);
+            }
+        }
 
         private static void Encode(IrType type, Value value, Span<byte> target)
         {
@@ -568,10 +631,24 @@ namespace Larva.Runtime.Vm
                     target[0] = (byte)(value.IsTrue ? 1 : 0);
                     break;
                 case ValueKind.Int:
-                    WriteBits(target, value.Int);
+                    if (value.TryBits(out long bits))
+                        WriteLong(target, bits, value.IsHighUnsigned);
+                    else
+                        WriteBits(target, value.Int);
                     break;
                 case ValueKind.Float:
-                    WriteBits(target, value.FloatBits);
+                    switch (value.Type)
+                    {
+                        case PrimitiveType { Kind: Primitive.F64 }:
+                            WriteLong(target, BitConverter.DoubleToInt64Bits(value.Float), unsigned: true);
+                            break;
+                        case PrimitiveType { Kind: Primitive.F32 }:
+                            WriteLong(target, BitConverter.SingleToUInt32Bits((float)value.Float), unsigned: true);
+                            break;
+                        default:
+                            WriteBits(target, value.FloatBits);
+                            break;
+                    }
                     break;
                 case ValueKind.Pointer:
                     BitConverter.TryWriteBytes(target, value.Address.Packed);
@@ -585,6 +662,19 @@ namespace Larva.Runtime.Vm
                 default:
                     throw new VmException($"cannot store {value} in memory");
             }
+        }
+
+        /// <summary>A 64-bit pattern into <paramref name="target"/>: its low bytes, or extended (by sign unless <paramref name="unsigned"/>) when wider.</summary>
+        private static void WriteLong(Span<byte> target, long value, bool unsigned)
+        {
+            if (target.Length >= 8)
+            {
+                BinaryPrimitives.WriteInt64LittleEndian(target, value);
+                target[8..].Fill(!unsigned && value < 0 ? (byte)0xFF : (byte)0);
+                return;
+            }
+            for (int i = 0; i < target.Length; i++, value >>= 8)
+                target[i] = (byte)value;
         }
 
         private static void WriteBits(Span<byte> target, BigInteger value)

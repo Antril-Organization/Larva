@@ -137,7 +137,7 @@ namespace Larva.Runtime.Vm
             try
             {
                 for (int a = 0; a < arguments.Length; a++)
-                    Heap.Write(frame.ArgumentTypes[a], frame.Arguments[a], arguments[a]);
+                    frame.StoreArgument(a, arguments[a]);
             }
             catch
             {
@@ -192,13 +192,13 @@ namespace Larva.Runtime.Vm
                     switch (op.OpCode)
                     {
                         case OpCode.LoadLocal:
-                            stack.Add(Heap.Read(frame.LocalTypes[a0], frame.Locals[a0]));
+                            stack.Add(frame.LoadLocal((int)a0));
                             break;
                         case OpCode.StoreLocal:
-                            Heap.Write(frame.LocalTypes[a0], frame.Locals[a0], Pop(stack));
+                            frame.StoreLocal((int)a0, Pop(stack));
                             break;
                         case OpCode.LoadArgument:
-                            stack.Add(Heap.Read(frame.ArgumentTypes[a0], frame.Arguments[a0]));
+                            stack.Add(frame.LoadArgument((int)a0));
                             break;
                         case OpCode.Const:
                             stack.Add(Value.FromInt(a0, null));
@@ -206,9 +206,26 @@ namespace Larva.Runtime.Vm
                         case OpCode.Add:
                         case OpCode.Sub:
                         case OpCode.Mul:
-                            var right = Pop(stack);
-                            stack.Add(Arithmetic(op.OpCode, Pop(stack), right));
+                        {
+                            var right = stack.Pop();
+                            var left = stack.Pop();
+                            if (left.Kind == ValueKind.Int && right.Kind == ValueKind.Int && (left.Type ?? right.Type) is PrimitiveType { Kind: >= Primitive.I8 and <= Primitive.U64 } small
+                                && left.TryBits(out long x) && right.TryBits(out long y))
+                            {
+                                // Integers of 64 bits or less: wrapping long arithmetic (congruent modulo 2^64, then wrapped to the type).
+                                stack.Add(Value.FromInt(op.OpCode switch { OpCode.Add => unchecked(x + y), OpCode.Sub => unchecked(x - y), _ => unchecked(x * y) }, small));
+                                break;
+                            }
+                            stack.Add(Arithmetic(op.OpCode, left, right));
                             break;
+                        }
+                        case OpCode.Compare when (Condition)op.SubOp != Condition.Ord:
+                        {
+                            var b = Pop(stack);
+                            var a = Pop(stack);
+                            stack.Add(Value.FromBool(Compare((Condition)op.SubOp, a, b)));
+                            break;
+                        }
                         case OpCode.Call:
                             Safepoint(frame);
                             if (CallFrom(frame, (int)a0) is { } called)
@@ -270,7 +287,8 @@ namespace Larva.Runtime.Vm
                             stack.Add(stack[^1]);
                             break;
                         case OpCode.Switch:
-                            var selector = Heap.AsInteger(Pop(stack));
+                            var popped = Pop(stack);
+                            var selector = popped.TryLong(out long chosen) ? chosen : Heap.AsInteger(popped);
                             if (selector >= 0 && selector < op.Operands.Length)
                             {
                                 frame.Pc = (int)op.Operands[(int)selector];
@@ -287,6 +305,35 @@ namespace Larva.Runtime.Vm
                             }
                             break;
                         }
+                        // The families straight to their (small) handlers: a call through one large method zeroes all of its
+                        // locals every time.
+                        case OpCode.Stack when (StackOp)op.SubOp == StackOp.Pop:
+                            stack.Pop();
+                            break;
+                        case OpCode.Stack:
+                            StackOperation(frame, op);
+                            break;
+                        case OpCode.Alu:
+                            Alu(stack, (AluOp)op.SubOp);
+                            break;
+                        case OpCode.Float:
+                            Fpu(stack, (FloatOp)op.SubOp);
+                            break;
+                        case OpCode.Convert:
+                            stack.Add(Convert(stack.Pop(), (ConvertOp)op.SubOp, frame, a0));
+                            break;
+                        case OpCode.Array:
+                            ArrayOperation(frame, op);
+                            break;
+                        case OpCode.Gc:
+                            GcOperation(frame, op);
+                            break;
+                        case OpCode.Generic:
+                            GenericOperation(frame, op);
+                            break;
+                        case OpCode.System when (SystemOp)op.SubOp is SystemOp.Safepoint or SystemOp.Poll:
+                            Safepoint(frame);
+                            break;
                         default:
                             ExecuteFamily(frame, op);
                             break;
@@ -342,12 +389,6 @@ namespace Larva.Runtime.Vm
             long a0 = op.Operands.Length > 0 ? op.Operands[0] : 0;
             switch (op.OpCode)
             {
-                case OpCode.Alu:
-                    Alu(stack, (AluOp)op.SubOp);
-                    break;
-                case OpCode.Float:
-                    Fpu(stack, (FloatOp)op.SubOp);
-                    break;
                 case OpCode.Compare:
                 {
                     var b = Pop(stack);
@@ -358,9 +399,6 @@ namespace Larva.Runtime.Vm
                         : Value.FromBool(Compare(condition, a, b)));
                     break;
                 }
-                case OpCode.Convert:
-                    stack.Add(Convert(Pop(stack), (ConvertOp)op.SubOp, frame, a0));
-                    break;
                 case OpCode.Object:
                     switch ((ObjectOp)op.SubOp)
                     {
@@ -374,9 +412,6 @@ namespace Larva.Runtime.Vm
                         default:
                             throw Unsupported(op);
                     }
-                    break;
-                case OpCode.Array:
-                    ArrayOperation(frame, op);
                     break;
                 case OpCode.Literal when (LiteralOp)op.SubOp == LiteralOp.SetGlobal:
                 {
@@ -395,9 +430,6 @@ namespace Larva.Runtime.Vm
                         LiteralOp.Zero => Heap.DecodeBytes(frame.Resolve(a0), new byte[Heap.LayoutOf(frame.Resolve(a0)).Size]),
                         _ => Constant(il.Constants[a0]),
                     });
-                    break;
-                case OpCode.Stack:
-                    StackOperation(frame, op);
                     break;
                 case OpCode.CallExtended:
                     switch ((CallOp)op.SubOp)
@@ -426,9 +458,6 @@ namespace Larva.Runtime.Vm
                             throw Unsupported(op);
                     }
                     break;
-                case OpCode.Generic:
-                    GenericOperation(frame, op);
-                    break;
                 case OpCode.Exception:
                     switch ((ExceptionOp)op.SubOp)
                     {
@@ -439,9 +468,6 @@ namespace Larva.Runtime.Vm
                         default:
                             throw Unsupported(op);
                     }
-                case OpCode.Gc:
-                    GcOperation(frame, op);
-                    break;
                 default:
                     throw Unsupported(op);
             }
@@ -490,10 +516,10 @@ namespace Larva.Runtime.Vm
                     break;
                 }
                 case StackOp.StoreArgument:
-                    Heap.Write(frame.ArgumentTypes[a0], frame.Arguments[a0], Pop(stack));
+                    frame.StoreArgument((int)a0, Pop(stack));
                     break;
                 case StackOp.Move:
-                    Heap.Write(frame.LocalTypes[a0], frame.Locals[a0], Heap.Read(frame.LocalTypes[op.Operands[1]], frame.Locals[op.Operands[1]]));
+                    frame.StoreLocal((int)a0, frame.LoadLocal((int)op.Operands[1]));
                     break;
                 case StackOp.LoadLocalAddress:
                     stack.Add(Value.FromPointer(frame.Locals[a0], IrType.RefMut(frame.LocalTypes[a0])));
@@ -588,7 +614,7 @@ namespace Larva.Runtime.Vm
             var arguments = new Value[callee.ArgumentCount];
             for (int a = arguments.Length - 1; a >= 0; a--)
                 arguments[a] = Pop(stack);
-            var witnesses = new IrType[callee.TypeParameterCount];
+            var witnesses = callee.TypeParameterCount == 0 ? [] : new IrType[callee.TypeParameterCount];
             for (int w = witnesses.Length - 1; w >= 0; w--)
             {
                 var witness = Pop(stack);
@@ -691,6 +717,55 @@ namespace Larva.Runtime.Vm
             return truncated > max ? max : truncated < min ? min : truncated;
         }
 
+        /// <summary><see cref="SaturatedInteger"/> for a double and an integer type of 64 bits or less, without a BigInteger.</summary>
+        private static Value SaturatedSmall(double value, PrimitiveType target)
+        {
+            const double TwoTo63 = 9223372036854775808.0, TwoTo64 = 18446744073709551616.0;
+            if (double.IsNaN(value))
+                return Value.FromInt(0L, target);
+            double truncated = Math.Truncate(value);
+            int bits = target.BitWidth!.Value;
+            if (target.Kind == Primitive.U64)
+            {
+                ulong unsigned = truncated <= 0 ? 0 : truncated >= TwoTo64 ? ulong.MaxValue : (ulong)truncated;
+                return Value.FromInt((long)unsigned, target);
+            }
+            long max = target.IsSigned ? (bits == 64 ? long.MaxValue : (1L << (bits - 1)) - 1) : (1L << bits) - 1;
+            long min = target.IsSigned ? -max - 1 : 0;
+            long whole = truncated >= TwoTo63 ? long.MaxValue : truncated < -TwoTo63 ? long.MinValue : (long)truncated;
+            return Value.FromInt(Math.Clamp(whole, min, max), target);
+        }
+
+        /// <summary><c>conv.bitcast</c> between 32/64-bit floats and integers of 64 bits or less, without a BigInteger (null otherwise).</summary>
+        private static Value? FastBitCast(Value value, IrType to)
+        {
+            long bits;
+            if (value.Kind == ValueKind.Float)
+            {
+                switch (value.Type)
+                {
+                    case PrimitiveType { Kind: Primitive.F64 }: bits = BitConverter.DoubleToInt64Bits(value.Float); break;
+                    case PrimitiveType { Kind: Primitive.F32 }: bits = BitConverter.SingleToUInt32Bits((float)value.Float); break;
+                    default: return null;
+                }
+            }
+            else if (value.Kind is ValueKind.Int or ValueKind.Bool && value.TryBits(out long raw))
+            {
+                bits = raw;
+            }
+            else
+            {
+                return null;
+            }
+            return to switch
+            {
+                PrimitiveType { Kind: Primitive.F64 } => Value.FromFloat(BitConverter.Int64BitsToDouble(bits), to),
+                PrimitiveType { Kind: Primitive.F32 } => Value.FromFloat(BitConverter.UInt32BitsToSingle((uint)bits), to),
+                PrimitiveType p when Numbers.SmallInteger(p.Kind) => Value.FromInt(bits, to),
+                _ => null,
+            };
+        }
+
         private Value Convert(Value value, ConvertOp op, Frame frame, long operand)
         {
             switch (op)
@@ -698,16 +773,28 @@ namespace Larva.Runtime.Vm
                 case ConvertOp.Conv or ConvertOp.Cast:
                     var target = frame.Resolve(operand);
                     if (target is PrimitiveType { IsInteger: true } integer && value.Kind == ValueKind.Float)
-                        return Value.FromInt(SaturatedInteger(value, integer), target);
+                    {
+                        return Numbers.SmallInteger(integer.Kind) && !Numbers.IsWide(value.Type)
+                            ? SaturatedSmall(value.Float, integer)
+                            : Value.FromInt(SaturatedInteger(value, integer), target);
+                    }
                     return Heap.Coerce(value, target);
                 case ConvertOp.BitCast:
                     var to = frame.Resolve(operand);
+                    if (FastBitCast(value, to) is { } cast)
+                        return cast;
                     var bits = value.Kind == ValueKind.Float ? value.FloatBits : Heap.AsInteger(value);
                     return to.IsFloat
                         ? Value.FromFloatBits(bits & ((BigInteger.One << to.BitWidth!.Value) - 1), to)
                         : Value.FromInt(bits, to);
                 case ConvertOp.SignExtend or ConvertOp.ZeroExtend or ConvertOp.Truncate:
                     int width = (int)operand;
+                    if (width is > 0 and <= 64 && value.Kind == ValueKind.Int && Numbers.SmallInteger((value.Type as PrimitiveType)?.Kind ?? Primitive.Unit) && value.TryBits(out long raw))
+                    {
+                        ulong low = width == 64 ? (ulong)raw : (ulong)raw & ((1UL << width) - 1);
+                        long extended = op == ConvertOp.SignExtend && width < 64 && (low >> (width - 1) & 1) != 0 ? (long)low - (1L << width) : (long)low;
+                        return Value.FromInt(extended, value.Type);
+                    }
                     var masked = Heap.AsInteger(value) & ((BigInteger.One << width) - 1);
                     if (op == ConvertOp.SignExtend && !(masked >> (width - 1)).IsZero)
                         masked -= BigInteger.One << width;
@@ -719,14 +806,8 @@ namespace Larva.Runtime.Vm
 
         // ── Helpers ────────────────────────────────────────────────
 
-        private static Value Pop(List<Value> stack)
-        {
-            if (stack.Count == 0)
-                throw new VmException("operand stack underflow");
-            var value = stack[^1];
-            stack.RemoveAt(stack.Count - 1);
-            return value;
-        }
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        private static Value Pop(ValueStack stack) => stack.Pop();
 
         private static VmException Unsupported(Operation op) =>
             new($"`{op.Mnemonic}` is not supported by the interpreter yet");
@@ -760,21 +841,93 @@ namespace Larva.Runtime.Vm
                 : value.Type is null ? (long)value.Int : value.Int,
             ValueKind.Float => value.Float,
             ValueKind.Pointer => value.Address.Packed,
-            ValueKind.Struct => value.Bytes,
+            ValueKind.Struct => value.Bytes!.ToArray(), // a copy: slots may share a value's bytes
             _ => value,
         };
 
-        /// <summary>One activation: witnesses, argument and local slots in memory, operand stack and program counter.</summary>
+        /// <summary>
+        /// What every activation of a function shares: which slots have their address taken (<c>ldloca</c>, <c>ldarga</c>)
+        /// and so live in memory, and for non-generic code the slot types and the zero value of each held slot.
+        /// </summary>
+        private sealed class FunctionShape
+        {
+            public required bool[] AddressedLocals;
+            public required bool[] AddressedArguments;
+            /// <summary>Null addresses for every slot, shared by the frames that keep all their slots as values.</summary>
+            public required Address[] NoLocals;
+            public required Address[] NoArguments;
+            public IrType[]? LocalTypes;
+            public IrType[]? ArgumentTypes;
+            public Value[]? LocalZeros;
+            public Value[]? ArgumentZeros;
+        }
+
+        private FunctionShape?[]? functionShapes;
+
+        private FunctionShape ShapeOf(int index, IlFunction function, IrType[] typeArguments)
+        {
+            functionShapes ??= new FunctionShape?[il.Functions.Length];
+            if (functionShapes[index] is { } known)
+                return known;
+            var locals = new bool[function.LocalTypes.Length];
+            var arguments = new bool[function.ArgumentTypes.Length];
+            foreach (var op in function.Body.Operations)
+            {
+                if (op.OpCode != OpCode.Stack || op.Operands.Length == 0)
+                    continue;
+                if ((StackOp)op.SubOp == StackOp.LoadLocalAddress && op.Operands[0] < locals.Length)
+                    locals[op.Operands[0]] = true;
+                else if ((StackOp)op.SubOp == StackOp.LoadArgumentAddress && op.Operands[0] < arguments.Length)
+                    arguments[op.Operands[0]] = true;
+            }
+            var shape = new FunctionShape
+            {
+                AddressedLocals = locals,
+                AddressedArguments = arguments,
+                NoLocals = new Address[locals.Length],
+                NoArguments = new Address[arguments.Length],
+            };
+            if (function.TypeParameterCount == 0)
+            {
+                shape.LocalTypes = [.. function.LocalTypes.Select(t => il.Types[t])];
+                shape.ArgumentTypes = [.. function.ArgumentTypes.Select(t => il.Types[t])];
+                shape.LocalZeros = Zeros(shape.LocalTypes, locals);
+                shape.ArgumentZeros = Zeros(shape.ArgumentTypes, arguments);
+            }
+            return functionShapes[index] = shape;
+        }
+
+        /// <summary>The value an unwritten slot reads as (its zero bytes decoded), for the slots held as values.</summary>
+        private Value[] Zeros(IrType[] types, bool[] addressed)
+        {
+            var zeros = new Value[types.Length];
+            for (int i = 0; i < types.Length; i++)
+            {
+                if (!addressed[i])
+                    zeros[i] = Heap.DecodeBytes(types[i], new byte[Heap.SizeOf(types[i])]);
+            }
+            return zeros;
+        }
+
+        /// <summary>
+        /// One activation: witnesses, argument and local slots, operand stack and program counter. A slot whose address is
+        /// never taken holds its value (coerced to the slot's type, as storing it in memory would); the others live in the
+        /// heap, so pointers to them work like any address.
+        /// </summary>
         private sealed class Frame
         {
             public readonly IlFunction Function;
             public readonly int Index;
             public readonly IrType[] TypeArguments;
             public readonly IrType[] ArgumentTypes;
+            /// <summary>The memory of each argument whose address is taken (null addresses for the ones held as values).</summary>
             public readonly Address[] Arguments;
             public readonly IrType[] LocalTypes;
+            /// <summary>The memory of each local whose address is taken (null addresses for the ones held as values).</summary>
             public readonly Address[] Locals;
-            public readonly List<Value> Stack = [];
+            private readonly Value[] argumentValues;
+            private readonly Value[] localValues;
+            public readonly ValueStack Stack = new();
             public int Pc;
 
             /// <summary>The exception being handled (set when a handler is entered; used by <c>eh.rethrow</c>).</summary>
@@ -783,17 +936,76 @@ namespace Larva.Runtime.Vm
             /// <summary>Open arena regions when the frame started; unwinding closes anything above.</summary>
             public int RegionDepth;
             private readonly Interpreter vm;
+            private readonly Heap heap;
+
+            /// <summary>Whether any slot lives in the heap (freed when the frame is released).</summary>
+            private readonly bool inMemory;
 
             public Frame(Interpreter vm, int index, IlFunction function, IrType[] typeArguments)
             {
                 this.vm = vm;
+                heap = vm.Heap;
                 Index = index;
                 Function = function;
                 TypeArguments = typeArguments;
-                ArgumentTypes = [.. function.ArgumentTypes.Select(t => Resolve(t))];
-                LocalTypes = [.. function.LocalTypes.Select(t => Resolve(t))];
-                Arguments = [.. ArgumentTypes.Select(t => new Address(vm.Heap.Allocate(AllocationKind.Frame, t).Id, 0))];
-                Locals = [.. LocalTypes.Select(t => new Address(vm.Heap.Allocate(AllocationKind.Frame, t).Id, 0))];
+                var shape = vm.ShapeOf(index, function, typeArguments);
+                ArgumentTypes = shape.ArgumentTypes ?? [.. function.ArgumentTypes.Select(t => Resolve(t))];
+                LocalTypes = shape.LocalTypes ?? [.. function.LocalTypes.Select(t => Resolve(t))];
+                argumentValues = shape.ArgumentZeros is { } argumentZeros ? (Value[])argumentZeros.Clone() : vm.Zeros(ArgumentTypes, shape.AddressedArguments);
+                localValues = shape.LocalZeros is { } localZeros ? (Value[])localZeros.Clone() : vm.Zeros(LocalTypes, shape.AddressedLocals);
+                Arguments = Slots(ArgumentTypes, shape.AddressedArguments, shape.NoArguments);
+                Locals = Slots(LocalTypes, shape.AddressedLocals, shape.NoLocals);
+                inMemory = !ReferenceEquals(Arguments, shape.NoArguments) || !ReferenceEquals(Locals, shape.NoLocals);
+            }
+
+            private Address[] Slots(IrType[] types, bool[] addressed, Address[] none)
+            {
+                if (Array.IndexOf(addressed, true) < 0)
+                    return none; // every slot held as a value: the function's shared array of null addresses (never written)
+                var slots = new Address[types.Length];
+                for (int i = 0; i < types.Length; i++)
+                {
+                    if (addressed[i])
+                        slots[i] = new Address(heap.Allocate(AllocationKind.Frame, types[i]).Id, 0);
+                }
+                return slots;
+            }
+
+            [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+            public Value LoadLocal(int slot) => Locals[slot].IsNull ? localValues[slot] : heap.Read(LocalTypes[slot], Locals[slot]);
+
+            [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+            public void StoreLocal(int slot, Value value)
+            {
+                if (Locals[slot].IsNull)
+                    localValues[slot] = heap.Coerce(value, LocalTypes[slot]);
+                else
+                    heap.Write(LocalTypes[slot], Locals[slot], value);
+            }
+
+            [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+            public Value LoadArgument(int slot) => Arguments[slot].IsNull ? argumentValues[slot] : heap.Read(ArgumentTypes[slot], Arguments[slot]);
+
+            [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+            public void StoreArgument(int slot, Value value)
+            {
+                if (Arguments[slot].IsNull)
+                    argumentValues[slot] = heap.Coerce(value, ArgumentTypes[slot]);
+                else
+                    heap.Write(ArgumentTypes[slot], Arguments[slot], value);
+            }
+
+            /// <summary>The 8 bytes at <paramref name="offset"/> of a slot (where a root map says a handle is).</summary>
+            public ulong SlotWord(bool argument, int slot, int offset)
+            {
+                var memory = argument ? Arguments[slot] : Locals[slot];
+                if (!memory.IsNull)
+                    return (ulong)Heap.AsLong(heap.Read(IrType.U64, memory.Plus(offset)));
+                var value = argument ? argumentValues[slot] : localValues[slot];
+                if (value.Kind == ValueKind.Pointer && offset == 0)
+                    return value.Address.Packed;
+                var bytes = heap.EncodeBytes(argument ? ArgumentTypes[slot] : LocalTypes[slot], value);
+                return BitConverter.ToUInt64(bytes, offset);
             }
 
             /// <summary>Type token, with this frame's type arguments substituted (shared generic code).</summary>
@@ -801,8 +1013,12 @@ namespace Larva.Runtime.Vm
 
             public void Release()
             {
-                foreach (var slot in Arguments.Concat(Locals))
-                    vm.Heap.Free(slot, "frame exit");
+                if (!inMemory)
+                    return;
+                foreach (var slot in Arguments)
+                    heap.Free(slot, "frame exit");
+                foreach (var slot in Locals)
+                    heap.Free(slot, "frame exit");
             }
         }
     }

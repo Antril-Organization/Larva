@@ -28,16 +28,177 @@ namespace Larva.Runtime.Vm
     /// A value on the interpreter's operand stack. The IL is untyped, so every value carries the type of the slot, field or
     /// pointer it came from; untyped literals get their type when they are stored or converted.
     /// </summary>
-    public readonly record struct Value(ValueKind Kind, IrType? Type, BigInteger Int = default, double Float = 0, Address Address = default,
-        byte[]? Bytes = null, IrType? Witness = null, int Function = 0)
+    /// <remarks>
+    /// Compact (32 bytes): every scalar up to 64 bits lives in one <see cref="long"/> (an integer or bool, a float's double,
+    /// an address, a function index), so the common operations never make a <see cref="BigInteger"/>; only integers that
+    /// do not fit 64 bits (wide values of i128, u128, i256, u256, untyped literals beyond them) and the bits of f128/f256
+    /// are held as one. Struct bytes and witnesses are the reference.
+    /// </remarks>
+    public readonly struct Value : IEquatable<Value>
     {
-        public static readonly Value UnitValue = new(ValueKind.Unit, IrType.Unit);
+        /// <summary>How an integer is held: in <see cref="bits"/> as a long, as an unsigned long (2^63 and up), or a BigInteger in <see cref="reference"/>.</summary>
+        private const byte Signed = 0, Unsigned = 1, Big = 2;
 
-        public static Value FromBool(bool value) => new(ValueKind.Bool, IrType.Bool, value ? 1 : 0);
-        public static Value FromInt(BigInteger value, IrType? type) => new(ValueKind.Int, type, type is null ? value : Numbers.Wrap(value, type));
+        private readonly long bits;
+        private readonly object? reference;
+        /// <summary>
+        /// The kind (low byte), the integer form (next byte) and whether it is wrapped (bit 16: an integer made for its
+        /// 64-bit-or-narrower type by <see cref="FromInt(long, IrType?)"/>, already in that type's range). One field, so the
+        /// struct has four and the JIT keeps its fields in registers.
+        /// </summary>
+        private readonly int tag;
+
+        private ValueKind kind => (ValueKind)(byte)tag;
+        private byte form => (byte)(tag >> 8);
+        private bool wrapped => (tag & WrappedBit) != 0;
+        private const int WrappedBit = 1 << 16;
+
+        private static int Tag(ValueKind kind, byte form, bool wrapped) => (byte)kind | form << 8 | (wrapped ? WrappedBit : 0);
+
+        public ValueKind Kind => kind;
+        public IrType? Type { get; }
+
+        private Value(ValueKind kind, IrType? type, long bits, byte form = Signed, object? reference = null, bool wrapped = false)
+        {
+            tag = Tag(kind, form, wrapped);
+            Type = type;
+            this.bits = bits;
+            this.reference = reference;
+        }
+
+        /// <summary>Whether this is an integer of primitive <paramref name="primitive"/> (64 bits or less) already wrapped to it: storing it there changes nothing.</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        internal bool IsWrappedInteger(Primitive primitive) => wrapped && ((PrimitiveType)Type!).Kind == primitive;
+
+        public Value(ValueKind Kind, IrType? Type, BigInteger Int = default, double Float = 0, Address Address = default,
+            byte[]? Bytes = null, IrType? Witness = null, int Function = 0)
+        {
+            this.Type = Type;
+            byte form = Signed;
+            reference = null;
+            switch (Kind)
+            {
+                case ValueKind.Float:
+                    bits = BitConverter.DoubleToInt64Bits(Float);
+                    reference = Numbers.IsWide(Type) ? Int : null;
+                    break;
+                case ValueKind.Pointer or ValueKind.Deferred:
+                    bits = (long)Address.Packed;
+                    break;
+                case ValueKind.Struct:
+                    bits = 0;
+                    reference = Bytes;
+                    break;
+                case ValueKind.Witness:
+                    bits = 0;
+                    reference = Witness;
+                    break;
+                case ValueKind.Function:
+                    bits = Function;
+                    break;
+                default:
+                    (bits, form, reference) = Hold(Int);
+                    break;
+            }
+            tag = Tag(Kind, form, wrapped: false);
+        }
+
+        /// <summary>How <see cref="Value"/> holds this integer.</summary>
+        private static (long Bits, byte Form, object? Reference) Hold(BigInteger value) =>
+            value >= long.MinValue && value <= long.MaxValue ? ((long)value, Signed, null)
+            : value.Sign > 0 && value <= ulong.MaxValue ? ((long)(ulong)value, Unsigned, null)
+            : (0, Big, value);
+
+        /// <summary>An integer (or bool) value; 0 for other kinds, except a wide float, whose bits it is.</summary>
+        public BigInteger Int => kind switch
+        {
+            ValueKind.Int or ValueKind.Bool or ValueKind.Unit => form switch
+            {
+                Signed => bits,
+                Unsigned => (ulong)bits,
+                _ => (BigInteger)reference!,
+            },
+            ValueKind.Float when reference is BigInteger wide => wide,
+            _ => BigInteger.Zero,
+        };
+
+        public double Float => kind == ValueKind.Float ? BitConverter.Int64BitsToDouble(bits) : 0;
+        public Address Address => kind is ValueKind.Pointer or ValueKind.Deferred ? Address.Unpack((ulong)bits) : default;
+        public byte[]? Bytes => reference as byte[];
+        public IrType? Witness => kind == ValueKind.Witness ? reference as IrType : null;
+        public int Function => kind == ValueKind.Function ? (int)bits : 0;
+
+        /// <summary>An integer, bool or address held in 64 bits: its two's complement bits (false for wider integers and other kinds).</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        internal bool TryBits(out long value)
+        {
+            value = bits;
+            return form != Big && kind is ValueKind.Int or ValueKind.Bool or ValueKind.Pointer or ValueKind.Deferred;
+        }
+
+        /// <summary>An integer or bool whose value fits a long, as that long (false for others, also for u64 values from 2^63).</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        internal bool TryLong(out long value)
+        {
+            value = bits;
+            return form == Signed && kind is ValueKind.Int or ValueKind.Bool;
+        }
+
+        /// <summary>For <see cref="TryBits"/> values: whether the value is 2^63 or more (bits read as unsigned; an address's always are).</summary>
+        internal bool IsHighUnsigned => form == Unsigned || bits < 0 && kind is ValueKind.Pointer or ValueKind.Deferred;
+
+        /// <summary>A narrow float's double, straight from the bits (no kind check).</summary>
+        internal double RawDouble => BitConverter.Int64BitsToDouble(bits);
+
+        public static readonly Value UnitValue = new(ValueKind.Unit, IrType.Unit, 0L);
+
+        public static Value FromBool(bool value) => new(ValueKind.Bool, IrType.Bool, value ? 1L : 0L);
+
+        public static Value FromInt(BigInteger value, IrType? type)
+        {
+            if (type is PrimitiveType p && Numbers.SmallInteger(p.Kind) && value >= long.MinValue && value <= ulong.MaxValue)
+                return FromInt(value <= long.MaxValue ? (long)value : (long)(ulong)value, type);
+            var (bits, form, reference) = Hold(type is null ? value : Numbers.Wrap(value, type));
+            return new(ValueKind.Int, type, bits, form, reference);
+        }
+
+        /// <summary>An integer from a long, wrapped to <paramref name="type"/> (for 64 bits or less without a BigInteger).</summary>
+        public static Value FromInt(long value, IrType? type)
+        {
+            if (type is not PrimitiveType p)
+                return new(ValueKind.Int, type, value); // untyped, or not an integer type: nothing to wrap
+            switch (p.Kind)
+            {
+                case Primitive.I8: return new(ValueKind.Int, type, (sbyte)value, wrapped: true);
+                case Primitive.I16: return new(ValueKind.Int, type, (short)value, wrapped: true);
+                case Primitive.I32: return new(ValueKind.Int, type, (int)value, wrapped: true);
+                case Primitive.I64: return new(ValueKind.Int, type, value, wrapped: true);
+                case Primitive.I128 or Primitive.I256: return new(ValueKind.Int, type, value);
+                case Primitive.U8: return new(ValueKind.Int, type, (byte)value, wrapped: true);
+                case Primitive.U16: return new(ValueKind.Int, type, (ushort)value, wrapped: true);
+                case Primitive.U32: return new(ValueKind.Int, type, (uint)value, wrapped: true);
+                case Primitive.U64: return new(ValueKind.Int, type, value, value < 0 ? Unsigned : Signed, wrapped: true);
+                case Primitive.U128 or Primitive.U256:
+                {
+                    if (value >= 0)
+                        return new(ValueKind.Int, type, value);
+                    var (bits, form, reference) = Hold(Numbers.Wrap(value, type));
+                    return new(ValueKind.Int, type, bits, form, reference);
+                }
+                default:
+                    return new(ValueKind.Int, type, value); // bool, unit, floats: as given (Wrap leaves them)
+            }
+        }
+
+        /// <summary>An integer from its 64 bits read as unsigned, wrapped to <paramref name="type"/>.</summary>
+        internal static Value FromUnsigned(ulong value, IrType? type) =>
+            value <= long.MaxValue || type is PrimitiveType p && Numbers.SmallInteger(p.Kind)
+                ? FromInt((long)value, type)
+                : FromInt((BigInteger)value, type);
+
         public static Value FromFloat(double value, IrType type) => Numbers.IsWide(type)
             ? FromFloatBits(SoftFloat.FromDouble(value, Numbers.FormatOf(type)), type)
-            : new(ValueKind.Float, type, Float: Numbers.Round(value, type));
+            : new(ValueKind.Float, type, BitConverter.DoubleToInt64Bits(Numbers.Round(value, type)));
 
         /// <summary>A float from its IEEE bit pattern (exact for every width).</summary>
         public static Value FromFloatBits(BigInteger bits, IrType type)
@@ -46,7 +207,7 @@ namespace Larva.Runtime.Vm
                 return FromFloat(Numbers.FromBits(bits, type), type);
             var format = Numbers.FormatOf(type);
             bits &= format.Mask;
-            return new(ValueKind.Float, type, bits, SoftFloat.ToDouble(bits, format));
+            return new(ValueKind.Float, type, BitConverter.DoubleToInt64Bits(SoftFloat.ToDouble(bits, format)), Signed, bits);
         }
 
         /// <summary>A float's IEEE bit pattern.</summary>
@@ -54,19 +215,27 @@ namespace Larva.Runtime.Vm
 
         /// <summary>This float's bits as a value of (float) type <paramref name="type"/>: converted exactly when the width differs.</summary>
         public BigInteger FloatBitsAs(IrType type) => Type == type ? FloatBits : SoftFloat.Convert(FloatBits, Numbers.FormatOf(Type!), Numbers.FormatOf(type));
-        public static Value FromPointer(Address address, IrType? type) => new(ValueKind.Pointer, type, Address: address);
-        public static Value FromStruct(byte[] bytes, IrType type) => new(ValueKind.Struct, type, Bytes: bytes);
-        public static Value Deferred(Address address) => new(ValueKind.Deferred, null, Address: address);
-        public static Value FromWitness(IrType type) => new(ValueKind.Witness, null, Witness: type);
-        public static Value FromFunction(int index) => new(ValueKind.Function, IrType.U64, Function: index);
+        public static Value FromPointer(Address address, IrType? type) => new(ValueKind.Pointer, type, (long)address.Packed);
+        public static Value FromStruct(byte[] bytes, IrType type) => new(ValueKind.Struct, type, 0, Signed, bytes);
+        public static Value Deferred(Address address) => new(ValueKind.Deferred, null, (long)address.Packed);
+        public static Value FromWitness(IrType type) => new(ValueKind.Witness, null, 0, Signed, type);
+        public static Value FromFunction(int index) => new(ValueKind.Function, IrType.U64, index);
 
-        public bool IsTrue => Kind switch
+        public bool IsTrue => kind switch
         {
-            ValueKind.Bool or ValueKind.Int => !Int.IsZero,
+            ValueKind.Bool or ValueKind.Int => form == Big ? !((BigInteger)reference!).IsZero : bits != 0,
             ValueKind.Float => Float != 0,
             ValueKind.Pointer => !Address.IsNull,
             _ => throw new VmException($"{this} is not a condition"),
         };
+
+        public bool Equals(Value other) =>
+            (tag & ~WrappedBit) == (other.tag & ~WrappedBit) && bits == other.bits && Equals(Type, other.Type) && Equals(reference, other.reference);
+
+        public override bool Equals(object? obj) => obj is Value other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(kind, bits, Type, reference);
+        public static bool operator ==(Value left, Value right) => left.Equals(right);
+        public static bool operator !=(Value left, Value right) => !left.Equals(right);
 
         public override string ToString() => Kind switch
         {
@@ -80,6 +249,43 @@ namespace Larva.Runtime.Vm
             ValueKind.Witness => $"witness {Witness}",
             _ => $"fn.{Function}",
         };
+    }
+
+    /// <summary>An operand stack: an array and a count (no version checks, no copies to pop).</summary>
+    internal sealed class ValueStack
+    {
+        private Value[] items = new Value[8];
+        private int count;
+
+        public int Count => count;
+
+        public ref Value this[int index] => ref items[index];
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public void Add(Value value)
+        {
+            if (count == items.Length)
+                Array.Resize(ref items, count * 2);
+            items[count++] = value;
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public Value Pop()
+        {
+            if (count == 0)
+                throw new VmException("operand stack underflow");
+            var value = items[--count];
+            items[count] = default; // no stale references for the host collector
+            return value;
+        }
+
+        public void Clear()
+        {
+            Array.Clear(items, 0, count);
+            count = 0;
+        }
+
+        public Span<Value>.Enumerator GetEnumerator() => items.AsSpan(0, count).GetEnumerator();
     }
 
     /// <summary>
@@ -131,7 +337,10 @@ namespace Larva.Runtime.Vm
             return p.IsSigned && wrapped >= modulus >> 1 ? wrapped - modulus : wrapped;
         }
 
-        public static bool IsWide(IrType? type) => type is PrimitiveType { IsFloat: true, BitWidth: > 64 };
+        public static bool IsWide(IrType? type) => type is PrimitiveType { Kind: Primitive.F128 or Primitive.F256 };
+
+        /// <summary>An integer kind of 64 bits or less (its values need no BigInteger).</summary>
+        public static bool SmallInteger(Primitive kind) => kind is >= Primitive.I8 and <= Primitive.U64;
 
         public static FloatFormat FormatOf(IrType type) => FloatFormat.Of(type.BitWidth!.Value);
 

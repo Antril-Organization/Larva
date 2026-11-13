@@ -236,11 +236,10 @@ namespace Larva.Runtime.Vm
                 var roots = frame.Function.Safepoints.FirstOrDefault(s => s.Operation == frame.Pc).Roots ?? frame.Function.GcRoots;
                 foreach (var root in roots)
                 {
-                    var slot = root.IsArgument ? frame.Arguments[root.Slot] : frame.Locals[root.Slot];
                     var type = root.IsArgument ? frame.ArgumentTypes[root.Slot] : frame.LocalTypes[root.Slot];
                     var offsets = root.Offsets ?? Heap.LayoutOf(type).GcOffsets;
                     foreach (int offset in offsets)
-                        Mark(Heap.AsAddress(Heap.Read(IrType.U64, slot.Plus(offset))));
+                        Mark(Address.Unpack(frame.SlotWord(root.IsArgument, root.Slot, offset)));
                 }
                 foreach (var value in frame.Stack)
                     MarkValue(value);
