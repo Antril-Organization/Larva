@@ -160,6 +160,30 @@ public sealed unsafe class AotTests : CheckedTest
     }
 
     /// <summary>
+    /// Finalizers once a thread has run: the main thread then fills a nursery block of its own (not larva_heap's), and the
+    /// runtime's object lookup (nursery_object, behind is_gc) read that block's extent from larva_heap alone, so every
+    /// object allocated there failed is_gc and larva_gc_finalizer registered nothing: the collection freed the objects
+    /// without running their finalizers (destructors stopped running after the first thread).
+    /// </summary>
+    [Fact]
+    public void Llvm_finalizers_run_after_a_thread_was_started()
+    {
+        var toolchain = Toolchain.Find();
+        Assert.SkipWhen(toolchain is null, Toolchain.Missing);
+        string program = Save(NativePrograms.FinalizedAfterThreadProgram() with { Name = "finthread" }, "finthread.lvo");
+        string exe = Path.Combine(Directory, "finthread-llvm.exe");
+        var (code, log) = Cli("native", "--exe", "--entry", "finalized_after_thread", "-o", exe, program);
+        Check("llvm: larva native --exe --entry finalized_after_thread", code == 0, log.Trim());
+        if (code != 0)
+            return;
+        var (exit, output, errors) = Execute(exe, ["1000"], stats: true);
+        // The newest object may be pinned by a stale stack word: all but a few must be finalized by the requested collection.
+        Check("llvm: finthread.exe 1000 = 990..1000: the objects allocated after the thread were finalized", exit == 0
+            && int.TryParse(output.Trim(), out int finalized) && finalized >= 990 && finalized <= 1000 && errors.Contains("errors 0"),
+            $"exit {exit}: {output.Trim()} {errors.Trim()}");
+    }
+
+    /// <summary>
     /// A handle stored through a `&mut` reference (or pointer) lands in memory whose owner the storing function cannot name:
     /// when that memory is an old object, the store must still be remembered (larva_gc_wb_at finds the owner), or the next
     /// minor collection leaves the old object pointing at the young object's former place.
