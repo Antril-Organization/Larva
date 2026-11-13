@@ -13,20 +13,20 @@ namespace Larva.Cli.Tests;
 /// </summary>
 internal sealed class LanguageWorld
 {
+    /// <summary>
+    /// The Antril dev pack: beside the repository (<c>../Antril/artifacts/pack/Antril</c>), or, in a worktree under
+    /// <c>.claude/worktrees</c>, beside the main checkout above it, or in a folder <c>LARVA_LANGUAGES</c> names.
+    /// </summary>
     public static string SourcePack { get; } = FindSourcePack();
 
-    /// <summary>The Antril repository beside this one (or beside the repository a worktree of it is under): its dev pack.</summary>
     private static string FindSourcePack()
     {
-        string? fallback = null;
-        for (var folder = new DirectoryInfo(LarvaProcess.Repository); folder is not null; folder = folder.Parent)
-        {
-            string pack = Path.Combine(folder.FullName, "..", "Antril", "artifacts", "pack", "Antril");
-            fallback ??= Path.GetFullPath(pack);
-            if (File.Exists(Path.Combine(pack, "language.json")))
-                return Path.GetFullPath(pack);
-        }
-        return fallback!;
+        var candidates = new List<string>();
+        for (var folder = new DirectoryInfo(LarvaProcess.Repository); folder?.Parent is not null; folder = folder.Parent)
+            candidates.Add(Path.Combine(folder.Parent.FullName, "Antril", "artifacts", "pack", "Antril"));
+        if (Environment.GetEnvironmentVariable("LARVA_LANGUAGES") is { Length: > 0 } list)
+            candidates.AddRange(list.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries).Select(f => Path.Combine(f, "Antril")));
+        return Path.GetFullPath(candidates.FirstOrDefault(c => File.Exists(Path.Combine(c, "language.json"))) ?? candidates[0]);
     }
 
     public static string Platform
@@ -59,6 +59,22 @@ internal sealed class LanguageWorld
         if (trustRegistry)
             File.WriteAllText(config, new JsonObject { ["languages.trust"] = RegistryPublicKey }.ToJsonString());
         Larva = new LarvaProcess { WorkingDirectory = Root, Config = config, UserLanguages = User };
+    }
+
+    /// <summary>
+    /// A copy of the dev pack in a pack folder of the world (<c>packs/&lt;name&gt;</c>), signed by the author key, that larva
+    /// reads through <c>LARVA_LANGUAGES</c> (not from a registry: no registry signature or pinned key is needed); its folder.
+    /// </summary>
+    public string LocalPack(string name)
+    {
+        string packs = Path.Combine(Root, "packs");
+        string pack = Path.Combine(packs, name);
+        Directory.CreateDirectory(pack);
+        foreach (string file in Directory.EnumerateFiles(SourcePack))
+            File.Copy(file, Path.Combine(pack, Path.GetFileName(file)));
+        Sign(pack, AuthorKey);
+        Larva.Languages = packs;
+        return pack;
     }
 
     /// <summary>A new ECDSA P-256 key in a PEM file of the world; its path (and its public key).</summary>

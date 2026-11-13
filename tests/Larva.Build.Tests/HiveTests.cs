@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
 using Hive;
 
 namespace Larva.Build.Tests;
@@ -285,6 +286,133 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
             described is { Kind: ProjectKind.Library, Sources.Count: 0, Libraries.Count: 1 } && described.Resources.Select(r => r.Name).OrderBy(n => n, StringComparer.Ordinal).SequenceEqual(["data/unit.txt", "mark"]),
             string.Join("; ", diagnostics));
         Check("an exe or a project without a version is not packed", Throws(() => HivePacker.Pack(project, library, packed, null, null), "packages are libraries"));
+    }
+
+    // ── publishing ──
+
+    /// <summary>A project's .queen names where it publishes: the shared token must not follow that address.</summary>
+    [Fact]
+    public void Publishing_sends_the_token_only_to_configured_registries()
+    {
+        var antril = new Uri("https://antril.org/hive/");
+        var evil = new Uri("https://evil.example/hive/");
+        var local = new Uri("http://127.0.0.1:8080/");
+        string? Env(Dictionary<string, string> variables, string name) => variables.GetValueOrDefault(name);
+        var shared = new Dictionary<string, string> { ["HIVE_TOKEN"] = "shared" };
+        Check("HIVE_TOKEN goes to a registry configured on this machine (with or without a scheme)",
+            HiveHttpProvider.TokenFor(antril, ["antril.org/hive"], n => Env(shared, n)) == "shared"
+            && HiveHttpProvider.TokenFor(antril, ["https://antril.org/hive/"], n => Env(shared, n)) == "shared"
+            && HiveHttpProvider.TokenFor(antril, HiveSettings.Defaults(), n => Env(shared, n)) == "shared");
+        Check("HIVE_TOKEN does not go to a registry a project names", HiveHttpProvider.TokenFor(evil, ["antril.org/hive"], n => Env(shared, n)) is null
+            && HiveHttpProvider.TokenFor(evil, [], n => Env(shared, n)) is null && HiveHttpProvider.TokenFor(evil, ["../registry", "file:x", "C:/r"], n => Env(shared, n)) is null);
+        Check("nor over another scheme or port of a configured host", HiveHttpProvider.TokenFor(new Uri("http://antril.org/hive/"), ["antril.org/hive"], n => Env(shared, n)) is null
+            && HiveHttpProvider.TokenFor(local, ["http://127.0.0.1:9090/"], n => Env(shared, n)) is null);
+        var own = new Dictionary<string, string> { ["HIVE_TOKEN"] = "shared", ["HIVE_TOKEN_EVIL_EXAMPLE"] = "mine", ["HIVE_TOKEN_127_0_0_1"] = "loop" };
+        Check("a registry's own variable (HIVE_TOKEN_<HOST>) is sent to it wherever it is named",
+            HiveHttpProvider.TokenVariableFor(evil) == "HIVE_TOKEN_EVIL_EXAMPLE" && HiveHttpProvider.TokenFor(evil, [], n => Env(own, n)) == "mine"
+            && HiveHttpProvider.TokenFor(local, [], n => Env(own, n)) == "loop" && HiveHttpProvider.TokenFor(antril, ["antril.org/hive"], n => Env(own, n)) == "shared");
+        Check("publishing without a token the registry may have is refused, naming the variable", Throws(() =>
+            new HiveHttpProvider(evil).Publish(PackageReference.Parse("T/X")!, new HiveIndexVersion { Version = "1.0.0", File = "x", Sha256 = new string('0', 64) }, [1], null), "HIVE_TOKEN_EVIL_EXAMPLE"));
+    }
+
+    // ── the cache ──
+
+    /// <summary>Several larva processes share the cache: unpacking the same version and remembering keys at once loses nothing.</summary>
+    [Fact]
+    public void Cache_writes_survive_concurrent_larvas()
+    {
+        string root = Path.Combine(hive.Root, "concurrent");
+        var cache = new HiveCache(root);
+        string fingerprint = new string('f', 64);
+        var failures = new List<Exception>();
+        void Try(Action action)
+        {
+            try { action(); }
+            catch (Exception e) { lock (failures) failures.Add(e); }
+        }
+        Parallel.For(0, 24, i => Try(() => cache.Trust(PackageReference.Parse($"P/N{i}")!, fingerprint)));
+        Parallel.For(0, 24, i => Try(() => cache.AddTrusted(PackageReference.Parse("P/Shared")!, new string((char)('a' + i % 6), 60) + i.ToString("D4"))));
+        var keys = JsonSerializer.Deserialize<Dictionary<string, List<string>>>(File.ReadAllBytes(Path.Combine(root, "keys.json")), HiveManifest.Json)!;
+        Check("keys remembered at once are all kept", failures.Count == 0 && Enumerable.Range(0, 24).All(i => keys.GetValueOrDefault($"P/N{i}") is [var one] && one == fingerprint) && keys["P/Shared"].Count == 24,
+            failures.Count > 0 ? failures[0].ToString() : $"{keys.Count} packages, {keys.GetValueOrDefault("P/Shared")?.Count} shared keys");
+        Check("…through whole files only (no partial file is left)", !Directory.EnumerateFiles(root, "*.partial").Any());
+
+        string source = Path.Combine(root, "src");
+        Directory.CreateDirectory(source);
+        File.WriteAllText(Path.Combine(source, "a.lvo"), new string('x', 200_000));
+        File.WriteAllText(Path.Combine(source, "b.txt"), "text");
+        string file = Path.Combine(root, "C-1.0.0.hive");
+        HiveArchive.Create(file, new HiveManifest { Package = "P/C", Version = "1.0.0" }, new Dictionary<string, string> { ["lib/a.lvo"] = Path.Combine(source, "a.lvo"), ["b.txt"] = Path.Combine(source, "b.txt") }, null);
+        var opened = HiveArchive.Open(File.ReadAllBytes(file), null, false);
+        string target = cache.Folder(PackageReference.Parse("P/C")!, "1.0.0");
+        Parallel.For(0, 8, _ => Try(() => HiveArchive.Extract(opened, target, "stamp")));
+        Check("the same version unpacked by several at once ends complete, stamped, with nothing half done beside it",
+            failures.Count == 0 && File.ReadAllText(Path.Combine(target, "b.txt")) == "text" && new FileInfo(Path.Combine(target, "lib", "a.lvo")).Length == 200_000
+            && cache.Stamp(PackageReference.Parse("P/C")!, "1.0.0") == "stamp" && !Directory.EnumerateDirectories(Path.GetDirectoryName(target)!, "*.partial").Any(),
+            failures.Count > 0 ? failures[0].ToString() : string.Join(", ", Directory.EnumerateFileSystemEntries(Path.GetDirectoryName(target)!)));
+        Check("a folder another larva left half done is cleared when the version is unpacked again", Cleared());
+        bool Cleared()
+        {
+            string stale = $"{target}.deadbeef.partial";
+            Directory.CreateDirectory(stale);
+            HiveArchive.Extract(opened, target, "stamp");
+            return !Directory.Exists(stale) && File.Exists(Path.Combine(target, "b.txt"));
+        }
+    }
+
+    /// <summary>The cache never mixes two packages up because the file system would (case, trailing dots), and a lock pins bytes, not just a version number.</summary>
+    [Fact]
+    public void Cache_folders_tell_names_apart_and_locks_pin_bytes()
+    {
+        string root = hive.Root;
+        var (_, _, _, cache, locked) = hive.Registry.Value;
+        Check("names that Windows would fold are refused (trailing dot, device names)",
+            PackageReference.Parse("Acme./Json") is null && PackageReference.Parse("Acme/Json.") is null && PackageReference.Parse("CON/Json") is null && PackageReference.Parse("Acme/com1.x") is null
+            && PackageReference.Parse("Acme/Json.Net") is not null);
+        var upper = PackageReference.Parse("Acme/Json")!;
+        var lower = PackageReference.Parse("acme/json")!;
+        Check("names that differ in case get different folders (lower case plus a hash of the exact name)",
+            !string.Equals(cache.Folder(upper, "1.0.0"), cache.Folder(lower, "1.0.0"), StringComparison.OrdinalIgnoreCase)
+            && Path.GetFileName(Path.GetDirectoryName(cache.Folder(upper, "1.0.0")))!.StartsWith("json-", StringComparison.Ordinal)
+            && cache.Folder(upper, "1.0.0") == cache.Folder(PackageReference.Parse("Acme/Json")!, "1.0.0"),
+            cache.Folder(upper, "1.0.0"));
+        Check("installed packages are listed by their exact names", cache.Installed().Any(i => i.Package.Id == "T/B" && i.Version == "1.3.0") && cache.Installed().All(i => i.Package.Author == "T"),
+            string.Join(", ", cache.Installed().Select(i => $"{i.Package.Id} {i.Version}")));
+        Check("an installed version carries the hash of the file it came from", cache.Has(PackageReference.Parse("T/B")!, "1.3.0", locked.Find("T/B")!.Sha256)
+            && !cache.Has(PackageReference.Parse("T/B")!, "1.3.0", new string('0', 64)) && cache.Stamp(PackageReference.Parse("T/B")!, "9.9.9") is null);
+
+        string folder = Path.Combine(root, "pinned");
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "Main.ant"), "Main() : i32 => 0;");
+        File.WriteAllText(Path.Combine(folder, "Pinned.queen"), $"""
+            queen 1.0;
+
+            chunk PROJ:
+               name: Pinned
+
+            chunk BUILD:
+               stdlib: none
+
+            chunk DEPS:
+               package: T/B@^1.0
+
+            chunk HIVE:
+               provider: ../registry,
+               cache: "{cache.Root.Replace("\\", "/")}",
+               verify: hashes
+            """);
+        locked.Save(folder);
+        var diagnostics = new List<QueenDiagnostic>();
+        var project = QueenProject.Load(Path.Combine(folder, "Pinned.queen"), null, diagnostics, HiveResolver.Create());
+        Check("the pinned version is used when the cache holds the pinned file", project is not null && !diagnostics.Any(d => d.IsError) && project.Dependencies.Any(d => d.Name == "B"), string.Join("; ", diagnostics));
+
+        var tampered = locked with { Packages = [.. locked.Packages.Select(p => p.Package == "T/B" ? p with { Sha256 = new string('a', 64) } : p)] };
+        tampered.Save(folder);
+        diagnostics.Clear();
+        QueenProject.Load(Path.Combine(folder, "Pinned.queen"), null, diagnostics, HiveResolver.Create());
+        Check("a cached version that is not the file the lock pins is refused, pointing at `hive restore`",
+            diagnostics.Any(d => d.Code == "QN108" && d.IsError && d.Message.Contains("not the file hive.lock pins", StringComparison.Ordinal) && d.Message.Contains("hive restore", StringComparison.Ordinal)),
+            string.Join("; ", diagnostics));
     }
 
     // ── helpers ──

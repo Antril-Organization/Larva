@@ -146,10 +146,43 @@ namespace Hive
 
     /// <summary>
     /// A registry on the web: the same files over HTTPS (plain HTTP only to this machine). Publishing sends the package with
-    /// <c>PUT Author/Name/version</c> and the token in <c>HIVE_TOKEN</c>; the registry checks it and updates the index.
+    /// <c>PUT Author/Name/version</c> and a token (see <see cref="TokenFor"/>); the registry checks it and updates the index.
     /// </summary>
     public sealed class HiveHttpProvider : HiveProvider
     {
+        public const string TokenVariable = "HIVE_TOKEN";
+
+        /// <summary>The variable that holds the token of one registry: <c>HIVE_TOKEN_</c> and its host in upper case, <c>.</c> and <c>-</c> as <c>_</c>.</summary>
+        public static string TokenVariableFor(Uri registry) =>
+            TokenVariable + "_" + registry.Host.ToUpperInvariant().Replace('.', '_').Replace('-', '_');
+
+        /// <summary>
+        /// The token that may be sent to <paramref name="registry"/>: the one in its own variable
+        /// (<see cref="TokenVariableFor"/>), else <c>HIVE_TOKEN</c> when the registry is one this machine is configured
+        /// with (<paramref name="trusted"/>: <c>larva config hive.provider</c>, or Hive's own registry); null otherwise. A
+        /// project's <c>.queen</c> names the registries it publishes to, so <c>HIVE_TOKEN</c> must not follow whatever
+        /// address a project gives.
+        /// </summary>
+        public static string? TokenFor(Uri registry, IEnumerable<string> trusted, Func<string, string?> environment)
+        {
+            if (environment(TokenVariableFor(registry)) is { Length: > 0 } own)
+                return own;
+            if (environment(TokenVariable) is not { Length: > 0 } shared)
+                return null;
+            foreach (var address in trusted)
+            {
+                string text = address.Trim();
+                if (text.StartsWith("file:", StringComparison.OrdinalIgnoreCase) || text.StartsWith('.') || Path.IsPathRooted(text))
+                    continue;
+                if (!text.Contains("://", StringComparison.Ordinal))
+                    text = "https://" + text;
+                if (Uri.TryCreate(text, UriKind.Absolute, out var configured) && configured.Scheme == registry.Scheme
+                    && string.Equals(configured.Host, registry.Host, StringComparison.OrdinalIgnoreCase) && configured.Port == registry.Port)
+                    return shared;
+            }
+            return null;
+        }
+
         private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromMinutes(2) };
         private readonly Uri root;
 
@@ -180,8 +213,9 @@ namespace Hive
 
         public override void Publish(PackageReference package, HiveIndexVersion version, byte[] file, string? publicKey)
         {
-            string token = Environment.GetEnvironmentVariable("HIVE_TOKEN")
-                ?? throw new HiveException($"publishing to {root} needs your token in HIVE_TOKEN");
+            string token = TokenFor(root, HiveSettings.Defaults(), Environment.GetEnvironmentVariable)
+                ?? throw new HiveException($"publishing to {root} needs your token in {TokenVariableFor(root)} " +
+                    $"({TokenVariable} alone is sent only to the registries this machine is configured with: `larva config hive.provider`)");
             using var request = new HttpRequestMessage(HttpMethod.Put, new Uri(root, $"{FolderOf(package)}/{version.Version}"))
             {
                 Content = new ByteArrayContent(file),

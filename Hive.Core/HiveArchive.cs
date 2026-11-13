@@ -125,28 +125,48 @@ namespace Hive
             }
         }
 
-        /// <summary>Unpacks a checked package into an empty folder (made here), then marks it complete.</summary>
-        public static void Extract(Opened package, string folder)
+        /// <summary>
+        /// Unpacks a checked package into <paramref name="folder"/>: written into a folder of its own next to it (with
+        /// <paramref name="stamp"/>, the package file's hash, as <see cref="HiveCache.StampFile"/> when given), then moved
+        /// into place, so the folder is either complete or not there. Several larva processes unpacking the same package
+        /// take turns (a <c>.lock</c> file beside the folder).
+        /// </summary>
+        public static void Extract(Opened package, string folder, string? stamp = null)
         {
             string root = Path.GetFullPath(folder);
-            string partial = root + ".partial";
-            if (Directory.Exists(partial))
-                Directory.Delete(partial, recursive: true);
-            Directory.CreateDirectory(partial);
-            foreach (var (path, bytes) in package.Files)
+            Directory.CreateDirectory(Path.GetDirectoryName(root)!);
+            using var held = HiveFileLock.Acquire(root + ".lock");
+            // Folders a larva that was stopped left behind.
+            foreach (string stale in Directory.EnumerateDirectories(Path.GetDirectoryName(root)!, Path.GetFileName(root) + ".*.partial"))
             {
-                string target = Path.GetFullPath(Path.Combine(partial, path));
-                if (!target.StartsWith(partial + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-                    throw new HiveException($"`{path}` would leave the package's folder");
-                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                File.WriteAllBytes(target, bytes);
+                try { Directory.Delete(stale, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
             }
-            File.WriteAllBytes(Path.Combine(partial, ManifestEntry), package.ManifestBytes);
-            if (package.Signature is not null)
-                File.WriteAllBytes(Path.Combine(partial, SignatureEntry), package.Signature);
-            if (Directory.Exists(root))
-                Directory.Delete(root, recursive: true);
-            Directory.Move(partial, root);
+            string partial = $"{root}.{Guid.NewGuid():N}.partial";
+            try
+            {
+                Directory.CreateDirectory(partial);
+                foreach (var (path, bytes) in package.Files)
+                {
+                    string target = Path.GetFullPath(Path.Combine(partial, path));
+                    if (!target.StartsWith(partial + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                        throw new HiveException($"`{path}` would leave the package's folder");
+                    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                    File.WriteAllBytes(target, bytes);
+                }
+                File.WriteAllBytes(Path.Combine(partial, ManifestEntry), package.ManifestBytes);
+                if (package.Signature is not null)
+                    File.WriteAllBytes(Path.Combine(partial, SignatureEntry), package.Signature);
+                if (stamp is not null)
+                    File.WriteAllText(Path.Combine(partial, HiveCache.StampFile), stamp);
+                if (Directory.Exists(root))
+                    Directory.Delete(root, recursive: true);
+                Directory.Move(partial, root);
+            }
+            catch
+            {
+                try { Directory.Delete(partial, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                throw;
+            }
         }
 
         /// <summary>
