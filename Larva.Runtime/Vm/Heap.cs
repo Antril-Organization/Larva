@@ -75,7 +75,8 @@ namespace Larva.Runtime.Vm
         public int TotalAllocations { get; private set; }
         public int TotalFrees { get; private set; }
 
-        public IEnumerable<Allocation> Live => allocations.Values.Where(a => !a.Freed);
+        /// <summary>The allocations not freed yet (a freed one leaves the table).</summary>
+        public IEnumerable<Allocation> Live => allocations.Values;
 
         public Allocation Allocate(AllocationKind kind, IrType type, int? size = null)
         {
@@ -93,7 +94,10 @@ namespace Larva.Runtime.Vm
             var allocation = Get(address, why);
             if (address.Offset != 0)
                 throw new VmException($"{why}: {address} is not the start of an allocation");
+            // Forgotten at once (its bytes and its entry): a freed id is never reused, so an address into it is still
+            // recognized as a use after free (an id below the next one that is not in the table).
             allocation.Freed = true;
+            allocations.Remove(allocation.Id);
             if (allocation.Kind is AllocationKind.Gc or AllocationKind.Heap)
                 TotalFrees++;
             if (allocation.Kind == AllocationKind.Native)
@@ -204,9 +208,11 @@ namespace Larva.Runtime.Vm
             if (address.IsNull)
                 throw new VmException($"{why}: null dereference");
             if (!allocations.TryGetValue(address.Allocation, out var allocation))
-                throw new VmException($"{why}: invalid address {address}");
-            if (allocation.Freed)
-                throw new VmException($"{why}: use after free of {allocation}");
+            {
+                throw new VmException(address.Allocation > 0 && address.Allocation < nextId
+                    ? $"{why}: use after free of #{address.Allocation}"
+                    : $"{why}: invalid address {address}");
+            }
             return allocation;
         }
 

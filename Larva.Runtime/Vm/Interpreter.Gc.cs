@@ -127,7 +127,7 @@ namespace Larva.Runtime.Vm
         private void ExitRegion()
         {
             int region = regions.Pop().Instance;
-            var dying = Heap.Live.Where(x => x.Kind == AllocationKind.Gc && x.Region == region).ToList();
+            var dying = Heap.Live.Where(x => x.Kind == AllocationKind.Gc && x.Region == region).OrderBy(x => x.Id).ToList();
             // Finalizers first, while everything in the region is still there for them to read.
             foreach (var allocation in dying)
                 Finalize(allocation);
@@ -256,7 +256,7 @@ namespace Larva.Runtime.Vm
 
             // Unreachable objects with a finalizer survive this collection (with what they reach): their finalizers run
             // after the sweep, and a later collection frees them once they are unreachable again.
-            var finalizing = Heap.Live.Where(a => a.Kind == AllocationKind.Gc && !a.Marked && a.Region is null && a.Finalizer is not null).ToList();
+            var finalizing = Heap.Live.Where(a => a.Kind == AllocationKind.Gc && !a.Marked && a.Region is null && a.Finalizer is not null).OrderBy(a => a.Id).ToList();
             foreach (var allocation in finalizing)
                 Mark(new Address(allocation.Id, 0));
 
