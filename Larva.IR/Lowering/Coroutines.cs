@@ -69,14 +69,16 @@ namespace Larva.IR.Lowering
         private static IrFunction Rewrite(IrFunction function, int frame, StructType frameStruct, int suspend, IrFunction suspendFunction,
             HashSet<int> awaits, ref StructDef frameDef)
         {
-            // The frame's new fields: the state, then one per local (but the result and the frame itself).
+            // The frame's new fields: the state, then one per argument and per local that lives across a pause (but the
+            // result and the frame itself); the other locals stay locals.
             int stateField = frameDef.Fields.Length;
             var fieldOf = new Dictionary<int, int>();
             var fields = new List<IrType>(frameDef.Fields) { IrType.I32 };
             var names = new List<string>(frameDef.FieldNames.Length == frameDef.Fields.Length ? frameDef.FieldNames : [.. Enumerable.Range(0, frameDef.Fields.Length).Select(i => $"${i}")]) { "$state" };
+            var acrossPauses = LiveAcrossPauses(function, awaits);
             for (int local = 1; local < function.Locals.Length; local++)
             {
-                if (local == frame)
+                if (local == frame || local > function.ArgumentCount && !acrossPauses.Contains(local))
                     continue;
                 fieldOf[local] = fields.Count;
                 fields.Add(function.Locals[local].Type);
@@ -193,6 +195,104 @@ namespace Larva.IR.Lowering
                 Locals = [.. locals],
                 Blocks = [dispatch, start, .. blocks, .. extra, unreachable],
             };
+        }
+
+        /// <summary>
+        /// The locals a coroutine needs in its frame: those live across a pause (used by an await call, or live after it,
+        /// on its way on or into its handlers), and every local borrowed anywhere (a reference to it may outlive a pause).
+        /// Liveness is conservative: every mention of a local is a use, and only an assignment to the whole local ends
+        /// it; exceptions reach a call's or a throw's handlers.
+        /// </summary>
+        private static HashSet<int> LiveAcrossPauses(IrFunction function, HashSet<int> awaits)
+        {
+            var blocks = function.Blocks;
+            int count = blocks.Length;
+            var gen = new HashSet<int>[count];
+            var kill = new HashSet<int>[count];
+            var mentioned = new HashSet<int>();
+            var borrowed = new HashSet<int>();
+            Place Mention(Place place)
+            {
+                mentioned.Add(place.Local);
+                foreach (var projection in place.Projections)
+                {
+                    if (projection is IndexProjection index)
+                        mentioned.Add(index.Local);
+                }
+                return place;
+            }
+            HashSet<int> Mentions(object value)
+            {
+                mentioned.Clear();
+                Map(value, Mention);
+                return mentioned;
+            }
+            for (int b = 0; b < count; b++)
+            {
+                var used = gen[b] = [];
+                var defined = kill[b] = [];
+                foreach (var statement in blocks[b].Statements)
+                {
+                    if (statement is AssignStatement { Value: RefRvalue reference })
+                        borrowed.Add(reference.Place.Local);
+                    bool whole = statement is AssignStatement { Target.Projections.Length: 0 };
+                    foreach (int local in Mentions(whole ? ((AssignStatement)statement).Value : statement))
+                    {
+                        if (!defined.Contains(local))
+                            used.Add(local);
+                    }
+                    if (whole)
+                        defined.Add(((AssignStatement)statement).Target.Local);
+                }
+                foreach (int local in Mentions(blocks[b].Terminator))
+                {
+                    if (!defined.Contains(local))
+                        used.Add(local);
+                }
+            }
+            static IEnumerable<int> Successors(Terminator terminator)
+            {
+                IEnumerable<int> targets = terminator switch
+                {
+                    GotoTerminator g => [g.Target],
+                    IfTerminator i => [i.Then, i.Else],
+                    SwitchTerminator s => [.. s.Targets, s.Otherwise],
+                    CallTerminator c => [c.Target],
+                    DropTerminator d => [d.Target],
+                    _ => [],
+                };
+                return terminator is IUnwinding unwinding ? targets.Concat(unwinding.Handlers.Select(h => h.Block)) : targets;
+            }
+            var successors = blocks.Select(block => Successors(block.Terminator).Where(t => t >= 0 && t < count).ToArray()).ToArray();
+            var liveIn = new HashSet<int>[count];
+            for (int b = 0; b < count; b++)
+                liveIn[b] = [.. gen[b]];
+            for (bool changed = true; changed;)
+            {
+                changed = false;
+                for (int b = count - 1; b >= 0; b--)
+                {
+                    foreach (int next in successors[b])
+                    {
+                        foreach (int local in liveIn[next])
+                        {
+                            if (!kill[b].Contains(local) && liveIn[b].Add(local))
+                                changed = true;
+                        }
+                    }
+                }
+            }
+            var result = new HashSet<int>(borrowed);
+            for (int b = 0; b < count; b++)
+            {
+                if (blocks[b].Terminator is not CallTerminator { Required: null, Callee: null } call || !awaits.Contains(call.Function))
+                    continue;
+                // The await is called again on resuming: what it mentions, and what is live after it, crosses the pause.
+                result.UnionWith(Mentions(call));
+                foreach (int next in successors[b])
+                    result.UnionWith(liveIn[next]);
+            }
+            return result;
         }
 
         private static Terminator ShiftTargets(Terminator terminator, Func<int, int> shift)

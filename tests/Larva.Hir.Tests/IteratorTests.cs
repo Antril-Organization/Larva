@@ -51,6 +51,67 @@ public sealed unsafe class IteratorTests : CheckedTest
         Check($"Run() = {expected}: the values before yield break (1), its finally (1), and Dispose() ran the finally once more (2)", same, $"LVM {onVm}, x64 {onX64}, LLVM {onLlvm}");
     }
 
+    /// <summary>
+    /// The frame keeps what lives across a pause: the loop's counter does, a temporary computed and yielded between two
+    /// pauses does not and stays a local of the step (a smaller frame); the values come out the same.
+    /// </summary>
+    [Fact]
+    public void Only_locals_live_across_a_yield_go_into_the_frame()
+    {
+        var p = new HirProgram("Counting");
+        var iteratorDef = new TypeDef { Namespace = "System", Name = "Iterator", Kind = TypeKind.Class, Flags = TypeFlags.Abstract };
+        var iterator = p.Assembly.Add(iteratorDef);
+        var It = HirProgram.T(iterator);
+        var current = HirProgram.Field(iterator, iteratorDef, "current", I);
+        var next = HirProgram.Method(iterator, iteratorDef, "Next", Bool, MethodFlags.Virtual | MethodFlags.Abstract);
+        var (prog, progDef) = p.Type("Program", TypeKind.Class, flags: TypeFlags.Static | TypeFlags.Abstract);
+
+        // class Program.Count$iterator0 : Iterator { iterator $Step() : bool { k = 0; while (k < 3) { t = k * 10; yield t + 1; k++; } } override Next() => $Step(); }
+        var frameDef = new TypeDef { Namespace = p.Assembly.Name, Name = "Program.Count$iterator0", Kind = TypeKind.Class, Flags = TypeFlags.Final, DeclaringType = prog.Index, Base = It };
+        var frame = p.Assembly.Add(frameDef);
+        var Fr = HirProgram.T(frame);
+        var step = HirProgram.Method(frame, frameDef, "$Step", Bool, MethodFlags.Iterator | MethodFlags.Final);
+        {
+            var m = new MethodBuilder(frameDef.Methods[^1]);
+            var k = m.Local("k", I);
+            var t = m.Local("t", I);
+            m.Do(Let(k, Int(0)), While(Lt(k, Int(3)), Let(t, Mul(k, Int(10))), new YieldStmt(Add(t, Int(1))), S(Inc(k)))).Done();
+        }
+        HirProgram.Method(frame, frameDef, "Next", Bool, MethodFlags.Virtual | MethodFlags.Override | MethodFlags.Final);
+        new MethodBuilder(frameDef.Methods[^1]).Do(Ret(new CallExpr(This(Fr), step, [], [], Bool) { NonVirtual = true })).Done();
+
+        // Run(): sum = 0; it = new Count$iterator0(); while (it.Next()) sum += it.current; return sum;   (1 + 11 + 21)
+        HirProgram.Method(prog, progDef, "Run", I, MethodFlags.Static);
+        {
+            var m = new MethodBuilder(progDef.Methods[^1]);
+            var sum = m.Local("sum", I);
+            var it = m.Local("it", It);
+            m.Do(Let(sum, Int(0)),
+                Let(it, new ConvertExpr(new NewExpr(null, [], [], Fr), ConversionKind.Upcast, It)),
+                While(CallOn(it, next, Bool), S(AddTo(sum, F(it, current, I)))),
+                Ret(sum)).Done();
+        }
+        var lowered = HirLowerer.Lower(p.Assembly);
+        Check("the program lowers", lowered.Success, string.Join("; ", lowered.Errors));
+        Require();
+        var resumable = Larva.IR.Lowering.Coroutines.Lower(lowered.Module!);
+        var frameStruct = resumable.Structs.Single(s => s.Name == "Counting.Program.Count$iterator0");
+        Check("the counter lives in the frame", frameStruct.FieldNames.Any(n => n.StartsWith("$k", StringComparison.Ordinal)), string.Join(", ", frameStruct.FieldNames));
+        Check("the temporary between two pauses does not", !frameStruct.FieldNames.Any(n => n.StartsWith("$t", StringComparison.Ordinal)), string.Join(", ", frameStruct.FieldNames));
+        var vm = Larva.IR.Compiler.Compile(lowered.Module!);
+        Check("the IR passes the type and borrow checks", vm.Il is not null, string.Join("; ", vm.TypeErrors.Concat<object>(vm.Diagnostics).Take(6)));
+        if (vm.Il is null)
+            return;
+        var x64 = X64Backend.Compile(lowered.Module!);
+        Check("x64 compiles it", x64.Success, x64.ToString());
+        if (!x64.Success)
+            return;
+        using var image = x64.Program!.Load();
+        var onVm = new Interpreter(vm.Il).Run("Counting.Program.Run");
+        int onX64 = ((delegate* unmanaged<int>)image.Address("Counting.Program.Run"))();
+        Check("Run() = 33 on LVM and x64", Equals(onVm, 33L) && onX64 == 33, $"LVM {onVm}, x64 {onX64}");
+    }
+
     private static HirProgram Program()
     {
         var p = new HirProgram("Iterators");
