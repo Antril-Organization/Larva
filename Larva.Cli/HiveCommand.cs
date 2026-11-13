@@ -91,9 +91,14 @@ internal static class HiveCommand
                     if (rest.Count == 0 || PackageReference.Parse(rest[0]) is not { } added)
                         throw new HiveException("larva hive add Author/Name[@version]");
                     string queen = FindQueen(rest.ElementAtOrDefault(1));
+                    // Installed first, written to the project after: a package that cannot be installed leaves the
+                    // project as it was (one that builds), not with a dependency it cannot resolve.
+                    int installed = Install(queen, added);
+                    if (installed != 0)
+                        return installed;
                     AddDependency(queen, added);
                     Console.WriteLine($"added `package: {added}` to {Path.GetFileName(queen)}");
-                    return Install(queen);
+                    return 0;
                 }
                 case "install":
                     return Install(FindQueen(rest.FirstOrDefault()));
@@ -209,12 +214,33 @@ internal static class HiveCommand
         return new HiveInstaller(HiveCache.For(project.Hive), providers, project.Hive.RequireSignatures, Console.WriteLine);
     }
 
-    private static int Install(string queen)
+    /// <summary>Installs the project's packages (and <paramref name="added"/>, one not in the file yet); pins them in hive.lock.</summary>
+    private static int Install(string queen, PackageReference? added = null)
     {
         // Read without resolving packages: they are what is being installed.
         var project = LoadProject(queen, resolvePackages: false);
         var previous = HiveLock.Load(project.Folder);
-        var locked = Installer(project).Install(project.Packages, previous);
+        var packages = project.Packages.ToList();
+        if (added is not null)
+        {
+            packages.RemoveAll(p => p.Id == added.Id);
+            packages.Add(added);
+        }
+        // The packages of the projects it depends on (`proj:`, through any depth) are built with it: installed with it,
+        // and pinned in this project's lock, which is the one a build of this project reads.
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { project.File };
+        void Collect(QueenProject dependency)
+        {
+            if (!seen.Add(dependency.File))
+                return;
+            foreach (var package in dependency.Packages.Where(p => !packages.Any(known => known.ToString() == p.ToString())))
+                packages.Add(package);
+            foreach (var below in dependency.Dependencies)
+                Collect(below);
+        }
+        foreach (var dependency in project.Dependencies)
+            Collect(dependency);
+        var locked = Installer(project).Install(packages, previous);
         locked.Save(project.Folder);
         foreach (var entry in locked.Packages)
             Console.WriteLine($"  {entry.Package} {entry.Version}{(entry.Key is null ? " (unsigned)" : "")}");
@@ -237,7 +263,9 @@ internal static class HiveCommand
             {
                 Directory.CreateDirectory(work);
                 string library = Path.Combine(work, project.Name + ".dll");
-                if (SourceBuild.Lib(["-o", library, .. project.AllLibraries().Where(QueenProject.IsAssembly), .. sources]) != 0)
+                // Compiled as `larva build` compiles it: with the project's BUILD settings (this machine's defaults fill in
+                // what the chunk does not set), not with the defaults alone.
+                if (SourceBuild.Lib(["-o", library, .. project.AllLibraries().Where(QueenProject.IsAssembly), .. sources], project.FrontendOptions()) != 0)
                     throw new HiveException($"{project.Name} does not compile: nothing was packed");
             }
             var name = HivePacker.NameOf(project);
@@ -261,7 +289,13 @@ internal static class HiveCommand
     /// <summary>`larva hive add`: a `package:` entry in the project's DEPS chunk (a DEPS chunk at the end when it has none).</summary>
     private static void AddDependency(string queen, PackageReference package)
     {
-        var lines = File.ReadAllLines(queen).ToList();
+        string text = File.ReadAllText(queen);
+        // The file's own line endings (its first line's; LF for a file of one line) and whether it ends with one are kept.
+        string newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        bool endsWithNewline = text.Length == 0 || text.EndsWith('\n');
+        var lines = text.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
+        if (endsWithNewline && lines.Count > 0)
+            lines.RemoveAt(lines.Count - 1);
         int deps = lines.FindIndex(l => l.Trim() is "chunk DEPS:");
         if (deps < 0)
         {
@@ -278,10 +312,21 @@ internal static class HiveCommand
             int last = end - 1;
             while (last > deps && lines[last].Trim().Length == 0)
                 last--;
+            // The package already there (at another version, or none): its entry is replaced, not repeated.
+            int existing = lines.FindIndex(deps + 1, Math.Max(0, last - deps), l =>
+                l.Trim().TrimEnd(',').Trim() is var entry && entry.StartsWith("package:", StringComparison.Ordinal)
+                && PackageReference.Parse(entry["package:".Length..].Trim())?.Id == package.Id);
+            if (existing >= 0)
+            {
+                string indent = lines[existing][..(lines[existing].Length - lines[existing].TrimStart().Length)];
+                lines[existing] = $"{indent}package: {package}{(lines[existing].TrimEnd().EndsWith(',') ? "," : "")}";
+                File.WriteAllText(queen, string.Join(newline, lines) + (endsWithNewline ? newline : ""));
+                return;
+            }
             if (last > deps)
                 lines[last] = lines[last].TrimEnd().TrimEnd(',') + ",";
             lines.Insert(last + 1, $"   package: {package}");
         }
-        File.WriteAllLines(queen, lines);
+        File.WriteAllText(queen, string.Join(newline, lines) + (endsWithNewline ? newline : ""));
     }
 }

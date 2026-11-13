@@ -39,10 +39,21 @@ namespace Larva.Build
             return new PackageReference(parts[0], parts[1], range, line, column);
         }
 
-        /// <summary>A part of a package's name: letters, digits, <c>_</c>, <c>-</c> and dots, starting with a letter or digit.</summary>
+        /// <summary>
+        /// A part of a package's name: letters, digits, <c>_</c>, <c>-</c> and dots, starting with a letter or digit and
+        /// not ending with a dot (Windows drops trailing dots from folder names: <c>Acme.</c> would be <c>Acme</c> on
+        /// disk), and not a device name (<c>CON</c>, <c>COM1</c>…).
+        /// </summary>
         public static bool IsPart(string part) =>
             part.Length is > 0 and <= 64 && char.IsAsciiLetterOrDigit(part[0]) && part.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.')
-            && !part.Contains("..", StringComparison.Ordinal);
+            && !part.Contains("..", StringComparison.Ordinal) && !part.EndsWith('.') && !IsDeviceName(part);
+
+        private static bool IsDeviceName(string part)
+        {
+            string stem = part.Split('.')[0].ToUpperInvariant();
+            return stem is "CON" or "PRN" or "AUX" or "NUL"
+                || stem.Length == 4 && (stem.StartsWith("COM", StringComparison.Ordinal) || stem.StartsWith("LPT", StringComparison.Ordinal)) && char.IsDigit(stem[3]);
+        }
     }
 
     public enum VersionOperator : byte { Exact, Compatible, AtLeast }

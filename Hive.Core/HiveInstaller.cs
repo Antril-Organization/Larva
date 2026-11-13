@@ -117,27 +117,35 @@ namespace Hive
         {
             var entry = new HiveLockEntry(package.Id, version.Version, version.Sha256, version.Key, provider.Address, version.Dependencies);
             string folder = cache.Folder(package, version.Version);
-            string stamp = Path.Combine(folder, ".sha256");
-            if (cache.Project(package, version.Version) is not null && File.Exists(stamp) && File.ReadAllText(stamp).Trim() == version.Sha256)
+            if (cache.Has(package, version.Version, version.Sha256))
                 return entry;
 
             log?.Invoke($"  fetching {package.Id} {version.Version} from {provider.Address}");
             byte[] file = provider.Download(package, version);
             if (HiveManifest.Hash(file) != version.Sha256)
                 throw new HiveException($"{package.Id} {version.Version} from {provider.Address} does not match the hash its index gives: refusing it");
+            // A key pinned locally for the package always wins over what the index says; a missing key never skips it.
+            var pinned = cache.Pinned(package);
             string? publicKey = null;
             if (version.Key is { } fingerprint)
             {
                 if (!index.Keys.TryGetValue(fingerprint, out publicKey) || HiveKeys.Fingerprint(publicKey) != fingerprint)
                     throw new HiveException($"{package.Id} {version.Version} is signed by key {HiveArchive.Short(fingerprint)}, which its index does not give");
+                if (pinned.Count > 0 && !pinned.Contains(fingerprint))
+                    throw new HiveException($"{package.Id} {version.Version} is signed by key {HiveArchive.Short(fingerprint)}, not by the key it was installed with ({string.Join(", ", pinned.Select(HiveArchive.Short))}). " +
+                        $"If its author changed keys, accept the new one with `hive trust {package.Id} {fingerprint}`");
             }
+            else if (requireSignatures)
+                throw new HiveException($"{package.Id} {version.Version} is not signed: its index gives no key for it (`verify: hashes` in HIVE accepts unsigned packages)");
+            else if (pinned.Count > 0)
+                throw new HiveException($"{package.Id} {version.Version} is not signed, but {package.Id} was installed with key {string.Join(", ", pinned.Select(HiveArchive.Short))}: refusing it");
             var opened = HiveArchive.Open(file, publicKey, requireSignatures);
             if (opened.Manifest.Package != package.Id || opened.Manifest.Version != version.Version)
                 throw new HiveException($"{provider.Address} gave {opened.Manifest.Package} {opened.Manifest.Version} for {package.Id} {version.Version}");
             if (version.Key is { } signer)
                 cache.Trust(package, signer);
-            HiveArchive.Extract(opened, folder);
-            File.WriteAllText(stamp, version.Sha256);
+            // The hash goes in with the files: the folder appears complete, with its stamp, or not at all.
+            HiveArchive.Extract(opened, folder, version.Sha256);
             return entry;
         }
     }
@@ -173,11 +181,19 @@ namespace Hive
             foreach (var package in packages)
             {
                 var versions = cache.Versions(package).Where(v => package.Version is null || package.Version.Accepts(VersionRange.Parse(v)!.Version)).ToList();
-                string? pinned = locked?.Find(package.Id)?.Version;
+                var pin = locked?.Find(package.Id);
+                string? pinned = pin?.Version;
                 string? version = pinned is not null && versions.Contains(pinned) ? pinned : versions.FirstOrDefault();
                 if (version is null || cache.Project(package, version) is not { } path)
                 {
                     diagnostics.Add(new QueenDiagnostic("QN108", $"package {package} is not installed: run `larva hive install`{(pinned is not null ? " (or `larva hive restore`)" : "")}",
+                        project.File, package.Line, package.Column));
+                    continue;
+                }
+                // The lock pins the bytes, not only the version: what the cache holds under that version must be that file.
+                if (pin is not null && version == pin.Version && !cache.Has(package, version, pin.Sha256))
+                {
+                    diagnostics.Add(new QueenDiagnostic("QN108", $"package {package.Id} {version} in the cache is not the file {HiveLock.FileName} pins: run `larva hive restore`",
                         project.File, package.Line, package.Column));
                     continue;
                 }
