@@ -160,14 +160,14 @@ namespace Larva.Llvm
             {
                 string triple = options.Triple ?? LLVMTargetRef.DefaultTriple;
                 var compilable = Compilable.Of(concrete, Supports);
-                LlvmCodegen Codegen(LLVMContextRef? context = null, Func<int, bool>? defines = null) =>
+                LlvmCodegen Codegen(LLVMContextRef? context = null, Func<int, bool>? defines = null, Func<int, bool>? copies = null) =>
                     new(concrete, options.Compilation.Gc, options.Compilation.BorrowCheck == BorrowCheckMode.Enforce, name,
                         options.BoundsCheckElimination, options.SymbolPrefix, flagExceptions: !UsesSeh(options.Triple), context, defines, compilable,
-                        inlinePolls: !IsWasm(options.Triple), stackRoots: options.PreciseStackRoots, threadLocalExceptions: !IsWasm(options.Triple));
+                        inlinePolls: !IsWasm(options.Triple), stackRoots: options.PreciseStackRoots, threadLocalExceptions: !IsWasm(options.Triple), copies: copies);
                 if (partitions > 1)
                 {
                     using var parallel = PhaseTimer.Start($"llvm: build, optimize and emit ({partitions} threads, {concrete.Functions.Length} functions)");
-                    return (ParallelCodegen.Emit(concrete, partitions, (context, defines) => Codegen(context, defines), triple, options.OptimizationLevel, directory, name, options.Cpu), null);
+                    return (ParallelCodegen.Emit(concrete, partitions, (context, defines, copies) => Codegen(context, defines, copies), triple, options.OptimizationLevel, directory, name, options.Cpu), null);
                 }
                 var codegen = Codegen();
                 using (PhaseTimer.Start($"llvm: build IR ({concrete.Functions.Length} functions)"))

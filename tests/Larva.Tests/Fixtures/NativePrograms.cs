@@ -668,4 +668,60 @@ internal static class NativePrograms
              .Return();
         return new IrModule(GcPrograms.StructDefs, [fin.Build(), inner.Build(), outer.Build()]) { Globals = [new GlobalDef("seen", IrType.I32)] };
     }
+
+    /// A program large enough for the LLVM back end to compile in partitions: <c>twice(x) = x * 2</c> (function 0, small),
+    /// <paramref name="count"/> fillers <c>filler_k(n)</c> (functions 1..count; 50 statements each, too large to copy) that
+    /// mix <c>n</c> with k and end with a call to twice, and <c>wide_main() = sum of filler_k(k) &amp; 0xFFFFFF</c> (see
+    /// <see cref="WideExpected"/>).
+    /// </summary>
+    public static IrModule WideProgram(int count)
+    {
+        var twice = new FunctionBuilder("twice", IrType.I32);
+        int x = twice.Argument(IrType.I32, "x");
+        twice.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Mul, Copy(x), Int(2))).Return();
+        var functions = new List<IrFunction> { twice.Build() };
+        for (int k = 0; k < count; k++)
+        {
+            var filler = new FunctionBuilder($"filler_{k}", IrType.I32);
+            int n = filler.Argument(IrType.I32, "n");
+            int s = filler.Local(IrType.I32, "s", mutable: true);
+            int done = filler.NewBlock();
+            filler.Assign(s, Copy(n));
+            for (int step = 0; step < 25; step++)
+            {
+                filler.Assign(s, Rvalue.Binary(BinaryOp.Xor, Copy(s), Int(k + step)));
+                filler.Assign(s, Rvalue.Binary(BinaryOp.And, Copy(s), Int(0xFFFF)));
+            }
+            filler.Call(0, [Copy(s)], FunctionBuilder.ReturnPlace, done);
+            filler.At(done).Return();
+            functions.Add(filler.Build());
+        }
+        var main = new FunctionBuilder("wide_main", IrType.I32);
+        int total = main.Local(IrType.I32, "total", mutable: true);
+        int value = main.Local(IrType.I32, "value", mutable: true);
+        main.Assign(total, Int(0));
+        for (int k = 0; k < count; k++)
+        {
+            int next = main.NewBlock();
+            main.Call(1 + k, [Int(k)], value, next);
+            main.At(next).Assign(total, Rvalue.Binary(BinaryOp.Add, Copy(total), Copy(value)));
+        }
+        main.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.And, Copy(total), Int(0xFFFFFF))).Return();
+        functions.Add(main.Build());
+        return new IrModule([], [.. functions]) { Name = "wide" };
+    }
+
+    /// <summary>What <see cref="WideProgram"/>'s wide_main returns.</summary>
+    public static int WideExpected(int count)
+    {
+        int total = 0;
+        for (int k = 0; k < count; k++)
+        {
+            int s = k;
+            for (int step = 0; step < 25; step++)
+                s = (s ^ (k + step)) & 0xFFFF;
+            total += s * 2;
+        }
+        return total & 0xFFFFFF;
+    }
 }
