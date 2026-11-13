@@ -177,12 +177,15 @@ namespace Larva.Hir.Lowering
             }
         }
 
-        /// <summary>Adds static data; it is ordered by its content (two identical entries are interchangeable).</summary>
-        internal int AddData(StaticData data)
+        /// <summary>
+        /// Adds static data; it is ordered by its content (two identical entries are interchangeable), or by
+        /// <paramref name="key"/> when that names it alone (resource bytes, whose content would make a key as large).
+        /// </summary>
+        internal int AddData(StaticData data, string? key = null)
         {
             lock (Sync)
             {
-                dataOrigins.Add(OriginOf(DataKey(data)));
+                dataOrigins.Add(OriginOf(key ?? DataKey(data)));
                 Data.Add(data);
                 return Data.Count - 1;
             }
@@ -271,6 +274,10 @@ namespace Larva.Hir.Lowering
             // The memo tables keep indices too.
             foreach (var key in literalData.Keys.ToArray())
                 literalData[key] = D(literalData[key]);
+            foreach (var key in resourceBlobs.Keys.ToArray())
+                resourceBlobs[key] = (D(resourceBlobs[key].Blob), D(resourceBlobs[key].Starts));
+            foreach (var key in resourceCopies.Keys.ToArray())
+                resourceCopies[key] = D(resourceCopies[key]);
             foreach (var key in literalGlobals.Keys.ToArray())
                 literalGlobals[key] = G(literalGlobals[key]);
             foreach (var key in stringUnits.Keys.ToArray())
@@ -1618,6 +1625,57 @@ namespace Larva.Hir.Lowering
         internal int ConstantData(H.Primitive unit, IEnumerable<System.Numerics.BigInteger> values)
         {
             return AddData(new StaticData(Primitive(unit), [.. values]));
+        }
+
+        /// <summary>The static data of the resources (each once for the module): their bytes, or their UTF-8 names.</summary>
+        private readonly Dictionary<string, (int Blob, int Starts)> resourceBlobs = [];
+        private readonly Dictionary<int, int> resourceCopies = [];
+
+        /// <summary>
+        /// Every resource's bytes (or names) as one static blob followed by a filler byte, and the table of where each
+        /// starts (count + 1 entries, the last the end): made once, shared by every resource service that reads them.
+        /// </summary>
+        internal (int Blob, int Starts) ResourceBlob(bool names)
+        {
+            string key = names ? "$resources.names" : "$resources.bytes";
+            lock (Sync)
+            {
+                if (resourceBlobs.TryGetValue(key, out var found))
+                    return found;
+                var resources = Assembly.Resources;
+                var parts = names ? resources.Select(r => System.Text.Encoding.UTF8.GetBytes(r.Name)).ToList() : resources.Select(r => r.Data).ToList();
+                var starts = new System.Numerics.BigInteger[parts.Count + 1];
+                var blob = new System.Numerics.BigInteger[parts.Sum(p => (long)p.Length) + 1];
+                long at = 0;
+                for (int i = 0; i < parts.Count; i++)
+                {
+                    starts[i] = at;
+                    foreach (byte value in parts[i])
+                        blob[at++] = value;
+                }
+                starts[parts.Count] = at;
+                var made = (AddData(new StaticData(IrType.U8, blob), key), AddData(new StaticData(IrType.U64, starts), key + ".starts"));
+                resourceBlobs[key] = made;
+                return made;
+            }
+        }
+
+        /// <summary>The static data of one resource's bytes (what <c>$resource("name")</c> copies), made once however many places name it.</summary>
+        internal int ResourceData(int index)
+        {
+            lock (Sync)
+            {
+                if (!resourceCopies.TryGetValue(index, out int data))
+                {
+                    var bytes = Assembly.Resources[index].Data;
+                    var values = new System.Numerics.BigInteger[bytes.Length];
+                    for (int i = 0; i < bytes.Length; i++)
+                        values[i] = bytes[i];
+                    data = AddData(new StaticData(IrType.U8, values), $"$resource {index}");
+                    resourceCopies[index] = data;
+                }
+                return data;
+            }
         }
 
         internal int LiteralGlobal(string text, H.Primitive unit, IrType type)

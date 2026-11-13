@@ -284,20 +284,14 @@ namespace Larva.Hir.Lowering
             var indexType = plan.Parameters[0];
             b.Unsafe = true;
             // The blob (every resource's bytes, then one filler byte: pointers are never null and the end is a valid index)
-            // and the starts.
-            var blob = new List<byte>();
-            var starts = new List<System.Numerics.BigInteger>();
-            foreach (var resource in resources)
-            {
-                starts.Add(blob.Count);
-                blob.AddRange(kind == "name" ? System.Text.Encoding.UTF8.GetBytes(resource.Name) : resource.Data);
-            }
-            starts.Add(blob.Count);
-            blob.Add(0);
+            // and the starts: one of each for the module, whichever services read them (`length` only needs the starts).
+            var (blobData, startsData) = lowerer.ResourceBlob(names: kind == "name");
+            long fillerIndex = kind == "name" ? resources.Sum(r => (long)System.Text.Encoding.UTF8.GetByteCount(r.Name)) : resources.Sum(r => (long)r.Data.Length);
             var arrayOfBytes = new IR.ArrayType(IrType.U8);
             int bytes = Temp(IrType.Ref(arrayOfBytes)), table = Temp(IrType.Ref(new IR.ArrayType(IrType.U64)));
-            b.Assign(bytes, new StaticRvalue(lowerer.ConstantData(H.Primitive.U8, blob.Select(x => (System.Numerics.BigInteger)x))))
-             .Assign(table, new StaticRvalue(lowerer.ConstantData(H.Primitive.U64, starts)));
+            if (kind != "length")
+                b.Assign(bytes, new StaticRvalue(blobData));
+            b.Assign(table, new StaticRvalue(startsData));
             // 0 <= i < count, else the defaults.
             int low = Temp(IrType.Bool), high = Temp(IrType.Bool);
             int checkHigh = NewBlock(), found = NewBlock(), missing = NewBlock();
@@ -353,7 +347,7 @@ namespace Larva.Hir.Lowering
                     break;
                 default:
                     int filler = Temp(IrType.U64);
-                    b.Assign(filler, Operand.Const(blob.Count - 1, IrType.U64));
+                    b.Assign(filler, Operand.Const(fillerIndex, IrType.U64));
                     PointTo(filler);
                     break;
             }
@@ -2081,10 +2075,11 @@ namespace Larva.Hir.Lowering
                 case H.ResourceExpr r:
                 {
                     // A resource's bytes: static data copied into a new u8[] (the last resource of that name, as Install does).
-                    var resource = lowerer.Assembly.Resources.LastOrDefault(x => x.Name == r.Name)
-                        ?? throw new LoweringException($"the program has no resource \"{r.Name}\"");
+                    int resource = lowerer.Assembly.Resources.FindLastIndex(x => x.Name == r.Name);
+                    if (resource < 0)
+                        throw new LoweringException($"the program has no resource \"{r.Name}\"");
                     int data = Temp(IrType.Ref(new IR.ArrayType(IrType.U8)));
-                    b.Assign(data, new StaticRvalue(lowerer.ConstantData(H.Primitive.U8, resource.Data.Select(x => (System.Numerics.BigInteger)x))));
+                    b.Assign(data, new StaticRvalue(lowerer.ResourceData(resource)));
                     Emit(lowerer.StringUnits(H.Primitive.U8), [Operand.Copy(data)], target);
                     return;
                 }
