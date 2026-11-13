@@ -43,6 +43,12 @@ namespace Larva.Runtime.Vm
         internal bool Marked;
         internal bool Sealed;
 
+        /// <summary>Its place in the heap's list of gc objects or of scanned memory (-1 in neither).</summary>
+        internal int SetIndex = -1;
+
+        /// <summary>Where the collector finds handles in it (cached on its first scan; the type never changes).</summary>
+        internal (int[] Offsets, int Header, int Stride)? Scan;
+
         /// <summary>Where a <see cref="AllocationKind.Native"/> allocation's bytes are.</summary>
         public nint NativeBase { get; init; }
 
@@ -84,7 +90,65 @@ namespace Larva.Runtime.Vm
             allocations[allocation.Id] = allocation;
             if (kind is AllocationKind.Gc or AllocationKind.Heap)
                 TotalAllocations++;
+            if (SetOf(kind) is { } set)
+            {
+                allocation.SetIndex = set.Count;
+                set.Add(allocation);
+            }
             return allocation;
+        }
+
+        // A collection visits these only, not every allocation: the live gc objects (marked, swept), and the memory the
+        // collector scans for handles (boxes and raw cells, invoke buffers, globals). Frame slots and native memory are
+        // in neither. Unordered (a free moves the last one into the hole).
+        private readonly List<Allocation> gcObjects = [];
+        private readonly List<Allocation> scanned = [];
+
+        /// <summary>The live gc objects (in no particular order).</summary>
+        internal List<Allocation> GcObjects => gcObjects;
+
+        /// <summary>The live boxes, raw cells, invoke buffers and globals (in no particular order).</summary>
+        internal List<Allocation> Scanned => scanned;
+
+        private List<Allocation>? SetOf(AllocationKind kind) => kind switch
+        {
+            AllocationKind.Gc => gcObjects,
+            AllocationKind.Heap or AllocationKind.Buffer or AllocationKind.Static => scanned,
+            _ => null,
+        };
+
+        /// <summary>The gc objects made in each open arena region (by instance), in allocation order.</summary>
+        private readonly Dictionary<int, List<Allocation>> regionObjects = [];
+
+        /// <summary>Tags a new gc object with the open region it was made in (none when <paramref name="region"/> is null).</summary>
+        internal void PlaceInRegion(Allocation allocation, int? region)
+        {
+            allocation.Region = region;
+            if (region is not int instance)
+                return;
+            if (!regionObjects.TryGetValue(instance, out var members))
+                regionObjects[instance] = members = [];
+            members.Add(allocation);
+        }
+
+        /// <summary>The objects made in region <paramref name="instance"/> that are still alive, in allocation order; forgets the region.</summary>
+        internal List<Allocation> TakeRegion(int instance)
+        {
+            if (!regionObjects.Remove(instance, out var members))
+                return [];
+            members.RemoveAll(a => a.Freed);
+            return members;
+        }
+
+        private void Forget(Allocation allocation)
+        {
+            if (allocation.SetIndex < 0 || SetOf(allocation.Kind) is not { } set)
+                return;
+            var last = set[^1];
+            set[allocation.SetIndex] = last;
+            last.SetIndex = allocation.SetIndex;
+            set.RemoveAt(set.Count - 1);
+            allocation.SetIndex = -1;
         }
 
         public void Free(Address address, string why)
@@ -98,6 +162,7 @@ namespace Larva.Runtime.Vm
             // recognized as a use after free (an id below the next one that is not in the table).
             allocation.Freed = true;
             allocations.Remove(allocation.Id);
+            Forget(allocation);
             if (allocation.Kind is AllocationKind.Gc or AllocationKind.Heap)
                 TotalFrees++;
             if (allocation.Kind == AllocationKind.Native)

@@ -96,7 +96,7 @@ namespace Larva.Runtime.Vm
                     stack.Add(Value.FromInt(Stats.Collections, IrType.I64));
                     break;
                 case 15:
-                    stack.Add(Value.FromInt(Heap.Live.Count(a => a.Kind == AllocationKind.Gc), IrType.I64));
+                    stack.Add(Value.FromInt(Heap.GcObjects.Count, IrType.I64));
                     break;
                 case 43:
                     stack.Add(Value.FromFloat(Math.Sqrt(PopDouble(stack)), IrType.F64));

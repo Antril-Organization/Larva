@@ -389,6 +389,51 @@ public sealed class InterpreterTests : CheckedTest
         Check("collections happened while the list was live", vm.Stats.Collections > 0, vm.Stats.ToString());
     }
 
+    /// <summary>
+    /// Marking drains one work stack: scanning an object only queues what it holds (scanning used to drain the queue
+    /// itself, a host call per queued object, so a large array of objects overflowed the host stack). Run on a small
+    /// stack; the live set is what collections sweep (garbage from the fill is reclaimed, the array's objects stay).
+    /// </summary>
+    [Fact]
+    public void Marking_a_large_array_of_objects_does_not_overflow_a_small_host_stack()
+    {
+        // unsafe fn fill(count: i64) -> i32 { let arr = gc [gc Point; count]; for i in 0..count { arr[i] = gc Point{i, i}; gc Point{0, 0}; } arr[count - 1].1 }
+        var point = GcPrograms.PointType;
+        var gcPoint = IrType.Gc(point);
+        var f = new FunctionBuilder("fill", IrType.I32) { Unsafe = true };
+        int count = f.Argument(IrType.I64, "count");
+        int arr = f.Local(IrType.Gc(new ArrayType(gcPoint)), "arr");
+        int i = f.Local(IrType.I64, "i", mutable: true);
+        int p = f.Local(point, "p", mutable: true);
+        int garbage = f.Local(gcPoint, "garbage", mutable: true);
+        int last = f.Local(gcPoint, "last", mutable: true);
+        int c = f.Local(IrType.Bool, "c", mutable: true);
+        int loop = f.NewBlock(), body = f.NewBlock(), exit = f.NewBlock();
+        f.Assign(arr, Rvalue.NewArray(AllocKind.Gc, gcPoint, Copy(count))).Assign(i, Int(0, IrType.I64)).Goto(loop);
+        f.At(loop).Assign(c, Rvalue.Binary(BinaryOp.Lt, Copy(i), Copy(count))).If(Copy(c), body, exit);
+        f.At(body).Assign(new Place(p).Field(0), Rvalue.Cast(Copy(i), IrType.I32)).Assign(new Place(p).Field(1), Rvalue.Cast(Copy(i), IrType.I32))
+         .Assign(new Place(arr).Deref().Index(i), Rvalue.Gc(Move(p)))
+         .Assign(new Place(p).Field(0), Int(0)).Assign(new Place(p).Field(1), Int(0))
+         .Assign(garbage, Rvalue.Gc(Move(p)))
+         .Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64))).Goto(loop);
+        f.At(exit).Assign(i, Rvalue.Binary(BinaryOp.Sub, Copy(count), Int(1, IrType.I64)))
+         .Assign(last, Copy(new Place(arr).Deref().Index(i)))
+         .Assign(FunctionBuilder.ReturnPlace, Copy(new Place(last).Deref().Field(1))).Return();
+
+        var vm = Vm(new IrModule(GcPrograms.StructDefs, [f.Build()]), gc: GcConfig.Default);
+        object? result = null;
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try { result = vm.Run("fill", 20000L); }
+            catch (Exception e) { failure = e; }
+        }, 256 * 1024);
+        thread.Start();
+        thread.Join();
+        Check("fill(20000) = 19999 on a 256 KB host stack", failure is null && Equal(result, 19999L), failure?.Message ?? vm.Stats.ToString());
+        Check("collections ran while the array was live and reclaimed the garbage", vm.Stats.Collections > 0 && vm.Stats.Reclaimed > 0, vm.Stats.ToString());
+    }
+
     [Fact]
     public void Shift_amounts_are_masked_by_the_operand_width()
     {
