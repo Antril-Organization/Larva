@@ -9,7 +9,6 @@ into namespace System
 		extern("print.utf8") PrintUtf8(u8[] bytes);
 		extern("print.i64") PrintInteger(i64 value);
 		extern("print.u64") PrintUnsigned(u64 value);
-		extern("print.f64") PrintFloat(f64 value);
 		extern("print.bool") PrintBool(bool value);
 		extern("print.line") PrintLine();
 		extern("read.line") ReadInto() : i64;
@@ -85,7 +84,7 @@ into namespace System
 			Write(u256 value) { PrintUtf8(value.ToString().Units()); }
 			Write(f16 value) { PrintUtf8(value.ToString().Units()); }
 			Write(f32 value) { PrintUtf8(value.ToString().Units()); }
-			Write(f64 value) { PrintFloat(value); }
+			Write(f64 value) { PrintUtf8(value.ToString().Units()); }
 			Write(f128 value) { PrintUtf8(value.ToString().Units()); }
 			Write(f256 value) { PrintUtf8(value.ToString().Units()); }
 			Write(bool value) { PrintBool(value); }
@@ -133,7 +132,7 @@ into namespace System
 			WriteLine(u256 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
 			WriteLine(f16 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
 			WriteLine(f32 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
-			WriteLine(f64 value) { PrintFloat(value); PrintLine(); }
+			WriteLine(f64 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
 			WriteLine(f128 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
 			WriteLine(f256 value) { PrintUtf8(value.ToString().Units()); PrintLine(); }
 			WriteLine(bool value) { PrintBool(value); PrintLine(); }
