@@ -45,6 +45,7 @@ namespace Larva.Hir.Lowering
             currentRank = 0;
             try
             {
+                ProbeReflection(plan, method);
                 var function = new BodyLowerer(this, plan, info, method).Lower();
                 lock (Sync)
                     Functions[plan.Function] = function;

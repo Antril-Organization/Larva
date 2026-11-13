@@ -413,6 +413,8 @@ namespace Larva.Hir.Lowering
             }
             if (errors.Count == 0)
                 LowerBodies();
+            if (reflectionMissed)
+                return new HirLowerer(Assembly, Options) { readAllForReflection = true }.Run();
             if (errors.Count == 0)
                 ApplyLinkage();
             if (errors.Count > 0)
