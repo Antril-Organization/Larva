@@ -2022,6 +2022,19 @@ static int64_t minors, majors;
 static int64_t minor_ns, major_ns;   /* time spent collecting (LARVA_STATS) */
 static int64_t barrier_calls, poll_calls;
 static int64_t promoted_total, pinned_total;
+static volatile int64_t sync_handles;   /* mutex and condition handles alive (LARVA_STATS: a leak shows as growth) */
+#ifdef LARVA_DIAGNOSTICS
+#ifdef _WIN32
+#define SYNC_MADE() InterlockedIncrement64(&sync_handles)
+#define SYNC_FREED() InterlockedDecrement64(&sync_handles)
+#else
+#define SYNC_MADE() __atomic_add_fetch(&sync_handles, 1, __ATOMIC_RELAXED)
+#define SYNC_FREED() __atomic_sub_fetch(&sync_handles, 1, __ATOMIC_RELAXED)
+#endif
+#else
+#define SYNC_MADE() ((void)0)
+#define SYNC_FREED() ((void)0)
+#endif
 
 static int64_t now_ns(void) {
 #ifdef _WIN32
@@ -6170,6 +6183,7 @@ LARVA_API int64_t larva_cpu_count(void) {
 
 #ifdef _WIN32
 LARVA_API int64_t larva_mutex_new(void) {
+    SYNC_MADE();
     SRWLOCK *lock = (SRWLOCK *)calloc(1, sizeof(SRWLOCK));
     if (!lock)
         fail_alloc();
@@ -6194,9 +6208,13 @@ LARVA_API void larva_mutex_lock(int64_t handle) {
 
 LARVA_API int64_t larva_mutex_trylock(int64_t handle) { return TryAcquireSRWLockExclusive((SRWLOCK *)(uintptr_t)handle) ? 1 : 0; }
 LARVA_API void larva_mutex_unlock(int64_t handle) { ReleaseSRWLockExclusive((SRWLOCK *)(uintptr_t)handle); }
-LARVA_API void larva_mutex_free(int64_t handle) { free((void *)(uintptr_t)handle); }
+LARVA_API void larva_mutex_free(int64_t handle) {
+    SYNC_FREED();
+    free((void *)(uintptr_t)handle);
+}
 
 LARVA_API int64_t larva_cond_new(void) {
+    SYNC_MADE();
     CONDITION_VARIABLE *condition = (CONDITION_VARIABLE *)calloc(1, sizeof(CONDITION_VARIABLE));
     if (!condition)
         fail_alloc();
@@ -6214,9 +6232,13 @@ LARVA_API int64_t larva_cond_wait(int64_t condition, int64_t lock, int64_t milli
 
 LARVA_API void larva_cond_signal(int64_t condition) { WakeConditionVariable((CONDITION_VARIABLE *)(uintptr_t)condition); }
 LARVA_API void larva_cond_broadcast(int64_t condition) { WakeAllConditionVariable((CONDITION_VARIABLE *)(uintptr_t)condition); }
-LARVA_API void larva_cond_free(int64_t condition) { free((void *)(uintptr_t)condition); }
+LARVA_API void larva_cond_free(int64_t condition) {
+    SYNC_FREED();
+    free((void *)(uintptr_t)condition);
+}
 #else
 LARVA_API int64_t larva_mutex_new(void) {
+    SYNC_MADE();
     pthread_mutex_t *lock = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
     if (!lock)
         fail_alloc();
@@ -6236,11 +6258,13 @@ LARVA_API void larva_mutex_lock(int64_t handle) {
 LARVA_API int64_t larva_mutex_trylock(int64_t handle) { return pthread_mutex_trylock((pthread_mutex_t *)(uintptr_t)handle) == 0; }
 LARVA_API void larva_mutex_unlock(int64_t handle) { pthread_mutex_unlock((pthread_mutex_t *)(uintptr_t)handle); }
 LARVA_API void larva_mutex_free(int64_t handle) {
+    SYNC_FREED();
     pthread_mutex_destroy((pthread_mutex_t *)(uintptr_t)handle);
     free((void *)(uintptr_t)handle);
 }
 
 LARVA_API int64_t larva_cond_new(void) {
+    SYNC_MADE();
     pthread_cond_t *condition = (pthread_cond_t *)calloc(1, sizeof(pthread_cond_t));
     if (!condition)
         fail_alloc();
@@ -6273,6 +6297,7 @@ LARVA_API int64_t larva_cond_wait(int64_t condition, int64_t lock, int64_t milli
 LARVA_API void larva_cond_signal(int64_t condition) { pthread_cond_signal((pthread_cond_t *)(uintptr_t)condition); }
 LARVA_API void larva_cond_broadcast(int64_t condition) { pthread_cond_broadcast((pthread_cond_t *)(uintptr_t)condition); }
 LARVA_API void larva_cond_free(int64_t condition) {
+    SYNC_FREED();
     pthread_cond_destroy((pthread_cond_t *)(uintptr_t)condition);
     free((void *)(uintptr_t)condition);
 }
@@ -7169,6 +7194,7 @@ static void print_stats(void) {
         minor_roots_ns / 1e6, minor_copy_ns / 1e6, minor_blocks_ns / 1e6, live.capacity);
     fprintf(stderr, "larva stats: remembered+cards part of copy %.1f ms\n", minor_cards_ns / 1e6);
     fprintf(stderr, "larva stats: safepoint calls %lld\n", (long long)poll_calls);
+    fprintf(stderr, "larva stats: sync handles alive %lld\n", (long long)sync_handles);
     fprintf(stderr, "larva stats: cards %lld, slots %lld, remembered %lld\n", (long long)cards_scanned, (long long)slots_evacuated, (long long)remembered_scanned);
 }
 
