@@ -1309,9 +1309,13 @@ namespace Larva.Llvm
                     {
                         var value = Operand(store.Value);
                         var address = Global(store.Global);
-                        if (Has(GcCapabilities.RefCounting) && module.Globals[store.Global].Type.Unoptional() is GcType)
-                            cg.ReleaseHandle(fn, b.BuildLoad2(cg.ptr, address, "")); // the old value loses its owner
+                        // The old value loses its owner once the new one is in place: its destructor sees the global
+                        // already changed, not itself still there.
+                        var old = Has(GcCapabilities.RefCounting) && module.Globals[store.Global].Type.Unoptional() is GcType
+                            ? b.BuildLoad2(cg.ptr, address, "") : default;
                         b.BuildStore(value, address);
+                        if (old.Handle != IntPtr.Zero)
+                            cg.ReleaseHandle(fn, old);
                         break;
                     }
                     case RegionEnterStatement enter:
@@ -1346,8 +1350,11 @@ namespace Larva.Llvm
                     ? b.BuildLoad2(cg.ValueType(targetType), b.BuildLoad2(cg.ptr, caughtPayload, "payload"), "caught")
                     : Rvalue(value);
                 var moved = Moved(MoveAnalysis.Operands(value));
-                ReleaseOwned(target, moved);
+                // What the target owned is released after the new value is stored: a destructor that runs in the
+                // release sees the owner's field already changed, not the dying object still in it.
+                var old = LoadOwned(target, moved);
                 Store(target, result);
+                ReleaseLoaded(old);
                 UpdateFlags(moved, target);
             }
 
@@ -2280,23 +2287,39 @@ namespace Larva.Llvm
             /// Releases what the value at <paramref name="place"/> owns. Resources of locals are guarded by their drop flag;
             /// resources behind a pointer belong to that memory and are always initialized.
             /// </summary>
-            private void ReleaseOwned(Place place, IReadOnlyList<Place> movedNow)
+            private void ReleaseOwned(Place place, IReadOnlyList<Place> movedNow) => ReleaseLoaded(LoadOwned(place, movedNow));
+
+            /// <summary>A resource of a place, read before the place is overwritten, to be released after (see <see cref="ReleaseLoaded"/>).</summary>
+            private readonly record struct OwnedValue(Release Release, LLVMValueRef Flag, LLVMValueRef Handle);
+
+            /// <summary>Reads the resources the value at <paramref name="place"/> owns (its drop flags decide later whether they are released).</summary>
+            private List<OwnedValue> LoadOwned(Place place, IReadOnlyList<Place> movedNow)
             {
+                var owned = new List<OwnedValue>();
                 foreach (var (path, release, _) in Owned(function.TypeOf(place, module), []))
                 {
                     var resource = new Place(place.Local, [.. place.Projections, .. path]);
                     if (movedNow.Any(m => m.IsPrefixOf(resource) || resource.IsPrefixOf(m)))
                         continue;
+                    flags.TryGetValue(resource, out var flag);
+                    owned.Add(new OwnedValue(release, flag, Load(resource)));
+                }
+                return owned;
+            }
 
+            /// <summary>Releases what <see cref="LoadOwned"/> read, each guarded by its drop flag when it has one (and the flag cleared).</summary>
+            private void ReleaseLoaded(List<OwnedValue> owned)
+            {
+                foreach (var (release, flag, handle) in owned)
+                {
                     LLVMBasicBlockRef done = default;
-                    if (flags.TryGetValue(resource, out var flag))
+                    if (flag.Handle != IntPtr.Zero)
                     {
-                        var owned = fn.AppendBasicBlock("release");
+                        var live = fn.AppendBasicBlock("release");
                         done = fn.AppendBasicBlock("released");
-                        b.BuildCondBr(b.BuildLoad2(Ctx.Int1Type, flag, ""), owned, done);
-                        b.PositionAtEnd(owned);
+                        b.BuildCondBr(b.BuildLoad2(Ctx.Int1Type, flag, ""), live, done);
+                        b.PositionAtEnd(live);
                     }
-                    var handle = Load(resource);
                     if (release == Release.FreeBox)
                         cg.CallRuntime("larva_free", handle);
                     else

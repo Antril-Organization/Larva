@@ -83,6 +83,18 @@ public sealed unsafe class LlvmTests : CheckedTest
         }
     }
 
+    /// <summary>A store releases the old value after the new one is in place: a finalizer sees the field (or the global) already changed.</summary>
+    [Fact]
+    public void Reference_counting_stores_before_releasing_the_old_value()
+    {
+        NativeRuntime.Reset();
+        using var program = Compile(NativePrograms.RcStoreOrder(), GcConfig.RefCount);
+        using var jit = program.Jit();
+        int seen = ((delegate* unmanaged<int>)jit.Address("rc_store_order"))();
+        Check("RC: the finalizers of an overwritten field and global find the new values (22)", seen == 22, $"seen {seen}");
+        Check("RC: no runtime errors", NativeRuntime.Errors == 0, $"errors {NativeRuntime.Errors}");
+    }
+
     [Fact]
     public void Arrays_index_free_and_guard_their_bounds()
     {

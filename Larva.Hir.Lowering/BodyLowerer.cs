@@ -46,7 +46,8 @@ namespace Larva.Hir.Lowering
             }
             catch (LoweringException e)
             {
-                Error(where, e.Message);
+                // At the statement that failed when the HIR says where it is, else at the method's declaration.
+                Error(where, e.Message, e.At.IsKnown ? e.At : method.Location);
                 var empty = new FunctionBuilder(plan.Name, plan.Result);
                 DeclareGenerics(empty, plan.Generics);
                 empty.Unreachable();
@@ -94,7 +95,11 @@ namespace Larva.Hir.Lowering
         }
     }
 
-    internal sealed class LoweringException(string message) : Exception(message);
+    internal sealed class LoweringException(string message) : Exception(message)
+    {
+        /// <summary>Where in the source the error is: the statement being lowered when it was thrown (set on the way out).</summary>
+        public H.SourceLocation At { get; set; }
+    }
 
     /// <summary>One method body: HIR statements and expressions into IR blocks.</summary>
     internal sealed partial class BodyLowerer
@@ -168,7 +173,23 @@ namespace Larva.Hir.Lowering
 
         private LoweringException Unsupported(string what) => new($"{what} is lowered in a later phase");
 
+        /// <summary>The statement being lowered (for the position of an error).</summary>
+        private H.SourceLocation at;
+
         public IrFunction Lower()
+        {
+            try
+            {
+                return LowerChecked();
+            }
+            catch (LoweringException e) when (!e.At.IsKnown)
+            {
+                e.At = at;
+                throw;
+            }
+        }
+
+        private IrFunction LowerChecked()
         {
             var function = LowerBody();
             if (IsCoroutine)
@@ -491,9 +512,11 @@ namespace Larva.Hir.Lowering
         {
             if (!open)
                 Dead();
-            // Where it came from, for the IR's diagnostics (a borrow error names its line).
-            if (statement.At.IsKnown && statement.At.File < lowerer.Assembly.Files.Count)
-                b.Position = new SourcePosition(lowerer.Assembly.Files[statement.At.File], statement.At.Line, statement.At.Column);
+            // Where it came from, for the IR's diagnostics (a borrow error names its line) and for lowering's own errors.
+            if (statement.At.IsKnown)
+                at = statement.At;
+            if (lowerer.Position(statement.At) is { } position)
+                b.Position = position;
             switch (statement)
             {
                 case H.BlockStmt block:

@@ -721,6 +721,7 @@ namespace Larva.Hir.Lowering
             method = outer.method;
             context = outer.context;
             closures = outer.closures!;
+            overflowChecks = outer.overflowChecks; // a lambda written inside `checked { }` is checked too
             lambda = index;
             var scan = closures.Scan;
             var hir = scan.Lambdas[index];
@@ -770,7 +771,15 @@ namespace Larva.Hir.Lowering
 
         private IrFunction LowerLambda()
         {
-            Statement(closures!.Scan.Lambdas[lambda].Body);
+            try
+            {
+                Statement(closures!.Scan.Lambdas[lambda].Body);
+            }
+            catch (LoweringException e) when (!e.At.IsKnown)
+            {
+                e.At = at;
+                throw;
+            }
             if (open)
             {
                 if (result.IsUnit)

@@ -542,7 +542,66 @@ static RtFile *rt_std(int which) {
 #define stderr rt_std(2)
 #define FILE RtFile
 
+/*
+ * A console is written as UTF-16 (WriteConsoleW): what the program wrote is UTF-8, and written as bytes the console
+ * would read it in its own code page (850, 1252…) and show `ñandú` as mojibake. Redirected output keeps the UTF-8 bytes.
+ */
+static int rt_write_console(RtFile *file, const uint8_t *bytes, size_t count) {
+    WCHAR wide[4096];
+    while (count > 0) {
+        int chunk = count > sizeof(wide) / sizeof(wide[0]) ? (int)(sizeof(wide) / sizeof(wide[0])) : (int)count;
+        if ((size_t)chunk < count) {
+            /* Not in the middle of a sequence: back up to the lead byte that starts after the chunk. */
+            int cut = chunk;
+            while (cut > 0 && (bytes[cut] & 0xC0) == 0x80)
+                cut--;
+            if (cut > 0)
+                chunk = cut;
+        }
+        int units = MultiByteToWideChar(CP_UTF8, 0, (const char *)bytes, chunk, wide, (int)(sizeof(wide) / sizeof(wide[0])));
+        if (units <= 0) {
+            DWORD wrote = 0;
+            if (!WriteFile(file->handle, bytes, (DWORD)chunk, &wrote, NULL)) {
+                file->error = 1;
+                return -1;
+            }
+        }
+        const WCHAR *at = wide;
+        while (units > 0) {
+            DWORD wrote = 0;
+            if (!WriteConsoleW(file->handle, at, (DWORD)units, &wrote, NULL) || wrote == 0) {
+                file->error = 1;
+                return -1;
+            }
+            at += wrote;
+            units -= (int)wrote;
+        }
+        bytes += chunk;
+        count -= (size_t)chunk;
+    }
+    return 0;
+}
+
+/* The length of `bytes` up to its last complete UTF-8 sequence: one cut at the end waits for the rest of its bytes. */
+static size_t rt_utf8_complete(const uint8_t *bytes, size_t count) {
+    size_t i = count;
+    for (int back = 0; back < 4 && i > 0; back++) {
+        uint8_t b = bytes[i - 1];
+        if ((b & 0xC0) == 0x80) {
+            i--;  /* a continuation byte: its lead is before it */
+            continue;
+        }
+        if (b < 0xC0)
+            return count;  /* ASCII (or a stray byte): nothing is cut */
+        size_t need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : 2;
+        return count - (i - 1) >= need ? count : i - 1;
+    }
+    return count;
+}
+
 static int rt_write_all(RtFile *file, const uint8_t *bytes, size_t count) {
+    if (file->flags & RT_CONSOLE)
+        return rt_write_console(file, bytes, count);
     while (count > 0) {
         DWORD wrote = 0;
         DWORD chunk = count > 0x40000000 ? 0x40000000 : (DWORD)count;
@@ -560,6 +619,14 @@ static int rt_flush_unlocked(RtFile *file) {
     if (file->pending == 0)
         return 0;
     size_t count = file->pending;
+    if (file->flags & RT_CONSOLE) {
+        /* A UTF-8 sequence cut at the end of the buffer stays for the next write (the console takes whole characters). */
+        size_t whole = rt_utf8_complete(file->buffer, count), tail = count - whole;
+        int result = rt_write_all(file, file->buffer, whole);
+        memmove(file->buffer, file->buffer + whole, tail);
+        file->pending = tail;
+        return result;
+    }
     file->pending = 0;
     return rt_write_all(file, file->buffer, count);
 }
@@ -7351,7 +7418,30 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 #endif
 
 /* Runs the program: arguments from the command line, the result printed, settings from the environment. */
+#if defined(_WIN32) && !defined(LARVA_NO_CRT)
+/* With the C library's stdio the console shows the UTF-8 bytes in its own code page: it is set to UTF-8 while the program runs. */
+static UINT console_output_cp, console_input_cp;
+static void restore_console_cp(void) {
+    if (console_output_cp)
+        SetConsoleOutputCP(console_output_cp);
+    if (console_input_cp)
+        SetConsoleCP(console_input_cp);
+}
+static void console_utf8(void) {
+    console_output_cp = GetConsoleOutputCP();
+    console_input_cp = GetConsoleCP();
+    if (console_output_cp == 0 && console_input_cp == 0)
+        return;  /* no console */
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    atexit(restore_console_cp);
+}
+#endif
+
 static int program_main(int argc, char **argv, EntryFn entry, EntryF64Fn entry_f64, EntryInfoFn entry_info) {
+#if defined(_WIN32) && !defined(LARVA_NO_CRT)
+    console_utf8();
+#endif
     runtime_settings();
     main_record.os = 0;
     int64_t info = entry_info();

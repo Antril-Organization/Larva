@@ -39,6 +39,10 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         ("NestedFinally", 2, 123, "a finally with nested handlers on the normal path"),
         ("Nulls", null, 12, "null, ?? and == null"),
         ("Statics", null, 8, "static fields"),
+        ("CheckedLambda", 5, 6, "a lambda inside checked { } adds"),
+        ("CheckedLambda", int.MaxValue, -1, "a lambda inside checked { } is checked: its overflow is caught"),
+        ("CheckedFloatMin", int.MinValue, int.MinValue, "checked f32 → i32 accepts the smallest i32"),
+        ("CheckedFloatBelow", -(1 << 30) - 128, 7, "checked f32 → i32 rejects the f32 below the smallest i32"),
         ("OrderField", null, 6, "a field read before a call that changes it"),
         ("OrderThis", null, 6525, "this.Field before this.Call() as operand and arguments"),
         ("OrderArgs", null, 112, "arguments left to right around i++"),
@@ -48,6 +52,33 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         ("ContinueFinally", null, 3202, "continue inside a switch runs the finally between the switch and the loop"),
         ("InclusiveMax", null, 630, "an inclusive range up to the type's maximum ends (u8 ..=255, i8 ..=127); an empty one runs no pass"),
     ];
+
+    /// <summary>A lowering error names the source position of the statement (or the declaration) it is about, like the other diagnostics.</summary>
+    [Fact]
+    public void Lowering_errors_carry_the_source_position()
+    {
+        var p = new HirProgram("Pos");
+        p.Assembly.Files.Add("Pos/Main.ant");
+        // static class Program { static i32 Bad() { break; return 0; } }  — `break` outside a loop, at Main.ant(12,5)
+        var (prog, progDef) = p.Type("Program", TypeKind.Class, flags: TypeFlags.Static | TypeFlags.Abstract);
+        HirProgram.Method(prog, progDef, "Bad", HirProgram.I, MethodFlags.Static);
+        new MethodBuilder(progDef.Methods[^1]).Do(new BreakStmt { At = new SourceLocation(0, 12, 5) }, E.Ret(E.Int(0))).Done();
+        var lowered = HirLowerer.Lower(p.Assembly);
+        Check("the program does not lower", !lowered.Success);
+        var errors = lowered.Errors.Select(e => e.ToString()).ToList();
+        Check("the statement's error names its file, line and column: Pos/Main.ant(12,5): error: `break` outside a loop or switch (…)",
+            errors.Any(e => e.StartsWith("Pos/Main.ant(12,5): error: `break` outside a loop or switch")), string.Join("; ", errors));
+
+        // class Loop : Loop { }  — declared at Main.ant(3,1) (a declaration error: bodies are not reached)
+        var q = new HirProgram("Pos");
+        q.Assembly.Files.Add("Pos/Main.ant");
+        var (loop, loopDef) = q.Type("Loop", TypeKind.Class);
+        loopDef.Base = HirType.Named(loop);
+        loopDef.Location = new SourceLocation(0, 3, 1);
+        errors = HirLowerer.Lower(q.Assembly).Errors.Select(e => e.ToString()).ToList();
+        Check("the declaration's error names its position: Pos/Main.ant(3,1): error: a class cannot inherit from itself (…)",
+            errors.Any(e => e.StartsWith("Pos/Main.ant(3,1): error: a class cannot inherit from itself")), string.Join("; ", errors));
+    }
 
     /// <summary>The benchmark program lowered once, for the facts that run it and build executables of it.</summary>
     private static readonly Lazy<LoweringResult> LoweredBench = new(() => HirLowerer.Lower(HirPrograms.Bench().Assembly));

@@ -46,9 +46,9 @@ namespace Larva.Native
         }
 
         /// <summary>With <c>LARVA_MAP=1</c>, the linker also writes <c>output.map</c> (function addresses, for crash reports).</summary>
-        private static string MapOption(string output) =>
+        private static string? MapOption(string output) =>
             Environment.GetEnvironmentVariable("LARVA_MAP") is { Length: > 0 } map && map != "0"
-                ? $" /MAP:{Quote(Path.ChangeExtension(Path.GetFullPath(output), ".map"))}" : "";
+                ? $"/MAP:{Path.ChangeExtension(Path.GetFullPath(output), ".map")}" : null;
 
         /// <summary>
         /// Links <paramref name="objects"/> with the runtime into <paramref name="output"/>. The runtime is compiled once per
@@ -63,19 +63,11 @@ namespace Larva.Native
             var (options, system, systemLog) = ProgramLinking();
             if (system is null)
                 return (false, systemLog);
-            // The linker itself when the compiler's environment is known (no script and no cmd.exe in between).
-            if (Developer() is { } environment && Find(environment, "link.exe") is { } linker)
-            {
-                List<string> arguments = ["/nologo", "/CETCOMPAT:NO", .. options, $"/OUT:{Path.GetFullPath(output)}",
-                    .. objects.Select(Path.GetFullPath), runtime, .. system];
-                if (MapOption(output) is { Length: > 0 } map)
-                    arguments.Add(map.Trim().Replace("\"", ""));
-                var (code, log) = Run(linker, arguments, environment);
-                return (code == 0 && File.Exists(output), log.Trim());
-            }
-            string inputs = string.Join(" ", objects.Select(o => Quote(Path.GetFullPath(o))));
-            return RunScript(_ => $"link /nologo /CETCOMPAT:NO {string.Join(" ", options)}{MapOption(output)} /OUT:{Quote(Path.GetFullPath(output))} {inputs} {Quote(runtime)} {string.Join(" ", system.Select(Quote))} || exit /b 1",
-                output);
+            List<string> arguments = ["/nologo", "/CETCOMPAT:NO", .. options, $"/OUT:{Path.GetFullPath(output)}",
+                .. objects.Select(Path.GetFullPath), runtime, .. system];
+            if (MapOption(output) is { } map)
+                arguments.Add(map);
+            return RunCommands(_ => [new Command("link", arguments)], output);
         }
 
         /// <summary>
@@ -92,12 +84,7 @@ namespace Larva.Native
                 return (false, systemLog);
             List<string> arguments = ["/nologo", "/DLL", "/ENTRY:DllMain", "/CETCOMPAT:NO", .. SmallImage, $"/OUT:{Path.GetFullPath(output)}",
                 .. objects.Select(Path.GetFullPath), runtime, .. system, .. exports.Select(e => $"/EXPORT:{e}")];
-            if (Developer() is { } environment && Find(environment, "link.exe") is { } linker)
-            {
-                var (code, log) = Run(linker, arguments, environment);
-                return (code == 0 && File.Exists(output), log.Trim());
-            }
-            return RunScript(_ => "link " + string.Join(" ", arguments.Select(a => a.Contains(' ') ? Quote(a) : a)) + " || exit /b 1", output);
+            return RunCommands(_ => [new Command("link", arguments)], output);
         }
 
         /// <summary>
@@ -120,16 +107,16 @@ namespace Larva.Native
         /// </summary>
         private (string[]? Libraries, string Log) SystemLibraries()
         {
-            string target = Path.Combine(CacheFolder, $"ntdll-crt-{Hash(NtdllExports + VcVars)}.lib");
+            string target = Path.Combine(CacheFolder, $"ntdll-crt-{Hash(NtdllExports + VcVars + InstallationStamp())}.lib");
             if (!File.Exists(target))
             {
                 Directory.CreateDirectory(CacheFolder);
                 string partial = target + $".{Guid.NewGuid():N}.partial";
-                var (ok, log) = RunScript(directory =>
+                var (ok, log) = RunCommands(directory =>
                 {
                     string def = Path.Combine(directory, "ntdll.def");
                     File.WriteAllLines(def, ["LIBRARY ntdll.dll", "EXPORTS", .. NtdllExports.Split(' ')]);
-                    return $"lib /nologo /machine:x64 /def:{Quote(def)} /out:{Quote(partial)} || exit /b 1";
+                    return [new Command("lib", ["/nologo", "/machine:x64", $"/def:{def}", $"/out:{partial}"])];
                 }, partial);
                 if (!ok)
                     return (null, log);
@@ -195,16 +182,16 @@ namespace Larva.Native
         private (string? Path, string Log) CachedRuntime()
         {
             string source = RuntimeSource();
-            string target = Path.Combine(CacheFolder, $"larva_rt-{Hash(source + RuntimeFlags + VcVars)}.obj");
+            string target = Path.Combine(CacheFolder, $"larva_rt-{Hash(source + RuntimeFlags + VcVars + InstallationStamp())}.obj");
             if (File.Exists(target))
                 return (target, "");
             Directory.CreateDirectory(CacheFolder);
             string partial = target + $".{Guid.NewGuid():N}.partial";
-            var (ok, log) = RunScript(directory =>
+            var (ok, log) = RunCommands(directory =>
             {
                 string file = Path.Combine(directory, "larva_rt.c");
                 File.WriteAllText(file, source);
-                return $"cl {RuntimeFlags} /Fo{Quote(partial)} {Quote(file)} || exit /b 1";
+                return [new Command("cl", [.. RuntimeFlags.Split(' '), $"/Fo{partial}", file])];
             }, partial);
             if (!ok)
                 return (null, log);
@@ -231,12 +218,11 @@ namespace Larva.Native
         {
             if (developer is not null)
                 return developer;
-            string stamp = File.Exists(VcVars) ? File.GetLastWriteTimeUtc(VcVars).Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture) : "";
-            string file = Path.Combine(CacheFolder, $"vcvars-{Hash(VcVars + stamp)}.env");
+            string file = Path.Combine(CacheFolder, $"vcvars-{Hash(VcVars + InstallationStamp())}.env");
             string text;
-            if (File.Exists(file))
+            if (File.Exists(file) && File.ReadAllText(file) is { } cached && Find(Parse(cached), "cl.exe") is not null)
             {
-                text = File.ReadAllText(file);
+                text = cached;
             }
             else
             {
@@ -267,6 +253,13 @@ namespace Larva.Native
                     // Kept by another build, or not at all: this one has it.
                 }
             }
+            var variables = Parse(text);
+            return developer = variables.ContainsKey("PATH") && variables.ContainsKey("INCLUDE") ? variables : null;
+        }
+
+        /// <summary>The output of <c>set</c> as variables.</summary>
+        private static Dictionary<string, string> Parse(string text)
+        {
             var variables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             foreach (var line in text.Split('\n'))
             {
@@ -274,7 +267,29 @@ namespace Larva.Native
                 if (equals > 0)
                     variables[line[..equals]] = line[(equals + 1)..].TrimEnd('\r');
             }
-            return developer = variables.ContainsKey("PATH") && variables.ContainsKey("INCLUDE") ? variables : null;
+            return variables;
+        }
+
+        /// <summary>
+        /// What identifies the installed toolchain, for the cached environment: vcvars64.bat's last write and size, and
+        /// the default tools version next to it (<c>Microsoft.VCToolsVersion.default.txt</c>: it changes with every update,
+        /// vcvars64.bat itself usually does not). The environment names the tools' folders, so it goes stale with them.
+        /// </summary>
+        private string InstallationStamp()
+        {
+            var stamp = new System.Text.StringBuilder();
+            if (File.Exists(VcVars))
+            {
+                var info = new FileInfo(VcVars);
+                stamp.Append(info.LastWriteTimeUtc.Ticks).Append(':').Append(info.Length);
+                foreach (var name in new[] { "Microsoft.VCToolsVersion.default.txt", "Microsoft.VCRedistVersion.default.txt" })
+                {
+                    string version = Path.Combine(info.DirectoryName ?? "", name);
+                    if (File.Exists(version))
+                        stamp.Append(':').Append(File.ReadAllText(version).Trim()).Append(':').Append(File.GetLastWriteTimeUtc(version).Ticks);
+                }
+            }
+            return stamp.ToString();
         }
 
         // ── Native libraries (DLLs) ─────────────────────────────
@@ -305,13 +320,13 @@ namespace Larva.Native
         public (bool Success, string Log) BuildRuntime(string folder)
         {
             Directory.CreateDirectory(folder);
-            return RunScript(directory =>
+            return RunCommands(directory =>
             {
                 string source = Path.Combine(directory, "larva_rt.c");
                 File.WriteAllText(source, RuntimeSource());
-                return $"""
-                    cl /nologo /O2 /GS- /W3 /MT /DLARVA_SHARED_RUNTIME /D_CRT_SECURE_NO_WARNINGS /LD {Quote(source)} /Fo{Quote(Path.Combine(directory, "larva_rt.obj"))} /Fe{Quote(Path.Combine(Path.GetFullPath(folder), RuntimeDll))} /link /NOLOGO /CETCOMPAT:NO /OPT:REF /OPT:ICF /INCREMENTAL:NO /NODEFAULTLIB:libucrt.lib ucrt.lib kernel32.lib shell32.lib || exit /b 1
-                    """;
+                return [new Command("cl", ["/nologo", "/O2", "/GS-", "/W3", "/MT", "/DLARVA_SHARED_RUNTIME", "/D_CRT_SECURE_NO_WARNINGS", "/LD", source,
+                    $"/Fo{Path.Combine(directory, "larva_rt.obj")}", $"/Fe{Path.Combine(Path.GetFullPath(folder), RuntimeDll)}",
+                    "/link", "/NOLOGO", "/CETCOMPAT:NO", "/OPT:REF", "/OPT:ICF", "/INCREMENTAL:NO", "/NODEFAULTLIB:libucrt.lib", "ucrt.lib", "kernel32.lib", "shell32.lib"])];
             }, Path.Combine(folder, RuntimeDll));
         }
 
@@ -320,11 +335,11 @@ namespace Larva.Native
         /// that calls into that DLL links against. Made from the export list alone, so DLLs can depend on each other.
         /// </summary>
         public (bool Success, string Log) ImportLibrary(string dll, IReadOnlyList<string> exports, string output) =>
-            RunScript(directory =>
+            RunCommands(directory =>
             {
                 string response = Path.Combine(directory, "exports.rsp");
                 File.WriteAllText(response, Exports(exports));
-                return $"lib /nologo /machine:x64 /def /name:{Quote(Path.GetFileName(dll))} @{Quote(response)} /out:{Quote(Path.GetFullPath(output))} >nul || exit /b 1";
+                return [new Command("lib", ["/nologo", "/machine:x64", "/def", $"/name:{Path.GetFileName(dll)}", $"@{response}", $"/out:{Path.GetFullPath(output)}"])];
             }, output);
 
         /// <summary>
@@ -335,48 +350,72 @@ namespace Larva.Native
         /// </summary>
         public (bool Success, string Log) LinkLibrary(IReadOnlyList<string> objects, string output, IReadOnlyList<string> exports,
             string runtimeLibrary, IReadOnlyList<string> libraries) =>
-            RunScript(directory =>
+            RunCommands(directory =>
             {
                 string response = Path.Combine(directory, "exports.rsp");
                 File.WriteAllText(response, Exports(exports));
-                string inputs = string.Join(" ", objects.Concat(libraries).Append(runtimeLibrary).Select(o => Quote(Path.GetFullPath(o))));
-                return $"""
-                    link /nologo /DLL /NOENTRY /NODEFAULTLIB /NOIMPLIB /NOEXP /CETCOMPAT:NO /OPT:REF /OPT:ICF /INCREMENTAL:NO /ALTERNATENAME:_fltused=larva_poll @{Quote(response)} /OUT:{Quote(Path.GetFullPath(output))} {inputs} kernel32.lib ntdll.lib libcmt.lib || exit /b 1
-                    """;
+                return [new Command("link", ["/nologo", "/DLL", "/NOENTRY", "/NODEFAULTLIB", "/NOIMPLIB", "/NOEXP", "/CETCOMPAT:NO", "/OPT:REF", "/OPT:ICF", "/INCREMENTAL:NO",
+                    "/ALTERNATENAME:_fltused=larva_poll", $"@{response}", $"/OUT:{Path.GetFullPath(output)}",
+                    .. objects.Concat(libraries).Append(runtimeLibrary).Select(Path.GetFullPath), "kernel32.lib", "ntdll.lib", "libcmt.lib"])];
             }, output);
 
         /// <summary>A program that runs on <see cref="RuntimeDll"/> and calls into Larva DLLs (<paramref name="libraries"/>: import libraries).</summary>
         public (bool Success, string Log) LinkProgram(IReadOnlyList<string> objects, string output, string runtimeLibrary, IReadOnlyList<string> libraries) =>
-            RunScript(directory =>
+            RunCommands(directory =>
             {
                 string start = Path.Combine(directory, "larva_start.c");
                 File.WriteAllText(start, StartSource);
                 string startObject = Path.Combine(directory, "larva_start.obj");
-                string inputs = string.Join(" ", objects.Concat(libraries).Append(runtimeLibrary).Select(o => Quote(Path.GetFullPath(o))));
-                return $"""
-                    cl /nologo /O1 /GS- /c /Fo{Quote(startObject)} {Quote(start)} || exit /b 1
-                    link /nologo /SUBSYSTEM:CONSOLE /ENTRY:larva_start /NODEFAULTLIB /CETCOMPAT:NO{MapOption(output)} /OPT:REF /OPT:ICF /INCREMENTAL:NO /OUT:{Quote(Path.GetFullPath(output))} {inputs} {Quote(startObject)} kernel32.lib ntdll.lib libcmt.lib || exit /b 1
-                    """;
+                List<string> link = ["/nologo", "/SUBSYSTEM:CONSOLE", "/ENTRY:larva_start", "/NODEFAULTLIB", "/CETCOMPAT:NO"];
+                if (MapOption(output) is { } map)
+                    link.Add(map);
+                link.AddRange(["/OPT:REF", "/OPT:ICF", "/INCREMENTAL:NO", $"/OUT:{Path.GetFullPath(output)}",
+                    .. objects.Concat(libraries).Append(runtimeLibrary).Select(Path.GetFullPath), startObject, "kernel32.lib", "ntdll.lib", "libcmt.lib"]);
+                return [new Command("cl", ["/nologo", "/O1", "/GS-", "/c", $"/Fo{startObject}", start]), new Command("link", link)];
             }, output);
 
         /// <summary>A response file of <c>/EXPORT</c> options, each quoted whole so any symbol (spaces, <c>@</c>, <c>=</c>) passes as is.</summary>
         private static string Exports(IReadOnlyList<string> exports) => string.Concat(exports.Select(e => $"\"/EXPORT:{e}\"\n"));
 
-        /// <summary>Runs MSVC commands (after vcvars) in a scratch folder; succeeds when <paramref name="expected"/> exists.</summary>
-        private (bool Success, string Log) RunScript(Func<string, string> commands, string expected)
+        /// <summary>An MSVC tool (<c>cl</c>, <c>link</c>, <c>lib</c>) and its arguments, each one whole (a path with spaces needs no quotes).</summary>
+        private sealed record Command(string Program, IReadOnlyList<string> Arguments);
+
+        /// <summary>
+        /// Runs MSVC commands in a scratch folder, stopping at the first that fails; succeeds when <paramref name="expected"/>
+        /// exists. With the compiler's environment known (see <see cref="Developer"/>) each tool runs directly, its
+        /// arguments passed whole: nothing in between re-reads them. Only without it does a batch file call vcvars and
+        /// then the tools; cmd reads that file in the console's code page (not UTF-8), so it is written in it, or a path
+        /// with `ñ` or an accent would name a file that does not exist.
+        /// </summary>
+        private (bool Success, string Log) RunCommands(Func<string, IReadOnlyList<Command>> commands, string expected)
         {
             string directory = Path.Combine(Path.GetTempPath(), $"larva-link-{Guid.NewGuid():N}");
             Directory.CreateDirectory(directory);
             try
             {
-                string script = Path.Combine(directory, "build.bat");
-                // The compiler's environment from the cache when there is one, else from vcvars (seconds slower).
                 var environment = Developer();
-                File.WriteAllText(script, environment is null
-                    ? $"@echo off\ncall {Quote(VcVars)} >nul || exit /b 1\n{commands(directory)}\n"
-                    : $"@echo off\n{commands(directory)}\n");
-                var (code, log) = Run("cmd.exe", ["/d", "/c", script], environment);
-                return (code == 0 && File.Exists(expected), log.Trim());
+                var list = commands(directory);
+                if (environment is not null && list.All(c => Find(environment, c.Program + ".exe") is not null))
+                {
+                    var log = new System.Text.StringBuilder();
+                    foreach (var command in list)
+                    {
+                        var (code, output) = Run(Find(environment, command.Program + ".exe")!, command.Arguments, environment);
+                        log.Append(output);
+                        if (code != 0)
+                            return (false, log.ToString().Trim());
+                    }
+                    return (File.Exists(expected), log.ToString().Trim());
+                }
+                string script = Path.Combine(directory, "build.bat");
+                var text = new System.Text.StringBuilder("@echo off\n");
+                if (environment is null)
+                    text.Append($"call {Quote(VcVars)} >nul || exit /b 1\n");
+                foreach (var command in list)
+                    text.Append($"{command.Program} {string.Join(" ", command.Arguments.Select(ScriptArgument))} || exit /b 1\n");
+                File.WriteAllText(script, text.ToString(), ConsoleEncoding());
+                var (scriptCode, scriptLog) = Run("cmd.exe", ["/d", "/c", script], environment);
+                return (scriptCode == 0 && File.Exists(expected), scriptLog.Trim());
             }
             finally
             {
@@ -384,11 +423,49 @@ namespace Larva.Native
             }
         }
 
+        /// <summary>An argument on a batch file's command line: quoted when a space or a special character would split or change it.</summary>
+        private static string ScriptArgument(string argument) =>
+            argument.Length > 0 && argument.All(c => c > ' ' && c < 127 && c is not ('"' or '&' or '|' or '<' or '>' or '^' or '%' or '(' or ')'))
+                ? argument : Quote(argument);
+
         private static string Quote(string path) => $"\"{path}\"";
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern uint GetConsoleOutputCP();
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+        private static extern uint GetOEMCP();
+
+        private static readonly Lazy<bool> codePagesRegistered = new(() =>
+        {
+            System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+            return true;
+        });
+
+        /// <summary>
+        /// The encoding cmd and the MSVC tools use for what they read (batch files) and write (their output): the
+        /// console's output code page, or the OEM code page without a console (cmd gets one with it).
+        /// </summary>
+        private static System.Text.Encoding ConsoleEncoding()
+        {
+            _ = codePagesRegistered.Value;
+            uint codePage = GetConsoleOutputCP();
+            if (codePage == 0)
+                codePage = GetOEMCP();
+            try
+            {
+                return System.Text.Encoding.GetEncoding((int)codePage);
+            }
+            catch (Exception e) when (e is ArgumentException or NotSupportedException)
+            {
+                return new System.Text.UTF8Encoding(false);
+            }
+        }
 
         private static (int Code, string Output) Run(string program, IEnumerable<string> arguments, IReadOnlyDictionary<string, string>? environment = null)
         {
-            var start = new ProcessStartInfo(program) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            var encoding = ConsoleEncoding();
+            var start = new ProcessStartInfo(program) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, StandardOutputEncoding = encoding, StandardErrorEncoding = encoding };
             if (environment is not null)
             {
                 start.Environment.Clear();

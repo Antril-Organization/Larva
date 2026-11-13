@@ -345,14 +345,24 @@ namespace Larva.Wasm
                     var type = module.Globals[store.Global].Type;
                     int size = Layouts.Of(type, module)!.Size;
                     int value = Operand(store.Value);
+                    // The old value loses its owner once the new one is in place: its destructor sees the global
+                    // already changed, not itself still there.
+                    int old = int.MinValue;
                     if (Has(GcCapabilities.RefCounting) && type.Unoptional() is GcType)
                     {
+                        old = Temp();
+                        c.LocalGet(Fp);
                         c.I32(cg.GlobalAddress[store.Global]);
                         c.I64Load();
-                        c.I32WrapI64();
-                        c.Call(cg.Runtime("larva_gc_release")); // the old value loses its owner
+                        c.I64Store(old);
                     }
                     Copy(c, () => c.I32(cg.GlobalAddress[store.Global]), () => FrameAddress(value), size);
+                    if (old != int.MinValue)
+                    {
+                        LoadTemp(old);
+                        c.I32WrapI64();
+                        c.Call(cg.Runtime("larva_gc_release"));
+                    }
                     break;
                 }
                 case FreeStatement free:
@@ -390,8 +400,13 @@ namespace Larva.Wasm
             }
             int result = Rvalue(value, type);
             var moved = moves.MovedBy(MoveAnalysis.Operands(value), current).ToList();
-            ReleaseOwned(target, moved);
+            // What the target owned is released after the new value is stored: a destructor that runs in the
+            // release sees the owner's field already changed, not the dying object still in it.
+            int saved = tempCursor;
+            var old = LoadOwned(target, moved);
             Store(target, result);
+            ReleaseLoaded(old);
+            tempCursor = saved;
             UpdateFlags(moved, target);
         }
 
@@ -1606,24 +1621,44 @@ namespace Larva.Wasm
 
         private void ReleaseOwned(Place place, IReadOnlyList<Place> movedNow)
         {
+            int saved = tempCursor;
+            ReleaseLoaded(LoadOwned(place, movedNow));
+            tempCursor = saved;
+        }
+
+        /// <summary>A resource of a place read into a temp before the place is overwritten, to be released after (see <see cref="ReleaseLoaded"/>).</summary>
+        private readonly record struct OwnedValue(Release Release, int Flag, int Handle);
+
+        /// <summary>Reads the resources the value at <paramref name="place"/> owns into temps (its drop flags decide later whether they are released).</summary>
+        private List<OwnedValue> LoadOwned(Place place, IReadOnlyList<Place> movedNow)
+        {
+            var owned = new List<OwnedValue>();
             foreach (var (path, release, _) in Owned(function.TypeOf(place, module), []))
             {
                 var resource = new Place(place.Local, [.. place.Projections, .. path]);
                 if (movedNow.Any(m => m.IsPrefixOf(resource) || resource.IsPrefixOf(m)))
                     continue;
-                bool guarded = flags.TryGetValue(resource, out int flag);
+                int flag = flags.TryGetValue(resource, out int f) ? f : int.MinValue;
+                owned.Add(new OwnedValue(release, flag, Load(resource)));
+            }
+            return owned;
+        }
+
+        /// <summary>Releases what <see cref="LoadOwned"/> read, each guarded by its drop flag when it has one (and the flag cleared).</summary>
+        private void ReleaseLoaded(List<OwnedValue> owned)
+        {
+            foreach (var (release, flag, handle) in owned)
+            {
+                bool guarded = flag != int.MinValue;
                 if (guarded)
                 {
                     c.LocalGet(Fp);
                     c.I32Load8U(flag);
                     OpenIf();
                 }
-                int saved = tempCursor;
-                int handle = Load(resource);
                 LoadTemp(handle);
                 c.I32WrapI64();
                 c.Call(cg.Runtime(release == Release.FreeBox ? "larva_free" : "larva_gc_release"));
-                tempCursor = saved;
                 if (guarded)
                 {
                     c.LocalGet(Fp);
