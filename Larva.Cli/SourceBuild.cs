@@ -355,7 +355,7 @@ internal static class SourceBuild
         if (!lowered.Success)
         {
             foreach (var error in lowered.Errors)
-                Console.Error.WriteLine($"larva: {error}");
+                Console.Error.WriteLine(error.Source is null ? $"larva: {error}" : error.ToString()); // positioned like the other diagnostics
             return 1;
         }
         // The borrow checker, when on (with --check and when building): over the program's own functions (the libraries
@@ -483,7 +483,7 @@ internal static class SourceBuild
         if (!lowered.Success)
         {
             foreach (var error in lowered.Errors)
-                Console.Error.WriteLine($"larva: {dependency.Name}: {error}");
+                Console.Error.WriteLine(error.Source is null ? $"larva: {dependency.Name}: {error}" : error.ToString());
             return null;
         }
         var objectFile = Compiler.CompileObject(lowered.Module!, new CompilationOptions { Gc = dependency.Gc });

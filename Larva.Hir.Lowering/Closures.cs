@@ -717,7 +717,15 @@ namespace Larva.Hir.Lowering
 
         private IrFunction LowerLambda()
         {
-            Statement(closures!.Scan.Lambdas[lambda].Body);
+            try
+            {
+                Statement(closures!.Scan.Lambdas[lambda].Body);
+            }
+            catch (LoweringException e) when (!e.At.IsKnown)
+            {
+                e.At = at;
+                throw;
+            }
             if (open)
             {
                 if (result.IsUnit)

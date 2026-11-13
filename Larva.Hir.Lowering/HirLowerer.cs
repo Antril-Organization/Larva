@@ -37,9 +37,10 @@ namespace Larva.Hir.Lowering
         public bool StaticConstructorsFromEntry { get; init; }
     }
 
-    public sealed record LoweringError(string Where, string Message)
+    /// <summary>An error of lowering: in <paramref name="Where"/> (a type or method), at <paramref name="Source"/> when the HIR said where.</summary>
+    public sealed record LoweringError(string Where, string Message, SourcePosition? Source = null)
     {
-        public override string ToString() => $"{Where}: {Message}";
+        public override string ToString() => Source is { } source ? $"{source}: error: {Message} ({Where})" : $"{Where}: {Message}";
     }
 
     public sealed class LoweringResult
@@ -105,11 +106,15 @@ namespace Larva.Hir.Lowering
             return lowerer.Run();
         }
 
-        internal void Error(string where, string message)
+        internal void Error(string where, string message, H.SourceLocation at = default)
         {
             lock (errors)
-                errors.Add(new LoweringError(where, message));
+                errors.Add(new LoweringError(where, message, Position(at)));
         }
+
+        /// <summary>A HIR location as a source position (null when the HIR did not say where).</summary>
+        internal SourcePosition? Position(H.SourceLocation at) =>
+            at.IsKnown && at.File < Assembly.Files.Count ? new SourcePosition(Assembly.Files[at.File], at.Line, at.Column) : null;
 
         /// <summary>
         /// Linkage across GC domains. A type from <see cref="LoweringOptions.ExternalAssemblies"/> is defined in an object of
@@ -424,7 +429,7 @@ namespace Larva.Hir.Lowering
                     }
                     else
                     {
-                        Error(info.Name, $"the base of a class is a class, not {H.Text.HirPrinter.Print(b, Assembly)}");
+                        Error(info.Name, $"the base of a class is a class, not {H.Text.HirPrinter.Print(b, Assembly)}", info.Definition.Location);
                     }
                 }
             }
@@ -444,7 +449,7 @@ namespace Larva.Hir.Lowering
                 {
                     if (!seen.Add(c))
                     {
-                        Error(info.Name, "a class cannot inherit from itself");
+                        Error(info.Name, "a class cannot inherit from itself", info.Definition.Location);
                         break;
                     }
                 }
@@ -476,7 +481,7 @@ namespace Larva.Hir.Lowering
                     return;
                 if (state[info.Index] == 1)
                 {
-                    Error(info.Name, "a struct contains itself (directly or through other structs)");
+                    Error(info.Name, "a struct contains itself (directly or through other structs)", info.Definition.Location);
                     return;
                 }
                 state[info.Index] = 1;
@@ -639,11 +644,11 @@ namespace Larva.Hir.Lowering
                 var type = fields[info.FieldIndex[f]];
                 if (Larva.IR.Lowering.Layouts.Of(type, module) is not { } measured)
                 {
-                    Error(info.Name, $"`{definition.Fields[f].Name}` has no fixed size, so `[ValueLayout]` cannot place it");
+                    Error(info.Name, $"`{definition.Fields[f].Name}` has no fixed size, so `[ValueLayout]` cannot place it", definition.Fields[f].Location);
                     continue;
                 }
                 if (measured.GcOffsets.Length > 0)
-                    Error(info.Name, $"`{definition.Fields[f].Name}` holds objects: a value with `[ValueLayout]` holds no objects");
+                    Error(info.Name, $"`{definition.Fields[f].Name}` holds objects: a value with `[ValueLayout]` holds no objects", definition.Fields[f].Location);
                 int fieldAlign = pack > 0 ? Math.Min(measured.Align, pack) : measured.Align;
                 int offset;
                 if (isExplicit)
@@ -813,7 +818,7 @@ namespace Larva.Hir.Lowering
                     string where = $"{info.Name}.{method.Name}";
                     if (method.Generics.Count > 0 && info.MethodSlot is { } slots && slots[m] >= 0)
                     {
-                        Error(where, "a virtual method cannot be generic");
+                        Error(where, "a virtual method cannot be generic", method.Location);
                         continue;
                     }
                     var context = new GenericContext(info.GenericCount);
@@ -844,7 +849,7 @@ namespace Larva.Hir.Lowering
                         }
                         else
                         {
-                            Error(where, "instance methods belong to classes and structs");
+                            Error(where, "instance methods belong to classes and structs", method.Location);
                         }
                     }
                     var parameters = method.Parameters.Select(p => Lower(p.Type, where, context)).ToArray();
@@ -907,11 +912,11 @@ namespace Larva.Hir.Lowering
                         var overridden = FindVirtual(info, method);
                         if (overridden is not { } found)
                         {
-                            Error(where, "overrides no virtual method of a base class");
+                            Error(where, "overrides no virtual method of a base class", method.Location);
                             continue;
                         }
                         if (Types[found.Type].Definition.Methods[found.Method].Flags.HasFlag(H.MethodFlags.Final))
-                            Error(where, "overrides a final method");
+                            Error(where, "overrides a final method", method.Location);
                         info.MethodSlot[m] = Types[found.Type].MethodSlot[found.Method];
                         info.MethodIntroducer[m] = Types[found.Type].MethodIntroducer[found.Method];
                         info.Slots[info.MethodSlot[m]] = (info.Index, m);
@@ -920,7 +925,7 @@ namespace Larva.Hir.Lowering
                     {
                         if (method.IsStatic)
                         {
-                            Error(where, "a static method cannot be virtual");
+                            Error(where, "a static method cannot be virtual", method.Location);
                             continue;
                         }
                         info.MethodSlot[m] = info.Slots.Count;
@@ -1108,7 +1113,7 @@ namespace Larva.Hir.Lowering
                         var found = FindImplementation(info, required.Name, parameters, result);
                         if (found is null && required.Body is null)
                         {
-                            Error(info.Name, $"implements {iface.Name} but has no method {required.Name} with its parameters");
+                            Error(info.Name, $"implements {iface.Name} but has no method {required.Name} with its parameters", info.Definition.Location);
                             continue;
                         }
                         var selfType = info.IsPrimitive ? info.Definition.Underlying! : new H.NamedType(H.TypeToken.Def(info.Index), OwnParameters(info));
