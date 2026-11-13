@@ -205,6 +205,43 @@ internal static class HirPrograms
                     [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(2)), C))))]),
                 Ret(Int(0))).Done();
         }
+        // NestedRethrow(n): try { try { Throws(n); } catch (Error e) { try { throw new Error(5); } catch (Error) { Counter = 1; } throw; } } catch (Error e2) { return e2.Code * 10 + Counter; } return 0;
+        // (`throw;` rethrows the outer exception, not the one the nested catch handled in between.)
+        {
+            var m = M("NestedRethrow", n);
+            var e = m.Local("e", E_);
+            var e2 = m.Local("e2", E_);
+            m.Do(Try(Blk(Try(Blk(S(Call(throws, I, Arg(0)))),
+                        [new H.CatchClause(E_, e.Local, null, Blk(
+                            Try(Blk(Throw(New(E_, errorNew, Int(5)))), [new H.CatchClause(E_, -1, null, Blk(S(Set(C, Int(1)))))]),
+                            Throw(null)))])),
+                    [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(10)), C))))]),
+                Ret(Int(0))).Done();
+        }
+        // RethrowAfterFinally(n): try { try { Throws(n); } catch (Error e) { try { Counter = 1; } finally { Counter += 10; } throw; } } catch (Error e2) { return e2.Code * 100 + Counter; } return 0;
+        {
+            var m = M("RethrowAfterFinally", n);
+            var e = m.Local("e", E_);
+            var e2 = m.Local("e2", E_);
+            m.Do(Try(Blk(Try(Blk(S(Call(throws, I, Arg(0)))),
+                        [new H.CatchClause(E_, e.Local, null, Blk(
+                            Try(Blk(S(Set(C, Int(1)))), [], Blk(S(AddTo(C, Int(10))))),
+                            Throw(null)))])),
+                    [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(100)), C))))]),
+                Ret(Int(0))).Done();
+        }
+        // NestedFinally(n): Counter = 0; try { try { Throws(n); } finally { try { throw new Error(5); } catch (Error) { Counter += 3; } try { Counter += 20; } finally { Counter += 100; } } } catch (Error e2) { return e2.Code * 1000 + Counter; } return Counter;
+        // (the finally goes on with the exception that was passing, after nested handlers took others; on the normal path too.)
+        {
+            var m = M("NestedFinally", n);
+            var e2 = m.Local("e2", E_);
+            m.Do(S(Set(C, Int(0))),
+                Try(Blk(Try(Blk(S(Call(throws, I, Arg(0)))), [], Blk(
+                        Try(Blk(Throw(New(E_, errorNew, Int(5)))), [new H.CatchClause(E_, -1, null, Blk(S(AddTo(C, Int(3)))))]),
+                        Try(Blk(S(AddTo(C, Int(20)))), [], Blk(S(AddTo(C, Int(100)))))))),
+                    [new H.CatchClause(E_, e2.Local, null, Blk(Ret(Add(Mul(F(e2, code, I), Int(1000)), C))))]),
+                Ret(C)).Done();
+        }
         // Nulls(): Animal? a = null; r = 0; if (a == null) r += 1; Animal x = a ?? new Dog(); r += x.Speak(); return r;
         {
             var m = M("Nulls");
@@ -220,6 +257,107 @@ internal static class HirPrograms
         }
         // Statics(): Counter = 5; Counter += 3; return Counter;
         M("Statics").Do(S(Set(C, Int(5))), S(AddTo(C, Int(3))), Ret(C)).Done();
+
+        // Operands are evaluated left to right: one read before a later operand's side effect sees the old value.
+        // class Tally { i32 Count = 5; Bump() { Count += 10; return 1; } Both() => Count + Bump(); Args() => Add3(Count, Bump(), Count); }
+        var (tally, tallyDef) = p.Type("Tally", TypeKind.Class);
+        var Ty = HirProgram.T(tally);
+        var count = HirProgram.Field(tally, tallyDef, "Count", I);
+        var tallyNew = HirProgram.Method(tally, tallyDef, ".new", HirType.Void, MethodFlags.None, MethodKind.Constructor);
+        new MethodBuilder(tallyDef.Methods[^1]).Do(S(Set(F(This(Ty), count, I), Int(5)))).Done();
+        var bump = HirProgram.Method(tally, tallyDef, "Bump", I, MethodFlags.None);
+        new MethodBuilder(tallyDef.Methods[^1]).Do(S(AddTo(F(This(Ty), count, I), Int(10))), Ret(Int(1))).Done();
+        var add3 = default(MemberToken);
+        {
+            // Add3(a, b, c) => a * 100 + b * 10 + c
+            var m = M("Add3", HirProgram.P("a", I), HirProgram.P("b", I), HirProgram.P("c", I));
+            add3 = Last();
+            m.Do(Ret(Add(Add(Mul(Arg(0), Int(100)), Mul(Arg(1), Int(10))), Arg(2)))).Done();
+        }
+        var both = HirProgram.Method(tally, tallyDef, "Both", I, MethodFlags.None);
+        new MethodBuilder(tallyDef.Methods[^1]).Do(Ret(Add(F(This(Ty), count, I), CallOn(This(Ty), bump, I)))).Done();
+        var args = HirProgram.Method(tally, tallyDef, "Args", I, MethodFlags.None);
+        new MethodBuilder(tallyDef.Methods[^1]).Do(Ret(Call(add3, I, F(This(Ty), count, I), CallOn(This(Ty), bump, I), F(This(Ty), count, I)))).Done();
+        // OrderField(): t = new Tally(); return t.Count + t.Bump();  (6, not 16)
+        {
+            var m = M("OrderField");
+            var t = m.Local("t", Ty);
+            m.Do(Let(t, New(Ty, tallyNew)), Ret(Add(F(t, count, I), CallOn(t, bump, I)))).Done();
+        }
+        // OrderThis(): return new Tally().Both() * 1000 + new Tally().Args();  (6 * 1000 + 525)
+        {
+            var m = M("OrderThis");
+            var t = m.Local("t", Ty);
+            var u = m.Local("u", Ty);
+            m.Do(Let(t, New(Ty, tallyNew)), Let(u, New(Ty, tallyNew)), Ret(Add(Mul(CallOn(t, both, I), Int(1000)), CallOn(u, args, I)))).Done();
+        }
+        // OrderArgs(): i = 1; return Add3(i, i++, i);  (112, not 212)
+        {
+            var m = M("OrderArgs");
+            var i = m.Local("i", I);
+            m.Do(Let(i, Int(1)), Ret(Call(add3, I, i, Inc(i), i))).Done();
+        }
+        // OrderElement(): arr = new i32[4]; k = 1; arr[k] = k++; arr[2] = 5; arr[3] = 9; j = 2; return arr[1] * 100 + arr[2] * 10 + (arr[j] + j++);  (100 + 50 + 7)
+        {
+            var m = M("OrderElement");
+            var arrayType = new ArrayType(I);
+            var arr = m.Local("arr", arrayType);
+            var k = m.Local("k", I);
+            var j = m.Local("j", I);
+            Expr At(Expr index) => new ElementExpr(arr, [index], I);
+            m.Do(Let(arr, new NewArrayExpr(I, [Int(4)], arrayType)), Let(k, Int(1)),
+                S(Set(At(k), Inc(k))), S(Set(At(Int(2)), Int(5))), S(Set(At(Int(3)), Int(9))), Let(j, Int(2)),
+                Ret(Add(Add(Mul(At(Int(1)), Int(100)), Mul(At(Int(2)), Int(10))), Add(At(j), Inc(j))))).Done();
+        }
+        // OrderCompound(): v = 3; v += v++; t = new Tally(); t.Count = 1; t.Count += t.Bump(); return v * 10 + t.Count;  (60 + 2)
+        {
+            var m = M("OrderCompound");
+            var v = m.Local("v", I);
+            var t = m.Local("t", Ty);
+            m.Do(Let(v, Int(3)), S(AddTo(v, Inc(v))), Let(t, New(Ty, tallyNew)), S(Set(F(t, count, I), Int(1))), S(AddTo(F(t, count, I), CallOn(t, bump, I))),
+                Ret(Add(Mul(v, Int(10)), F(t, count, I)))).Done();
+        }
+        // OrderNew(): i = 1; e = new Error(i + i++ * 10); return e.Code;  (11: 1 + 1 * 10)
+        {
+            var m = M("OrderNew");
+            var i = m.Local("i", I);
+            var e = m.Local("e", E_);
+            m.Do(Let(i, Int(1)), Let(e, New(E_, errorNew, Add(i, Mul(Inc(i), Int(10))))), Ret(F(e, code, I))).Done();
+        }
+        // ContinueFinally(): s = 0; for (k = 0; k < 3; k++) { try { switch (k) { case 1: continue; default: s += 1; } s += 100; } finally { s += 1000; } } return s;
+        //   (3 finally runs + 2 full passes: 3000 + 202 = 3202)
+        {
+            var m = M("ContinueFinally");
+            var s = m.Local("s", I);
+            var k = m.Local("k", I);
+            m.Do(Let(s, Int(0)),
+                new ForStmt([Let(k, Int(0))], Lt(k, Int(3)), [Inc(k)], Blk(
+                    Try(Blk(
+                            new SwitchStmt(k, [
+                                new SwitchSection([new ConstantPattern(HirConstant.Int(1))], null, new ContinueStmt()),
+                                new SwitchSection([new DiscardPattern()], null, S(AddTo(s, Int(1)))),
+                            ]),
+                            S(AddTo(s, Int(100)))),
+                        [], Blk(S(AddTo(s, Int(1000))))))),
+                Ret(s)).Done();
+        }
+        // InclusiveMax(): n = 0; foreach (u8 b in 250..=255) n++; foreach (i8 c in 125..=127) m++; foreach (i in 5..=3) e++; return n * 100 + m * 10 + e;  (630)
+        {
+            var m = M("InclusiveMax");
+            var U8 = HirType.U8;
+            var I8 = HirType.Of(Primitive.I8);
+            var cnt = m.Local("cnt", I);
+            var mm = m.Local("m", I);
+            var e = m.Local("e", I);
+            var b = m.Local("b", U8);
+            var c = m.Local("c", I8);
+            var i = m.Local("i", I);
+            m.Do(Let(cnt, Int(0)), Let(mm, Int(0)), Let(e, Int(0)),
+                new ForeachStmt(b.Local, new RangeExpr(Int(250, U8), Int(255, U8), true, U8), S(AddTo(cnt, Int(1)))),
+                new ForeachStmt(c.Local, new RangeExpr(Int(125, I8), Int(127, I8), true, I8), S(AddTo(mm, Int(1)))),
+                new ForeachStmt(i.Local, new RangeExpr(Int(5), Int(3), true, I), S(AddTo(e, Int(1)))),
+                Ret(Add(Add(Mul(cnt, Int(100)), Mul(mm, Int(10))), e))).Done();
+        }
         return p;
     }
 

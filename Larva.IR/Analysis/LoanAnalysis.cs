@@ -75,21 +75,7 @@ namespace Larva.IR.Analysis
             switch (statement)
             {
                 case AssignStatement assign:
-                    HashSet<int> incoming = [];
-                    if (assign.Value is RefRvalue reference)
-                    {
-                        incoming.Add(loansByLocation[location].Id);
-                        // Reborrowing through a reference keeps the original loans alive too.
-                        if (reference.Place.HasDeref())
-                            incoming.UnionWith(state.LoansOf(reference.Place.Local));
-                    }
-                    else if (assign.Value is not IntrinsicRvalue)
-                    {
-                        // (The runtime's operations give numbers, raw pointers or nothing: they borrow from no argument.)
-                        foreach (var operand in MoveAnalysis.Operands(assign.Value))
-                            incoming.UnionWith(LoansFlowingFrom(state, operand));
-                    }
-                    Store(state, assign.Target, incoming);
+                    Store(state, assign.Target, Incoming(state, assign, location));
                     break;
 
                 case StorageDeadStatement dead:
@@ -98,32 +84,90 @@ namespace Larva.IR.Analysis
             }
         }
 
+        /// <summary>The loans the value of <paramref name="assign"/> carries into its target.</summary>
+        internal HashSet<int> Incoming(LoanState state, AssignStatement assign, Location location)
+        {
+            HashSet<int> incoming = [];
+            if (assign.Value is RefRvalue reference)
+            {
+                incoming.Add(loansByLocation[location].Id);
+                // Reborrowing through a reference keeps the original loans alive too; so does borrowing a place that
+                // itself holds references (`&r` with `r = &x`, `&holder`): what is read back through the new reference
+                // (`*rr`, `(*h).field`) still borrows what the place borrowed.
+                if (reference.Place.HasDeref() || function.TypeOf(reference.Place, module).ContainsReference(context))
+                    incoming.UnionWith(state.LoansOf(reference.Place.Local));
+            }
+            else if (assign.Value is not IntrinsicRvalue)
+            {
+                // (The runtime's operations give numbers, raw pointers or nothing: they borrow from no argument.)
+                foreach (var operand in MoveAnalysis.Operands(assign.Value))
+                    incoming.UnionWith(LoansFlowingFrom(state, operand));
+            }
+            return incoming;
+        }
+
         public void Terminator(LoanState state, Terminator terminator, Location location)
         {
             if (terminator is not CallTerminator call)
                 return;
-
-            // A returned reference may come from the reference arguments: it may point into what one of their loans
-            // borrowed (when that place's type can hold what it points to), or be a copy of a reference stored there (and
-            // carry the loans that place holds). Types decide which: a `&[u16]` cannot point into a struct of numbers.
-            HashSet<int> incoming = [];
-            var result = function.TypeOf(call.Destination, module);
-            if (result.ContainsReference(context))
+            foreach (var (into, loans, replaces) in CallStores(state, call))
             {
-                var targets = Pointees(result, []);
-                foreach (var argument in call.Arguments)
-                {
-                    foreach (int id in LoansFlowingFrom(state, argument))
-                    {
-                        var borrowed = function.TypeOf(Loans[id].Place, module);
-                        if (targets is null || targets.Any(t => MayHold(borrowed, t, [])))
-                            incoming.Add(id);
-                        if (borrowed.ContainsReference(context))
-                            incoming.UnionWith(state.LoansOf(Loans[id].Place.Local));
-                    }
-                }
+                if (replaces)
+                    Store(state, into, loans);
+                else
+                    Add(state, into, loans);
             }
-            Store(state, call.Destination, incoming);
+        }
+
+        /// <summary>
+        /// What a call may store, judged by its signature alone: its arguments' loans into its destination (<c>Replaces</c>:
+        /// an assignment), and into every place an argument lends as <c>&amp;mut</c> whose type can hold what the other
+        /// arguments borrow (the callee may keep a reference there; the place's own loans stay).
+        /// </summary>
+        /// <remarks>
+        /// A returned reference may come from the reference arguments: it may point into what one of their loans borrowed
+        /// (when that place's type can hold what it points to), or be a copy of a reference stored there (and carry the
+        /// loans that place holds). Types decide which: a <c>&amp;[u16]</c> cannot point into a struct of numbers. The same
+        /// goes for what the callee writes behind a <c>&amp;mut</c> argument.
+        /// </remarks>
+        internal List<(Place Into, HashSet<int> Loans, bool Replaces)> CallStores(LoanState state, CallTerminator call)
+        {
+            List<(Place, HashSet<int>, bool)> stores = [];
+            List<int> fromArguments = [];
+            foreach (var argument in call.Arguments)
+                fromArguments.AddRange(LoansFlowingFrom(state, argument));
+
+            HashSet<int> Kept(IrType holder, int except)
+            {
+                HashSet<int> kept = [];
+                if (!holder.ContainsReference(context))
+                    return kept;
+                var targets = Pointees(holder, []);
+                foreach (int id in fromArguments)
+                {
+                    if (id == except)
+                        continue;
+                    var borrowed = function.TypeOf(Loans[id].Place, module);
+                    if (targets is null || targets.Any(t => MayHold(borrowed, t, [])))
+                        kept.Add(id);
+                    if (borrowed.ContainsReference(context))
+                        kept.UnionWith(state.LoansOf(Loans[id].Place.Local));
+                }
+                return kept;
+            }
+
+            stores.Add((call.Destination, Kept(function.TypeOf(call.Destination, module), -1), true));
+            foreach (int id in fromArguments.Distinct())
+            {
+                if (!Loans[id].Mutable)
+                    continue;
+                var lent = Loans[id].Place;
+                var kept = Kept(function.TypeOf(lent, module), id);
+                kept.RemoveWhere(other => Loans[other].Place.Overlaps(lent)); // a loan of the place itself is a conflict, not something kept in it
+                if (kept.Count > 0)
+                    stores.Add((lent, kept, false));
+            }
+            return stores;
         }
 
         /// <summary>What the references in <paramref name="type"/> point to; null when a type parameter hides it.</summary>
@@ -181,7 +225,8 @@ namespace Larva.IR.Analysis
             };
         }
 
-        private IEnumerable<int> LoansFlowingFrom(LoanState state, Operand operand) => operand switch
+        /// <summary>The loans an operand carries: those its place's local holds, when its type can hold references.</summary>
+        internal IEnumerable<int> LoansFlowingFrom(LoanState state, Operand operand) => operand switch
         {
             CopyOperand { Place: var place } when function.TypeOf(place, module).ContainsReference(context) => state.LoansOf(place.Local),
             MoveOperand { Place: var place } when function.TypeOf(place, module).ContainsReference(context) => state.LoansOf(place.Local),
@@ -198,12 +243,18 @@ namespace Larva.IR.Analysis
                 else
                     state.Held[target.Local] = incoming;
             }
-            else if (incoming.Count > 0)
-            {
-                if (!state.Held.TryGetValue(target.Local, out var existing))
-                    state.Held[target.Local] = existing = [];
-                existing.UnionWith(incoming);
-            }
+            else
+                Add(state, target, incoming);
+        }
+
+        /// <summary>The target's local may now hold <paramref name="incoming"/> as well.</summary>
+        private static void Add(LoanState state, Place target, HashSet<int> incoming)
+        {
+            if (incoming.Count == 0)
+                return;
+            if (!state.Held.TryGetValue(target.Local, out var existing))
+                state.Held[target.Local] = existing = [];
+            existing.UnionWith(incoming);
         }
     }
 }

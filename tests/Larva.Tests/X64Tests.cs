@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Text;
 using Larva.IR;
 using Larva.Native;
@@ -58,6 +59,13 @@ public sealed unsafe class X64Tests : CheckedTest
             Check("RC: rc_main() = 7", ((delegate* unmanaged<int>)image.Address("rc_main"))() == 7);
             Check("RC: every handle released", NativeRuntime.LiveGc == 0 && NativeRuntime.Errors == 0,
                 $"live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
+        }
+        NativeRuntime.Reset();
+        using (var image = Load(NativePrograms.ComparisonProgram(), GcConfig.RefCount))
+        {
+            long k = ((delegate* unmanaged<long, long>)image.Address("compare"))(1000);
+            Check("RC: compare(1000) = 1000, `==` / `!=` on handles keep no reference", k == 1000 && NativeRuntime.LiveGc == 0 && NativeRuntime.Errors == 0,
+                $"k {k}, live {NativeRuntime.LiveGc}, retains {NativeRuntime.Retains}, releases {NativeRuntime.Releases}");
         }
         NativeRuntime.Reset();
         using (var image = Load(NativePrograms.RegionProgram(), GcConfig.Arena))
@@ -205,6 +213,88 @@ public sealed unsafe class X64Tests : CheckedTest
         Check("f128 is compiled (soft-float routines in the runtime)", !soft.Skipped.ContainsKey("quad") && soft.Error is null, soft.Error);
     }
 
+    /// <summary>Float `%` is fmod (the dividend's sign) through the runtime's exact soft float; singles go through doubles exactly.</summary>
+    [Fact]
+    public void Float_remainder_is_fmod()
+    {
+        var f64 = new FunctionBuilder("rem_f64", IrType.F64);
+        int a = f64.Argument(IrType.F64, "a"), b = f64.Argument(IrType.F64, "b");
+        f64.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(a), Copy(b))).Return();
+        var f32 = new FunctionBuilder("rem_f32", IrType.F32);
+        int sa = f32.Argument(IrType.F32, "a"), sb = f32.Argument(IrType.F32, "b");
+        f32.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(sa), Copy(sb))).Return();
+        var module = new IrModule([], [f64.Build(), f32.Build()]);
+        using var image = Load(module);
+        var vm = Vm(module);
+        var remF64 = (delegate* unmanaged<double, double, double>)image.Address("rem_f64");
+        var remF32 = (delegate* unmanaged<float, float, float>)image.Address("rem_f32");
+        foreach (var (x, y) in new (double, double)[] { (7.5, 2.0), (-7.5, 2.0), (7.5, -2.0), (1e300, 3.0), (5.5, double.PositiveInfinity), (0.1, 0.03), (-1.0, 0.5) })
+        {
+            double expected = x % y; // C#'s % on doubles is fmod
+            Check($"x64: {x} % {y} = {expected}", remF64(x, y).Equals(expected), $"gave {remF64(x, y)}");
+            Check($"x64: (f32){x} % {y} = {(float)x % (float)y}", remF32((float)x, (float)y).Equals((float)x % (float)y), $"gave {remF32((float)x, (float)y)}");
+            Check($"VM: {x} % {y} = {expected}", Equals(vm.Run("rem_f64", x, y), expected), $"gave {vm.Run("rem_f64", x, y)}");
+        }
+        Check("x64: 5 % 0 = NaN", double.IsNaN(remF64(5.0, 0.0)));
+        Check("x64: -0.0 keeps its sign (-1 % 1 = -0)", double.IsNegative(remF64(-1.0, 1.0)) && remF64(-1.0, 1.0) == 0);
+    }
+
+    /// <summary>
+    /// Larva's rule for every back end: a float out of the integer's range gives the nearest limit and NaN gives 0 (LLVM's
+    /// fptosi.sat), never cvttsd2si's 0x8000… or a wrapped value; the VM agrees.
+    /// </summary>
+    [Fact]
+    public void Float_to_integer_conversions_saturate()
+    {
+        var targets = new[] { IrType.I8, IrType.I16, IrType.I32, IrType.I64, IrType.U8, IrType.U16, IrType.U32, IrType.U64 };
+        var functions = new List<IrFunction>();
+        foreach (var target in targets)
+        {
+            foreach (var source in new[] { IrType.F64, IrType.F32 })
+            {
+                var f = new FunctionBuilder($"{source}_to_{target}", target);
+                int x = f.Argument(source, "x");
+                f.Assign(FunctionBuilder.ReturnPlace, Rvalue.Cast(Copy(x), target)).Return();
+                functions.Add(f.Build());
+            }
+        }
+        var module = new IrModule([], [.. functions]);
+        using var image = Load(module);
+        var vm = Vm(module);
+        var inputs = new[] { 1e30, -1e30, double.NaN, double.PositiveInfinity, double.NegativeInfinity, 3.9, -3.9, 0.0, 2147483648.0, 255.5, -0.5 };
+        foreach (var target in targets)
+        {
+            long min = target.IsSigned ? -(1L << (target.BitWidth!.Value - 1)) : 0;
+            ulong max = target.IsSigned ? (1UL << (target.BitWidth!.Value - 1)) - 1 : target.BitWidth == 64 ? ulong.MaxValue : (1UL << target.BitWidth!.Value) - 1;
+            foreach (double x in inputs)
+            {
+                var expected = double.IsNaN(x) ? 0 : x >= max ? (BigInteger)max : x <= min ? min : new BigInteger(Math.Truncate(x));
+                var fromDouble = Call(image, $"f64_to_{target}", target, x);
+                var fromSingle = Call(image, $"f32_to_{target}", target, (float)x);
+                var expectedSingle = double.IsNaN(x) ? 0 : (float)x >= max ? (BigInteger)max : (float)x <= min ? min : new BigInteger(Math.Truncate((float)x));
+                Check($"({target}){x} = {expected}", fromDouble == expected, $"x64 gave {fromDouble}");
+                Check($"({target})(f32){x} = {expectedSingle}", fromSingle == expectedSingle, $"x64 gave {fromSingle}");
+                Check($"VM: ({target}){x} = {expected}", new BigInteger(System.Convert.ToDecimal(vm.Run($"f64_to_{target}", x))) == expected, $"VM gave {vm.Run($"f64_to_{target}", x)}");
+            }
+        }
+    }
+
+    private static BigInteger Call(X64Image image, string name, IrType target, double x) => target.BitWidth switch
+    {
+        8 => target.IsSigned ? ((delegate* unmanaged<double, sbyte>)image.Address(name))(x) : ((delegate* unmanaged<double, byte>)image.Address(name))(x),
+        16 => target.IsSigned ? ((delegate* unmanaged<double, short>)image.Address(name))(x) : ((delegate* unmanaged<double, ushort>)image.Address(name))(x),
+        32 => target.IsSigned ? ((delegate* unmanaged<double, int>)image.Address(name))(x) : ((delegate* unmanaged<double, uint>)image.Address(name))(x),
+        _ => target.IsSigned ? ((delegate* unmanaged<double, long>)image.Address(name))(x) : ((delegate* unmanaged<double, ulong>)image.Address(name))(x),
+    };
+
+    private static BigInteger Call(X64Image image, string name, IrType target, float x) => target.BitWidth switch
+    {
+        8 => target.IsSigned ? ((delegate* unmanaged<float, sbyte>)image.Address(name))(x) : ((delegate* unmanaged<float, byte>)image.Address(name))(x),
+        16 => target.IsSigned ? ((delegate* unmanaged<float, short>)image.Address(name))(x) : ((delegate* unmanaged<float, ushort>)image.Address(name))(x),
+        32 => target.IsSigned ? ((delegate* unmanaged<float, int>)image.Address(name))(x) : ((delegate* unmanaged<float, uint>)image.Address(name))(x),
+        _ => target.IsSigned ? ((delegate* unmanaged<float, long>)image.Address(name))(x) : ((delegate* unmanaged<float, ulong>)image.Address(name))(x),
+    };
+
     /// <summary>The object file, read back with LLVM's object reader and disassembled with LLVM's disassembler.</summary>
     [Fact]
     public void Coff_objects_are_read_and_disassembled_by_llvm()
@@ -229,9 +319,43 @@ public sealed unsafe class X64Tests : CheckedTest
         var (listing, invalid) = Disassemble(basics.Code, sum.Offset, sum.Size);
         Check("LLVM decodes every instruction of the generated code", invalid == 0 && Disassemble(basics.Code, 0, basics.Code.Length).Invalid == 0,
             $"{invalid} undecodable");
-        Check("prologue push rbp / mov rbp, rsp / sub rsp; lea rsp, [rbp] epilogue",
-            listing[0].Contains("push") && listing[1].Contains("mov") && listing[2].Contains("sub") && listing.Any(l => l.Contains("lea") && l.Contains("rsp")),
+        Check("prologue push rbp / mov rbp, rsp / nop (probe slot) / sub rsp; lea rsp, [rbp] epilogue",
+            listing[0].Contains("push") && listing[1].Contains("mov") && listing[2].Contains("nop") && listing[3].Contains("sub") && listing.Any(l => l.Contains("lea") && l.Contains("rsp")),
             string.Join(" / ", listing.Take(24)));
+    }
+
+    /// <summary>
+    /// A frame over a page must touch every page before <c>rsp</c> moves (Windows commits the stack one guard page at a
+    /// time): the prologue's slot becomes a jump to a probe loop, and a call from the bottom of a 40 KB frame runs.
+    /// </summary>
+    [Fact]
+    public void Large_frames_probe_the_stack()
+    {
+        var helper = new FunctionBuilder("helper", IrType.I32);
+        helper.Assign(FunctionBuilder.ReturnPlace, Int(7)).Return();
+        var big = new FunctionBuilder("big", IrType.I32);
+        big.Local(new FixedArrayType(IrType.U8, 40000), "buffer", mutable: true);
+        int after = big.NewBlock();
+        big.Call(0, [], FunctionBuilder.ReturnPlace, after);
+        big.At(after).Return();
+        var small = new FunctionBuilder("small", IrType.I32);
+        small.Local(new FixedArrayType(IrType.U8, 1000), "buffer", mutable: true);
+        int afterSmall = small.NewBlock();
+        small.Call(0, [], FunctionBuilder.ReturnPlace, afterSmall);
+        small.At(afterSmall).Return();
+        var module = new IrModule([], [helper.Build(), big.Build(), small.Build()]);
+
+        var program = Compile(module, GcConfig.Manual);
+        var bigFn = program.Function("big");
+        var smallFn = program.Function("small");
+        Check("the big frame holds the buffer", bigFn.FrameSize >= 40000, $"frame {bigFn.FrameSize}");
+        Check("the big frame's prologue slot is a jump to the probe loop (push rbp; mov rbp, rsp; jmp rel32)",
+            program.Code[bigFn.Offset + 4] == 0xE9, $"byte {program.Code[bigFn.Offset + 4]:X2}");
+        Check("a small frame keeps the 5-byte nop in the slot",
+            program.Code[smallFn.Offset + 4] == 0x0F && program.Code[smallFn.Offset + 9] == 0x48, $"byte {program.Code[smallFn.Offset + 4]:X2}");
+        using var image = program.Load();
+        Check("big() = 7 (the call from the bottom of the frame does not fault)", ((delegate* unmanaged<int>)image.Address("big"))() == 7);
+        Check("small() = 7", ((delegate* unmanaged<int>)image.Address("small"))() == 7);
     }
 
     /// <summary>The CLI: the linker tests' objects (geom.lvo, app.lvo) compiled by the x64 back end into a COFF object.</summary>

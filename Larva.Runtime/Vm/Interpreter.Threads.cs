@@ -64,11 +64,25 @@ namespace Larva.Runtime.Vm
 
         private bool ManyThreads => threading is { } t && Volatile.Read(ref t.Alive) > 1;
 
-        /// <summary>At a safepoint: the turn goes to a waiting thread first.</summary>
+        /// <summary>
+        /// Safepoints a thread keeps the turn for while others want it. A turn handoff is a host context switch (and wakes
+        /// every waiter), so handing it over at every safepoint runs a program with a few runnable threads (a pool's
+        /// workers spinning for work, say) at the host's switch rate, thousands of operations a second: a slice keeps
+        /// the turns long enough to interpret at full speed and short enough (a millisecond or so) to stay fair. Waits
+        /// in the runtime still give the turn at once (<see cref="Blocking"/>).
+        /// </summary>
+        internal const int TurnSlice = 1000;
+        private int sliceLeft = TurnSlice;
+
+        /// <summary>At a safepoint: the turn goes to a waiting thread once this one's slice is used up.</summary>
         private void TakeTurns()
         {
             if (threading is { Wanted: true } t)
             {
+                if (--sliceLeft > 0)
+                    return;
+                sliceLeft = TurnSlice;
+                Stats.Turns++;
                 t.Give();
                 t.Take();
             }

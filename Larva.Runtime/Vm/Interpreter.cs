@@ -18,6 +18,12 @@ namespace Larva.Runtime.Vm
         /// <summary>Executed operations before giving up (protects against runaway loops).</summary>
         public long StepLimit { get; init; } = 50_000_000;
 
+        /// <summary>
+        /// Open frames before a call fails with a "call depth" <see cref="VmException"/> (the VM's stack overflow). Calls do
+        /// not use the host stack, so the limit bounds memory only: every frame keeps its slots in the heap.
+        /// </summary>
+        public int MaxCallDepth { get; init; } = 100_000;
+
         /// <summary>Where the runtime's print intrinsics write (the console when null).</summary>
         public TextWriter? Output { get; init; }
 
@@ -41,9 +47,12 @@ namespace Larva.Runtime.Vm
         public int Barriers { get; internal set; }
         public int Pins { get; internal set; }
 
+        /// <summary>Turn handoffs between threads at safepoints (not the ones made to wait in the runtime).</summary>
+        public int Turns { get; internal set; }
+
         public override string ToString() =>
             $"steps {Steps}, calls {Calls}, safepoints {Safepoints}, collections {Collections} (reclaimed {Reclaimed}), " +
-            $"retain/release {Retains}/{Releases}, barriers {Barriers}, pins {Pins}";
+            $"retain/release {Retains}/{Releases}, barriers {Barriers}, pins {Pins}, turns {Turns}";
     }
 
     /// <summary>
@@ -58,7 +67,7 @@ namespace Larva.Runtime.Vm
         private readonly IrModule shapes;
         private readonly InterpreterOptions options;
         private readonly List<Frame> callStack = [];
-        private readonly Stack<int> regions = new();
+        private readonly Stack<OpenRegion> regions = new();
         private int allocatedSinceCollect;
 
         public RuntimeModule Runtime { get; }
@@ -116,131 +125,196 @@ namespace Larva.Runtime.Vm
                 nativeCalls ??= new NativeCalls(this, Heap);
                 return nativeCalls.Call(callee, nativeCall, [.. callee.ArgumentTypes.Select(t => il.Types[t])], il.Types[callee.LocalTypes[0]], arguments);
             }
+            return Execute(Enter(function, callee, typeArguments, arguments));
+        }
 
+        /// <summary>Opens an activation: its slots, its arguments written, pushed on the call stack.</summary>
+        private Frame Enter(int function, IlFunction callee, IrType[] typeArguments, Value[] arguments)
+        {
+            if (callStack.Count >= options.MaxCallDepth)
+                throw new VmException($"call depth limit of {options.MaxCallDepth} frames reached calling `{callee.Name}` (stack overflow)");
             var frame = new Frame(this, function, callee, typeArguments) { RegionDepth = regions.Count };
             try
             {
                 for (int a = 0; a < arguments.Length; a++)
                     Heap.Write(frame.ArgumentTypes[a], frame.Arguments[a], arguments[a]);
-                callStack.Add(frame);
-                Stats.Calls++;
-                return Execute(frame);
             }
-            catch (LarvaException)
+            catch
             {
-                // Unwinding out of this frame: close the arena regions it left open.
-                while (regions.Count > frame.RegionDepth)
-                    ExitRegion(regions.Peek());
+                frame.Release();
                 throw;
             }
-            finally
+            callStack.Add(frame);
+            Stats.Calls++;
+            return frame;
+        }
+
+        /// <summary>Closes an activation: the arena regions it left open (when unwinding), its slots, its place on the call stack.</summary>
+        private void Leave(Frame frame, bool unwinding)
+        {
+            if (unwinding)
             {
-                if (callStack.Count > 0 && callStack[^1] == frame)
-                    callStack.RemoveAt(callStack.Count - 1);
-                frame.Release();
+                while (regions.Count > frame.RegionDepth)
+                    ExitRegion();
             }
+            if (callStack.Count > 0 && callStack[^1] == frame)
+                callStack.RemoveAt(callStack.Count - 1);
+            frame.Release();
         }
 
         // ── Execution ──────────────────────────────────────────────
 
-        private Value Execute(Frame frame)
+        /// <summary>
+        /// Runs <paramref name="entry"/> to its return. Calls between interpreted functions do not recurse on the host stack:
+        /// a call pushes the callee's frame and the loop continues in it, a return pops back to the caller, and an exception
+        /// unwinds frame by frame until a handler takes it (or it leaves <paramref name="entry"/>, to the host caller). The
+        /// host stack is only used again by re-entrant calls (finalizers, intrinsics, callbacks from native code).
+        /// </summary>
+        private Value Execute(Frame entry)
         {
-            var ops = frame.Function.Body.Operations;
-            var stack = frame.Stack;
-            while (true)
+            int entryIndex = callStack.Count - 1; // frames below it belong to the host callers of this run
+            var frame = entry;
+            try
             {
-                if (++Stats.Steps > options.StepLimit)
-                    throw new VmException($"step limit reached in `{frame.Function.Name}`");
-                if (frame.Pc >= ops.Length)
-                    throw new VmException($"`{frame.Function.Name}` ran past its last operation");
+                while (true)
+                {
+                    var ops = frame.Function.Body.Operations;
+                    var stack = frame.Stack;
+                    if (++Stats.Steps > options.StepLimit)
+                        throw new VmException($"step limit reached in `{frame.Function.Name}`");
+                    if (frame.Pc >= ops.Length)
+                        throw new VmException($"`{frame.Function.Name}` ran past its last operation");
 
-                var op = ops[frame.Pc];
-                long a0 = op.Operands.Length > 0 ? op.Operands[0] : 0;
-                try
-                {
-                switch (op.OpCode)
-                {
-                    case OpCode.LoadLocal:
-                        stack.Add(Heap.Read(frame.LocalTypes[a0], frame.Locals[a0]));
-                        break;
-                    case OpCode.StoreLocal:
-                        Heap.Write(frame.LocalTypes[a0], frame.Locals[a0], Pop(stack));
-                        break;
-                    case OpCode.LoadArgument:
-                        stack.Add(Heap.Read(frame.ArgumentTypes[a0], frame.Arguments[a0]));
-                        break;
-                    case OpCode.Const:
-                        stack.Add(Value.FromInt(a0, null));
-                        break;
-                    case OpCode.Add:
-                    case OpCode.Sub:
-                    case OpCode.Mul:
-                        var right = Pop(stack);
-                        stack.Add(Arithmetic(op.OpCode, Pop(stack), right));
-                        break;
-                    case OpCode.Call:
-                        Safepoint(frame);
-                        CallFrom(frame, (int)a0);
-                        break;
-                    case OpCode.Return:
-                        var resultType = frame.LocalTypes[0];
-                        return resultType.IsUnit ? Value.UnitValue : Heap.Coerce(Pop(stack), resultType);
-                    case OpCode.Jump:
-                        frame.Pc = (int)a0;
+                    var op = ops[frame.Pc];
+                    long a0 = op.Operands.Length > 0 ? op.Operands[0] : 0;
+                    try
+                    {
+                    switch (op.OpCode)
+                    {
+                        case OpCode.LoadLocal:
+                            stack.Add(Heap.Read(frame.LocalTypes[a0], frame.Locals[a0]));
+                            break;
+                        case OpCode.StoreLocal:
+                            Heap.Write(frame.LocalTypes[a0], frame.Locals[a0], Pop(stack));
+                            break;
+                        case OpCode.LoadArgument:
+                            stack.Add(Heap.Read(frame.ArgumentTypes[a0], frame.Arguments[a0]));
+                            break;
+                        case OpCode.Const:
+                            stack.Add(Value.FromInt(a0, null));
+                            break;
+                        case OpCode.Add:
+                        case OpCode.Sub:
+                        case OpCode.Mul:
+                            var right = Pop(stack);
+                            stack.Add(Arithmetic(op.OpCode, Pop(stack), right));
+                            break;
+                        case OpCode.Call:
+                            Safepoint(frame);
+                            if (CallFrom(frame, (int)a0) is { } called)
+                            {
+                                frame = called;
+                                continue;
+                            }
+                            break;
+                        case OpCode.CallExtended when (CallOp)op.SubOp == CallOp.Indirect:
+                        {
+                            var target = Pop(stack);
+                            Safepoint(frame);
+                            int function = target.Kind == ValueKind.Function ? target.Function : FunctionOf(Heap.AsInteger(target));
+                            if (CallFrom(frame, function) is { } calledIndirect)
+                            {
+                                frame = calledIndirect;
+                                continue;
+                            }
+                            break;
+                        }
+                        case OpCode.Return:
+                        {
+                            var resultType = frame.LocalTypes[0];
+                            var result = resultType.IsUnit ? Value.UnitValue : Heap.Coerce(Pop(stack), resultType);
+                            Leave(frame, unwinding: false);
+                            if (frame == entry)
+                                return result;
+                            frame = callStack[^1];
+                            if (!resultType.IsUnit)
+                                frame.Stack.Add(result);
+                            break; // past the caller's call operation
+                        }
+                        case OpCode.Jump:
+                            frame.Pc = (int)a0;
+                            continue;
+                        case OpCode.BranchTrue:
+                        case OpCode.BranchFalse:
+                            if (Pop(stack).IsTrue == (op.OpCode == OpCode.BranchTrue))
+                            {
+                                frame.Pc = (int)a0;
+                                continue;
+                            }
+                            break;
+                        case OpCode.LoadField:
+                        {
+                            var (owner, index, offset, type) = Field(frame, a0);
+                            var value = Heap.Coerce(Pop(stack), owner);
+                            stack.Add(Heap.DecodeBytes(type, value.Bytes.AsSpan(offset, Heap.LayoutOf(type).Size)));
+                            break;
+                        }
+                        case OpCode.StoreField:
+                        {
+                            var (_, _, offset, type) = Field(frame, a0);
+                            var value = Pop(stack);
+                            Heap.Write(type, Heap.AsAddress(Pop(stack)).Plus(offset), value);
+                            break;
+                        }
+                        case OpCode.Duplicate:
+                            stack.Add(stack[^1]);
+                            break;
+                        case OpCode.Switch:
+                            var selector = Heap.AsInteger(Pop(stack));
+                            if (selector >= 0 && selector < op.Operands.Length)
+                            {
+                                frame.Pc = (int)op.Operands[(int)selector];
+                                continue;
+                            }
+                            break;
+                        case OpCode.Branch:
+                        {
+                            var b = Pop(stack);
+                            if (Compare((Condition)op.SubOp, Pop(stack), b))
+                            {
+                                frame.Pc = (int)a0;
+                                continue;
+                            }
+                            break;
+                        }
+                        default:
+                            ExecuteFamily(frame, op);
+                            break;
+                    }
+                    }
+                    catch (LarvaException e)
+                    {
+                        // The nearest handler up the interpreted frames takes it; frames without one are unwound (their
+                        // regions closed, their slots freed). A caller's pc still points at its call operation, so its
+                        // handlers covering the call are found.
+                        while (!Handle(frame, e.Value))
+                        {
+                            Leave(frame, unwinding: true);
+                            if (frame == entry)
+                                throw;
+                            frame = callStack[^1];
+                        }
                         continue;
-                    case OpCode.BranchTrue:
-                    case OpCode.BranchFalse:
-                        if (Pop(stack).IsTrue == (op.OpCode == OpCode.BranchTrue))
-                        {
-                            frame.Pc = (int)a0;
-                            continue;
-                        }
-                        break;
-                    case OpCode.LoadField:
-                    {
-                        var (owner, index, offset, type) = Field(frame, a0);
-                        var value = Heap.Coerce(Pop(stack), owner);
-                        stack.Add(Heap.DecodeBytes(type, value.Bytes.AsSpan(offset, Heap.LayoutOf(type).Size)));
-                        break;
                     }
-                    case OpCode.StoreField:
-                    {
-                        var (_, _, offset, type) = Field(frame, a0);
-                        var value = Pop(stack);
-                        Heap.Write(type, Heap.AsAddress(Pop(stack)).Plus(offset), value);
-                        break;
-                    }
-                    case OpCode.Duplicate:
-                        stack.Add(stack[^1]);
-                        break;
-                    case OpCode.Switch:
-                        var selector = Heap.AsInteger(Pop(stack));
-                        if (selector >= 0 && selector < op.Operands.Length)
-                        {
-                            frame.Pc = (int)op.Operands[(int)selector];
-                            continue;
-                        }
-                        break;
-                    case OpCode.Branch:
-                    {
-                        var b = Pop(stack);
-                        if (Compare((Condition)op.SubOp, Pop(stack), b))
-                        {
-                            frame.Pc = (int)a0;
-                            continue;
-                        }
-                        break;
-                    }
-                    default:
-                        ExecuteFamily(frame, op);
-                        break;
+                    frame.Pc++;
                 }
-                }
-                catch (LarvaException e) when (Handle(frame, e.Value))
-                {
-                    continue;
-                }
-                frame.Pc++;
+            }
+            catch (Exception) when (callStack.Count > entryIndex)
+            {
+                // A VM error (or a Larva exception from a finalizer while unwinding) leaves this run: release its frames.
+                while (callStack.Count > entryIndex)
+                    Leave(callStack[^1], unwinding: false);
+                throw;
             }
         }
 
@@ -330,11 +404,6 @@ namespace Larva.Runtime.Vm
                     {
                         case CallOp.LoadFunction:
                             stack.Add(Value.FromFunction((int)a0));
-                            break;
-                        case CallOp.Indirect:
-                            var target = Pop(stack);
-                            Safepoint(frame);
-                            CallFrom(frame, target.Kind == ValueKind.Function ? target.Function : FunctionOf(Heap.AsInteger(target)));
                             break;
                         default:
                             throw Unsupported(op);
@@ -508,7 +577,11 @@ namespace Larva.Runtime.Vm
 
         // ── Calls ──────────────────────────────────────────────────
 
-        private void CallFrom(Frame caller, int function)
+        /// <summary>
+        /// Takes a call's witnesses and arguments off the caller's operand stack and opens the callee's frame (the loop in
+        /// <see cref="Execute"/> continues in it). Null for a native callee, which ran here: its result is already pushed.
+        /// </summary>
+        private Frame? CallFrom(Frame caller, int function)
         {
             var callee = il.Functions[function];
             var stack = caller.Stack;
@@ -522,9 +595,12 @@ namespace Larva.Runtime.Vm
                 witnesses[w] = witness.Kind == ValueKind.Witness ? witness.Witness! : Runtime.WitnessType((int)Heap.AsInteger(witness));
             }
 
+            if (callee.Native is null)
+                return Enter(function, callee, witnesses, arguments);
             var result = Call(function, witnesses, arguments);
             if (!il.Types[callee.LocalTypes[0]].Substitute(witnesses).IsUnit)
                 stack.Add(result);
+            return null;
         }
 
         private int FunctionOf(BigInteger tagged)
@@ -592,14 +668,37 @@ namespace Larva.Runtime.Vm
                 ? Value.FromFloatBits(constant.Bits, constant.Type)
                 : Value.FromInt(constant.Bits, constant.Type);
 
+        /// <summary>
+        /// A float as an integer with Larva's rule for every back end: truncation; a value out of the target's range gives
+        /// the nearest limit, NaN gives 0 (LLVM's <c>fptosi.sat</c>), never a wrapped value.
+        /// </summary>
+        private static BigInteger SaturatedInteger(Value value, PrimitiveType target)
+        {
+            int bits = target.BitWidth!.Value;
+            BigInteger max = target.IsSigned ? (BigInteger.One << (bits - 1)) - 1 : (BigInteger.One << bits) - 1;
+            BigInteger min = target.IsSigned ? -max - 1 : BigInteger.Zero;
+            if (!Numbers.IsWide(value.Type))
+            {
+                double d = value.Float;
+                if (double.IsNaN(d))
+                    return BigInteger.Zero;
+                if (double.IsPositiveInfinity(d))
+                    return max;
+                if (double.IsNegativeInfinity(d))
+                    return min;
+            }
+            var truncated = Heap.AsInteger(value);
+            return truncated > max ? max : truncated < min ? min : truncated;
+        }
+
         private Value Convert(Value value, ConvertOp op, Frame frame, long operand)
         {
             switch (op)
             {
                 case ConvertOp.Conv or ConvertOp.Cast:
                     var target = frame.Resolve(operand);
-                    if (target is PrimitiveType { IsInteger: true } && value.Kind == ValueKind.Float)
-                        return Value.FromInt(Heap.AsInteger(value), target);
+                    if (target is PrimitiveType { IsInteger: true } integer && value.Kind == ValueKind.Float)
+                        return Value.FromInt(SaturatedInteger(value, integer), target);
                     return Heap.Coerce(value, target);
                 case ConvertOp.BitCast:
                     var to = frame.Resolve(operand);

@@ -24,13 +24,19 @@ into namespace System
 			Hash() : u64 => (u64)(u32)this;
 			Equals(i32 other) : bool => this == other;
 			CompareTo(i32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
-			static Parse(str text) : i32 => (i32)Number.Parse(text);
+			static Parse(str text) : i32
+			{
+				i32? value = TryParse(text);
+				if (value == null)
+					throw new FormatError("not an i32: " + text);
+				return value.Value;
+			}
 
 			/// The number `text` writes, or null when it writes none.
 			static TryParse(str text) : i32?
 			{
 				i64? value = Number.TryParse(text);
-				if (value == null)
+				if (value == null || value.Value < Int32.MinValue || value.Value > Int32.MaxValue)
 					return null;
 				return (i32)value.Value;
 			}
@@ -195,21 +201,46 @@ into namespace System
 			return i == n;
 		}
 
+		/// What a trimmed text names besides a number: 1 for nan (`nan`, `NaN`), 2 for +inf (`inf`, `+inf`,
+		/// `Infinity`, `+Infinity`), 3 for -inf (`-inf`, `-Infinity`), 0 otherwise.
+		static Special(str trimmed) : i32
+		{
+			if (trimmed == "nan" || trimmed == "NaN" || trimmed == "-nan")
+				return 1;
+			if (trimmed == "inf" || trimmed == "+inf" || trimmed == "Infinity" || trimmed == "+Infinity")
+				return 2;
+			if (trimmed == "-inf" || trimmed == "-Infinity")
+				return 3;
+			return 0;
+		}
+
 		public:
 			/// As text by a format: F, N, E, P, G, R and a precision (`(2.5).ToString("F2")` is "2.50").
 			ToString(str format) : str => NumberFormat.FormatDouble(this, format);
 
-			/// The number as `print` writes it (up to 15 significant digits).
+			/// The shortest text that reads back as the same number, as `print` writes it (15 significant digits when
+			/// they are enough, else 16 or 17); `nan`, `inf` and `-inf` for the values that are no number.
 			ToString() : str
 			{
+				if (this != this)
+					return "nan";
+				if (this - this != 0)
+					return this > 0 ? "inf" : "-inf";
 				i64 count = FormatInto(this);
 				u8[] digits = new u8[(i32)count];
+				u16[] wide = new u16[(i32)count];
 				loop (i32 i = 0..digits.Length)
+				{
 					digits[i] = (u8)FormattedUnit(i);
-				return new String<u8>(digits);
+					wide[i] = digits[i];
+				}
+				if (ParseBits(wide) == BitsOf(this))
+					return new String<u8>(digits);
+				return NumberFormat.ShortestDouble(this);
 			}
 
-			CompareTo(f64 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f64 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f64 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 			Hash() : u64 => (u64)BitsOf(this == 0 ? 0 : this);
 
@@ -222,16 +253,14 @@ into namespace System
 			static IsInfinity(f64 x) : bool => x - x != 0 && x == x;
 			static IsFinite(f64 x) : bool => x - x == 0;
 
-			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			/// The number `text` writes (digits, a point, an exponent; `nan`, `inf`, `-inf` as ToString writes them, or
+			/// `NaN`, `Infinity`, `-Infinity`); a FormatError otherwise.
 			static Parse(str text) : f64
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN")
-					return NaN;
-				if (trimmed == "Infinity" || trimmed == "+Infinity")
-					return PositiveInfinity;
-				if (trimmed == "-Infinity")
-					return NegativeInfinity;
+				i32 special = Special(trimmed);
+				if (special != 0)
+					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
 				if (!IsNumber(trimmed.Units()))
 					throw new FormatError("not a number: " + text);
 				return FromBitsOf(ParseBits(Unicode.ToUtf16(trimmed)));
@@ -241,7 +270,7 @@ into namespace System
 			static TryParse(str text) : f64?
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+				if (Special(trimmed) != 0)
 					return Parse(trimmed);
 				if (!IsNumber(trimmed.Units()))
 					return null;
@@ -272,7 +301,8 @@ into namespace System
 			ToString(str format) : str => NumberFormat.FormatSingle(this, format);
 
 			ToString() : str => NumberFormat.FormatSingle(this, "R");
-			CompareTo(f32 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f32 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 
 			/// The IEEE 754 bits of `value` (an f32 is exact as an f64: its bits are rebuilt from those).
 			static Bits(f32 value) : u32
@@ -341,7 +371,8 @@ into namespace System
 
 			/// The shortest text that reads back as the same number.
 			ToString() : str => NumberFormat.FormatHalf(this, "G");
-			CompareTo(f16 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f16 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f16 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 			Hash() : u64 => (u64)Bits(this == 0 ? 0 : this);
 
@@ -492,15 +523,21 @@ into namespace System
 				i32 start = negative ? 1 : 0;
 				if (start == length)
 					return null;
+				// Counted downwards so that MinValue, which has no positive twin, parses too.
 				i128 value = 0;
 				loop (i32 i = start..length)
 				{
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (i128)(unit - 48);
+					i128 digit = (i128)(unit - 48);
+					if (value < (Int128.MinValue + digit) / 10)
+						return null;
+					value = value * 10 - digit;
 				}
-				return negative ? -value : value;
+				if (!negative && value == Int128.MinValue)
+					return null;
+				return negative ? value : -value;
 			}
 	}
 
@@ -552,7 +589,10 @@ into namespace System
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (u128)(unit - 48);
+					u128 digit = (u128)(unit - 48);
+					if (value > (UInt128.MaxValue - digit) / 10)
+						return null;
+					value = value * 10 + digit;
 				}
 				return value;
 			}
@@ -607,15 +647,21 @@ into namespace System
 				i32 start = negative ? 1 : 0;
 				if (start == length)
 					return null;
+				// Counted downwards so that MinValue, which has no positive twin, parses too.
 				i256 value = 0;
 				loop (i32 i = start..length)
 				{
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (i256)(unit - 48);
+					i256 digit = (i256)(unit - 48);
+					if (value < (Int256.MinValue + digit) / 10)
+						return null;
+					value = value * 10 - digit;
 				}
-				return negative ? -value : value;
+				if (!negative && value == Int256.MinValue)
+					return null;
+				return negative ? value : -value;
 			}
 	}
 
@@ -667,7 +713,10 @@ into namespace System
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (u256)(unit - 48);
+					u256 digit = (u256)(unit - 48);
+					if (value > (UInt256.MaxValue - digit) / 10)
+						return null;
+					value = value * 10 + digit;
 				}
 				return value;
 			}
@@ -697,7 +746,8 @@ into namespace System
 
 			/// The shortest text that reads back as the same number.
 			ToString() : str => NumberFormat.FormatWide(Bits(this), 128, "G");
-			CompareTo(f128 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f128 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f128 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 
 			Hash() : u64
@@ -723,16 +773,13 @@ into namespace System
 			static IsInfinity(f128 x) : bool => x - x != 0 && x == x;
 			static IsFinite(f128 x) : bool => x - x == 0;
 
-			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			/// The number `text` writes (digits, a point, an exponent; `nan`, `inf`, `-inf`); a FormatError otherwise.
 			static Parse(str text) : f128
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN")
-					return NaN;
-				if (trimmed == "Infinity" || trimmed == "+Infinity")
-					return PositiveInfinity;
-				if (trimmed == "-Infinity")
-					return NegativeInfinity;
+				i32 special = Float64.Special(trimmed);
+				if (special != 0)
+					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
 				if (!Float64.IsNumber(trimmed.Units()))
 					throw new FormatError("not a number: " + text);
 				return Read(trimmed.Units());
@@ -742,7 +789,7 @@ into namespace System
 			static TryParse(str text) : f128?
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+				if (Float64.Special(trimmed) != 0)
 					return Parse(trimmed);
 				if (!Float64.IsNumber(trimmed.Units()))
 					return null;
@@ -860,7 +907,8 @@ into namespace System
 
 			/// The shortest text that reads back as the same number.
 			ToString() : str => NumberFormat.FormatWide(Bits(this), 256, "G");
-			CompareTo(f256 other) : i32 => this < other ? -1 : this > other ? 1 : 0;
+			/// A total order: the usual one, nan above every number and equal to itself, -0 equal to +0 (what sorting uses).
+			CompareTo(f256 other) : i32 => this < other ? -1 : this > other ? 1 : this == other ? 0 : this != this ? (other != other ? 0 : 1) : -1;
 			Equals(f256 other) : bool => this == other || IsNaN(this) && IsNaN(other);
 
 			Hash() : u64
@@ -886,16 +934,13 @@ into namespace System
 			static IsInfinity(f256 x) : bool => x - x != 0 && x == x;
 			static IsFinite(f256 x) : bool => x - x == 0;
 
-			/// The number `text` writes (digits, a point, an exponent); a FormatError otherwise.
+			/// The number `text` writes (digits, a point, an exponent; `nan`, `inf`, `-inf`); a FormatError otherwise.
 			static Parse(str text) : f256
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN")
-					return NaN;
-				if (trimmed == "Infinity" || trimmed == "+Infinity")
-					return PositiveInfinity;
-				if (trimmed == "-Infinity")
-					return NegativeInfinity;
+				i32 special = Float64.Special(trimmed);
+				if (special != 0)
+					return special == 1 ? NaN : special == 2 ? PositiveInfinity : NegativeInfinity;
 				if (!Float64.IsNumber(trimmed.Units()))
 					throw new FormatError("not a number: " + text);
 				return Read(trimmed.Units());
@@ -905,7 +950,7 @@ into namespace System
 			static TryParse(str text) : f256?
 			{
 				str trimmed = text.Trim();
-				if (trimmed == "NaN" || trimmed == "Infinity" || trimmed == "+Infinity" || trimmed == "-Infinity")
+				if (Float64.Special(trimmed) != 0)
 					return Parse(trimmed);
 				if (!Float64.IsNumber(trimmed.Units()))
 					return null;
@@ -1114,15 +1159,21 @@ into namespace System
 				i32 start = negative ? 1 : 0;
 				if (start == length)
 					return null;
+				// Counted downwards so that MinValue, which has no positive twin, parses too.
 				i64 value = 0;
 				loop (i32 i = start..length)
 				{
 					u8 unit = text[i];
 					if (unit < 48 || unit > 57)
 						return null;
-					value = value * 10 + (i64)(unit - 48);
+					i64 digit = (i64)(unit - 48);
+					if (value < (Int64.MinValue + digit) / 10)
+						return null;
+					value = value * 10 - digit;
 				}
-				return negative ? -value : value;
+				if (!negative && value == Int64.MinValue)
+					return null;
+				return negative ? value : -value;
 			}
 
 	}

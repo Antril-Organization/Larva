@@ -1,7 +1,8 @@
 // Regular expressions, by backtracking over a text's UTF-8 units: literals, `.`, classes (`[a-z]`, `[^...]`, `\d \w \s`
-// and their negations), anchors `^` and `$`, groups (capturing, and `(?:...)`), alternatives `|`, and the quantifiers
-// `* + ? {n} {n,} {n,m}`, greedy or lazy with a trailing `?`. Matching works on bytes: multi-byte characters match
-// literally, and `.` or a class takes one byte of them.
+// and their negations), anchors `^` and `$`, word boundaries `\b` and `\B`, groups (capturing, and `(?:...)`),
+// alternatives `|`, and the quantifiers `* + ? {n} {n,} {n,m}`, greedy or lazy with a trailing `?`. An escape is one
+// of those, `\n \t \r \f \v` or a punctuation character (`\.`); any other (`\1`, `\x41`) is an ArgumentError.
+// Matching works on bytes: multi-byte characters match literally, and `.` or a class takes one byte of them.
 
 into namespace System.Text
 {
@@ -142,7 +143,7 @@ into namespace System.Text
 			at++;
 		}
 
-		/// After `\`: a class escape (`\d` `\w` `\s` and the negations), or a character.
+		/// After `\`: a class escape (`\d` `\w` `\s` and the negations), a word boundary (`\b` `\B`), or a character.
 		ParseEscape() : RegexNode
 		{
 			u32 c = p[at];
@@ -154,12 +155,31 @@ into namespace System.Text
 				FillEscape(cls.Table, c);
 				return cls;
 			}
+			if (c == 'b' || c == 'B')
+				return new RegexNode(c == 'b' ? 12 : 13);
 			RegexNode literal = new RegexNode(1);
 			literal.Literal = (u8)EscapedUnit(c);
 			return literal;
 		}
 
-		static EscapedUnit(u32 c) : u32 => c == 'n' ? 10 : c == 't' ? 9 : c == 'r' ? 13 : c == 'f' ? 12 : c == 'v' ? 11 : c;
+		/// The unit an escaped character stands for: `\n \t \r \f \v`, or a character that is no letter or digit
+		/// (itself); any other escape is an error (`\1`, `\x41`, `\u0041` and the like are not supported).
+		EscapedUnit(u32 c) : u32
+		{
+			if (c == 'n')
+				return 10;
+			if (c == 't')
+				return 9;
+			if (c == 'r')
+				return 13;
+			if (c == 'f')
+				return 12;
+			if (c == 'v')
+				return 11;
+			if (IsWord((u8)c))
+				Fail("unsupported escape `\\" + new String<u8>([(u8)c]) + "`");
+			return c;
+		}
 
 		static FillEscape(u8[] table, u32 c)
 		{
@@ -225,7 +245,8 @@ into namespace System.Text
 						FillEscape(cls.Table, e);
 						continue;
 					}
-					c = EscapedUnit(e);
+					// In a class, `\b` is a backspace.
+					c = e == 'b' ? 8 : EscapedUnit(e);
 				}
 				u32 high = c;
 				if (at + 1 < p.Length && p[at] == '-' && p[at + 1] != ']')
@@ -235,7 +256,7 @@ into namespace System.Text
 					at++;
 					if (high == '\\' && at < p.Length)
 					{
-						high = EscapedUnit(p[at]);
+						high = p[at] == 'b' ? 8 : EscapedUnit(p[at]);
 						at++;
 					}
 					if (high < c)
@@ -295,6 +316,9 @@ into namespace System.Text
 			}
 			else
 				return atom;
+			// A sequence of one node (`(?:a)`) repeats as that node.
+			loop (atom.Kind == 4 && atom.Children.Count == 1)
+				atom = atom.Children[0];
 			RegexNode repeat = new RegexNode(8);
 			repeat.Child = atom;
 			repeat.Min = min;
@@ -326,6 +350,9 @@ into namespace System.Text
 			}
 
 			i32 Groups { get => groups; }
+
+			/// Whether a unit is a word character (`\w`: a letter, a digit or `_`).
+			static IsWord(u8 c) : bool => c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_';
 
 			Parse() : RegexNode
 			{
@@ -465,12 +492,72 @@ into namespace System.Text
 				return pos == 0 ? Rest(pos, rest) : -1;
 			if (kind == 11)
 				return pos == s.Length ? Rest(pos, rest) : -1;
+			if (kind == 12 || kind == 13)
+			{
+				bool before = pos > 0 && RegexParser.IsWord(s[pos - 1]);
+				bool after = pos < s.Length && RegexParser.IsWord(s[pos]);
+				return (before != after) == (kind == 12) ? Rest(pos, rest) : -1;
+			}
 			return -1;
+		}
+
+		/// Whether a single-unit atom (a literal, a class or `.`) takes the unit at `at`.
+		Takes(RegexNode atom, i32 at) : bool
+		{
+			u8 c = s[at];
+			if (atom.Kind == 1)
+				return c == atom.Literal;
+			if (atom.Kind == 2)
+				return atom.Table[c] != 0;
+			return c != 10;
+		}
+
+		/// A repeat of a single-unit atom, as a loop over the run of units it takes rather than a call per unit (a
+		/// long text would exhaust the stack): greedy takes the longest run and backs off one unit at a time while
+		/// the rest fails; lazy starts from the minimum and takes one more unit at a time.
+		RunUnits(RegexNode node, i32 pos, RegexCont? rest) : i32
+		{
+			RegexNode atom = node.Child;
+			i32 limit = s.Length - pos;
+			if (node.Max >= 0 && node.Max < limit)
+				limit = node.Max;
+			i32 n = 0;
+			if (!node.Lazy)
+			{
+				loop (n < limit && Takes(atom, pos + n))
+					n++;
+				loop (n >= node.Min)
+				{
+					i32 r = Rest(pos + n, rest);
+					if (r >= 0)
+						return r;
+					n--;
+				}
+				return -1;
+			}
+			loop (n < node.Min)
+			{
+				if (n >= limit || !Takes(atom, pos + n))
+					return -1;
+				n++;
+			}
+			loop (true)
+			{
+				i32 r = Rest(pos + n, rest);
+				if (r >= 0)
+					return r;
+				if (n >= limit || !Takes(atom, pos + n))
+					return -1;
+				n++;
+			}
 		}
 
 		/// `count` iterations of a repeat are done; `lastPos` is where the last one started (-1 at first).
 		RunRepeat(RegexNode node, i32 pos, i32 count, i32 lastPos, RegexCont? rest) : i32
 		{
+			i32 atom = node.Child.Kind;
+			if (atom == 1 || atom == 2 || atom == 3)
+				return RunUnits(node, pos, rest);
 			// Another iteration is allowed under the maximum, and only if the last one made progress (an empty match
 			// could repeat forever).
 			bool more = (node.Max < 0 || count < node.Max) && !(count > node.Min && lastPos == pos);

@@ -9,10 +9,12 @@ namespace Larva.Hir.Lowering
     {
         private void LowerBodies()
         {
+            BeginParallelAdditions();
             if (Options.Parallel)
                 System.Threading.Tasks.Parallel.ForEach(Plans, LowerPlan);
             else
                 Plans.ForEach(LowerPlan);
+            OrderParallelAdditions();
             foreach (var info in Types.Where(i => i.IsClass))
                 Functions[info.VtableMaker] = VtableMaker(info);
         }
@@ -34,10 +36,12 @@ namespace Larva.Hir.Lowering
             var info = Types[plan.Type];
             var method = plan.Synthetic ?? info.Definition.Methods[plan.Method];
             string where = $"{info.Name}.{method.Name}";
+            currentPlan = plan.Function;
+            currentRank = 0;
             try
             {
                 var function = new BodyLowerer(this, plan, info, method).Lower();
-                lock (Functions)
+                lock (Sync)
                     Functions[plan.Function] = function;
             }
             catch (LoweringException e)
@@ -47,8 +51,12 @@ namespace Larva.Hir.Lowering
                 DeclareGenerics(empty, plan.Generics);
                 empty.Unreachable();
                 var built = empty.Build();
-                lock (Functions)
+                lock (Sync)
                     Functions[plan.Function] = built;
+            }
+            finally
+            {
+                currentPlan = -1;
             }
         }
 
@@ -111,7 +119,11 @@ namespace Larva.Hir.Lowering
 
         private int regionCount;
 
-        private sealed record LoopFrame(int Label, int Break, int Continue, int TryDepth);
+        /// <summary>
+        /// A loop or a switch: where <c>break</c> and <c>continue</c> go, and the try frames above which each runs the
+        /// finally blocks (a switch's <c>continue</c> is its loop's: it leaves the tries between the switch and the loop too).
+        /// </summary>
+        private sealed record LoopFrame(int Label, int Break, int Continue, int TryDepth, int ContinueTryDepth);
 
         private readonly List<TryFrame> tries = [];
 
@@ -202,6 +214,8 @@ namespace Larva.Hir.Lowering
                 // The program's entry runs every static constructor first.
                 Emit(lowerer.StaticInitFunction, [], new Place(Temp(IrType.Unit)));
             }
+            if (IsIterator)
+                EndIfDisposing();
             Block(body.Block);
             if (open && IsIterator)
                 EndIterator();
@@ -572,7 +586,7 @@ namespace Larva.Hir.Lowering
                     var loop = FindLoop(s.Label);
                     if (loop.Continue < 0)
                         throw new LoweringException("`continue` inside a switch that is not in a loop");
-                    RunFinally(loop.TryDepth);
+                    RunFinally(loop.ContinueTryDepth);
                     Goto(loop.Continue);
                     break;
                 }
@@ -650,7 +664,7 @@ namespace Larva.Hir.Lowering
         {
             if (!entered)
                 EnterIteration(body);
-            loops.Add(new LoopFrame(label, breakTarget, continueTarget, tries.Count));
+            loops.Add(new LoopFrame(label, breakTarget, continueTarget, tries.Count, tries.Count));
             Statement(body);
             loops.RemoveAt(loops.Count - 1);
         }
@@ -692,8 +706,10 @@ namespace Larva.Hir.Lowering
         {
             if (s.Collection is not H.RangeExpr { Low: { } low, High: { } high } range)
                 throw Unsupported("`foreach` over anything but a range");
-            // A captured variable is counted in a local and copied to the display object each iteration.
-            int variable = locals[s.Local] >= 0 ? locals[s.Local] : Temp(Lower(hirLocals[s.Local].Type));
+            // A captured variable is counted in a local, copied to the display object each pass and read back after it
+            // (the body may assign it, through a lambda or not: that changes the passes left, as for any variable).
+            bool captured = locals[s.Local] < 0;
+            int variable = captured ? Temp(Lower(hirLocals[s.Local].Type)) : locals[s.Local];
             var type = b.TypeOf(new Place(variable), Module);
             int end = Temp(type);
             Into(new Place(variable), low);
@@ -707,11 +723,22 @@ namespace Larva.Hir.Lowering
             open = false;
             At(body);
             EnterIteration(s.Body);
-            if (locals[s.Local] < 0)
+            if (captured)
                 b.Assign(LocalPlace(s.Local), Operand.Copy(variable));
             Loop(s.Label, after, step, s.Body, entered: true);
             Goto(step);
             At(step);
+            if (captured)
+                b.Assign(variable, Operand.Copy(LocalPlace(s.Local)));
+            if (range.Inclusive)
+            {
+                // The last pass (variable == end) ends the loop before the increment, which could wrap past the type's
+                // maximum (0..=255 over u8) and never fail the test above.
+                int more = Temp(IrType.Bool), increment = NewBlock();
+                b.Assign(more, Rvalue.Binary(BinaryOp.Lt, Operand.Copy(variable), Operand.Copy(end)));
+                b.If(Operand.Copy(more), increment, after);
+                At(increment);
+            }
             b.Assign(variable, Rvalue.Binary(BinaryOp.Add, Operand.Copy(variable), One(type)));
             Goto(head);
             At(after);
@@ -857,7 +884,7 @@ namespace Larva.Hir.Lowering
             int value = Temp(type);
             Into(new Place(value), s.Value);
             int after = NewBlock();
-            loops.Add(new LoopFrame(s.Label, after, loops.Count > 0 ? loops[^1].Continue : -1, tries.Count));
+            loops.Add(new LoopFrame(s.Label, after, loops.Count > 0 ? loops[^1].Continue : -1, tries.Count, loops.Count > 0 ? loops[^1].ContinueTryDepth : -1));
             foreach (var section in s.Sections)
             {
                 int body = NewBlock(), next = NewBlock();
@@ -886,11 +913,22 @@ namespace Larva.Hir.Lowering
 
         // ── Exceptions ─────────────────────────────────────
 
+        /// <summary>
+        /// The exception each enclosing <c>catch</c> handler is handling (innermost last): its own local, taken at the
+        /// handler's entry, so that a <c>throw;</c> rethrows it even after a nested try/catch or finally handled another.
+        /// </summary>
+        private readonly List<int> handled = [];
+
         private void Throw(H.Expr? value)
         {
             if (value is null)
             {
-                b.Resume(Handlers());
+                // `throw;`: the exception of the innermost catch around, from its local (`resume` would re-raise whatever the
+                // frame handled last, which a nested handler in between may have replaced).
+                if (handled.Count > 0)
+                    b.Throw(Operand.Copy(handled[^1]), Handlers());
+                else
+                    b.Resume(Handlers());
                 open = false;
                 return;
             }
@@ -915,8 +953,10 @@ namespace Larva.Hir.Lowering
 
         /// <summary>
         /// <c>try</c>: one handler takes every exception (all are objects, thrown as the root) and tests the clauses in
-        /// order; none matching, it goes on outward. <c>finally</c> is a catch-all that runs the block and re-raises, plus a
-        /// copy of the block on every way out of the try.
+        /// order; none matching, it throws it on outward. <c>finally</c> is a handler of the same kind that runs the block
+        /// and throws the exception on, plus a copy of the block on every way out of the try. Both handlers keep the
+        /// exception in a local of their own from their entry: the frame-wide "exception being handled" (<c>caught</c>,
+        /// <c>resume</c>) is replaced by any handler entered in between, a nested try/catch or finally in the body.
         /// </summary>
         private void Try(H.TryStmt s)
         {
@@ -925,7 +965,7 @@ namespace Larva.Hir.Lowering
             int finallyHandler = s.Finally is null ? -1 : NewBlock();
             int normalExit = s.Finally is null ? after : NewBlock();
             int handler = s.Catches.Length > 0 ? NewBlock() : -1;
-            CatchClause[] finallyClause = finallyHandler < 0 ? [] : [new CatchClause(null, finallyHandler)];
+            CatchClause[] finallyClause = finallyHandler < 0 ? [] : [new CatchClause(root, finallyHandler)];
             CatchClause[] clauses = [.. handler < 0 ? [] : new[] { new CatchClause(root, handler) }, .. finallyClause];
 
             tries.Add(new TryFrame(clauses, s.Finally));
@@ -947,6 +987,7 @@ namespace Larva.Hir.Lowering
                 At(handler);
                 int caught = Temp(root);
                 b.Assign(caught, Rvalue.Caught);
+                handled.Add(caught);
                 foreach (var clause in s.Catches)
                 {
                     int body = NewBlock(), next = NewBlock();
@@ -967,7 +1008,8 @@ namespace Larva.Hir.Lowering
                     Goto(normalExit);
                     At(next);
                 }
-                b.Resume(Handlers());
+                handled.RemoveAt(handled.Count - 1);
+                b.Throw(Operand.Copy(caught), Handlers());
                 open = false;
             }
             tries.RemoveAt(tries.Count - 1);
@@ -984,9 +1026,11 @@ namespace Larva.Hir.Lowering
                 }
                 else
                 {
+                    int passing = Temp(root);
+                    b.Assign(passing, Rvalue.Caught);
                     Block(finallyBlock);
                     if (open)
-                        b.Resume(Handlers());
+                        b.Throw(Operand.Copy(passing), Handlers());
                 }
                 open = false;
             }
@@ -1268,27 +1312,69 @@ namespace Larva.Hir.Lowering
         /// <summary>Jumps on a boolean expression; <c>&amp;&amp;</c>, <c>||</c> and <c>!</c> become branches.</summary>
         private void Condition(H.Expr condition, int yes, int no)
         {
+            Enter();
+            try
+            {
+                ConditionChain(condition, yes, no);
+            }
+            finally
+            {
+                depth--;
+            }
+        }
+
+        /// <summary>
+        /// The left spine of <c>&amp;&amp;</c>, <c>||</c> and <c>!</c> walked in a loop (a condition of thousands of
+        /// terms is left-deep): the targets of each step are known going down, the leaf jumps first, then each step's
+        /// right operand from the innermost out.
+        /// </summary>
+        private void ConditionChain(H.Expr condition, int yes, int no)
+        {
+            // Each step: the node, its targets, and the block its right operand starts in (-1 for `!`).
+            var steps = new List<(H.Expr Node, int Yes, int No, int Mid)>();
+            while (true)
+            {
+                switch (condition)
+                {
+                    case H.BinaryExpr { Op: H.BinaryOp.And } and:
+                    {
+                        int mid = NewBlock();
+                        steps.Add((and, yes, no, mid));
+                        condition = and.Left;
+                        yes = mid;
+                        continue;
+                    }
+                    case H.BinaryExpr { Op: H.BinaryOp.Or } or:
+                    {
+                        int mid = NewBlock();
+                        steps.Add((or, yes, no, mid));
+                        condition = or.Left;
+                        no = mid;
+                        continue;
+                    }
+                    case H.UnaryExpr { Op: H.UnaryOp.Not } not:
+                        steps.Add((not, yes, no, -1));
+                        (condition, yes, no) = (not.Operand, no, yes);
+                        continue;
+                }
+                break;
+            }
+            ConditionCore(condition, yes, no);
+            for (int i = steps.Count - 1; i >= 0; i--)
+            {
+                var (node, stepYes, stepNo, mid) = steps[i];
+                if (node is not H.BinaryExpr bin)
+                    continue;
+                At(mid);
+                Condition(bin.Right, stepYes, stepNo);
+            }
+        }
+
+        /// <summary>A condition that is not <c>&amp;&amp;</c>, <c>||</c> or <c>!</c> (those are <see cref="ConditionChain"/>'s).</summary>
+        private void ConditionCore(H.Expr condition, int yes, int no)
+        {
             switch (condition)
             {
-                case H.BinaryExpr { Op: H.BinaryOp.And } and:
-                {
-                    int mid = NewBlock();
-                    Condition(and.Left, mid, no);
-                    At(mid);
-                    Condition(and.Right, yes, no);
-                    return;
-                }
-                case H.BinaryExpr { Op: H.BinaryOp.Or } or:
-                {
-                    int mid = NewBlock();
-                    Condition(or.Left, yes, mid);
-                    At(mid);
-                    Condition(or.Right, yes, no);
-                    return;
-                }
-                case H.UnaryExpr { Op: H.UnaryOp.Not } not:
-                    Condition(not.Operand, no, yes);
-                    return;
                 case H.IsExpr test:
                 {
                     var place = PlaceOrTemp(test.Value);
@@ -1304,7 +1390,7 @@ namespace Larva.Hir.Lowering
 
         // ── Expressions ────────────────────────────────────
 
-        private IrModule Module => moduleView ??= new IrModule([.. lowerer.Structs], []);
+        private IrModule Module => moduleView ??= lowerer.StructsView();
         private IrModule? moduleView;
 
         /// <summary>Evaluates for its effects only.</summary>
@@ -1326,18 +1412,153 @@ namespace Larva.Hir.Lowering
             Into(new Place(sink), e);
         }
 
-        /// <summary>The value of an expression as an operand (a constant, a place read, or a temporary).</summary>
-        private Operand Value(H.Expr e)
+        /// <summary>
+        /// The value of an expression as an operand (a constant, a place read, or a temporary). A place is read when the
+        /// instruction using the operand runs, so when a later operand of the same expression may change it (see
+        /// <see cref="Effects"/>), <paramref name="settle"/> reads it now, into a temporary, as left-to-right evaluation
+        /// requires. A plain local is settled only against an outright write of a local (a call cannot reach it).
+        /// </summary>
+        private Operand Value(H.Expr e, int settle = 0)
         {
             if (e is H.LiteralExpr literal && literal.Value is not (H.NullConstant or H.StringConstant))
                 return Constant(literal.Value, Lower(e.Type));
-            if (AsPlace(e) is { } place)
+            if (AsPlace(e) is { } place && (settle == 0 || settle == 1 && place.Projections.Length == 0))
                 return Copied(place, e.Type);
             var type = Lower(e.Type);
             int temp = Temp(type);
             Into(new Place(temp), e);
             // A value made for the call moves in; a reference (a borrow for a `&mut` parameter) is not Copy.
             return FieldCopied(type) || type is ReferenceType ? Operand.Move(temp) : Operand.Copy(temp);
+        }
+
+        /// <summary>
+        /// The operands of one expression, evaluated left to right: an operand that names a place is read into a
+        /// temporary when an operand after it may write (<c>c.Count + c.Bump()</c>, <c>Add(i, i++, i)</c>); otherwise it
+        /// stays a place read, which costs nothing.
+        /// </summary>
+        private List<Operand> Operands(IReadOnlyList<H.Expr> operands)
+        {
+            var result = new List<Operand>(operands.Count);
+            if (operands.Count == 0)
+                return result;
+            // after[i]: the strongest effect of the operands after i.
+            var after = new int[operands.Count];
+            for (int i = operands.Count - 2; i >= 0; i--)
+                after[i] = Math.Max(after[i + 1], Effects(operands[i + 1]));
+            for (int i = 0; i < operands.Count; i++)
+                result.Add(Value(operands[i], after[i]));
+            return result;
+        }
+
+        /// <summary>
+        /// Whether evaluating <paramref name="e"/> can change what an operand evaluated before it reads: 0 not at all
+        /// (reads, arithmetic, conversions, allocations), 1 through a call (fields, elements, statics, anything reached
+        /// by reference), 2 a local or parameter of this function written outright (<c>i++</c>, <c>i = …</c>, a block).
+        /// </summary>
+        private static int Effects(H.Expr e) => Effects(e, 0);
+
+        /// <summary>Past a few hundred levels the answer is "the worst" (a copy), so a deep tree never costs the stack.</summary>
+        private const int EffectsDepth = 256;
+
+        private static int Effects(H.Expr e, int depth)
+        {
+            if (depth > EffectsDepth)
+                return 2;
+            switch (e)
+            {
+                case H.LiteralExpr or H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.TypeOfExpr or H.SizeOfExpr
+                    or H.DefaultExpr or H.ResourceExpr or H.MethodRefExpr or PendingExpr or HeldExpr:
+                    return 0;
+                case H.LambdaExpr:
+                    return 1;
+                case H.FieldExpr f:
+                    return f.Instance is null ? 0 : Effects(f.Instance, depth + 1);
+                case H.ElementExpr x:
+                    return Math.Max(Effects(x.Array, depth + 1), Effects(x.Indices, depth + 1));
+                case H.ArrayLengthExpr l:
+                    return Math.Max(Effects(l.Array, depth + 1), l.Dimension is null ? 0 : Effects(l.Dimension, depth + 1));
+                case H.UnaryExpr { Op: H.UnaryOp.PreIncrement or H.UnaryOp.PostIncrement or H.UnaryOp.PreDecrement or H.UnaryOp.PostDecrement } u:
+                    return WritesLocal(u.Operand) ? 2 : Math.Max(1, Effects(u.Operand, depth + 1));
+                case H.UnaryExpr u:
+                    return Effects(u.Operand, depth + 1);
+                case H.BinaryExpr bin:
+                    return Math.Max(Effects(bin.Left, depth + 1), Effects(bin.Right, depth + 1));
+                case H.AssignExpr a:
+                    return WritesLocal(a.Target) ? 2 : Math.Max(1, Math.Max(Effects(a.Target, depth + 1), Effects(a.Value, depth + 1)));
+                case H.ConvertExpr { Kind: H.ConversionKind.User } c:
+                    return Math.Max(1, Effects(c.Value, depth + 1));
+                case H.ConvertExpr c:
+                    return Effects(c.Value, depth + 1);
+                case H.AsExpr a:
+                    return Effects(a.Value, depth + 1);
+                case H.CheckedExpr c:
+                    return Effects(c.Value, depth + 1);
+                case H.IsExpr i:
+                    return Math.Max(Effects(i.Value, depth + 1), Effects(i.Pattern));
+                case H.ConditionalExpr c:
+                    return Math.Max(Effects(c.Condition, depth + 1), Math.Max(Effects(c.Then, depth + 1), Effects(c.Else, depth + 1)));
+                case H.CoalesceExpr c:
+                    return Math.Max(Effects(c.Left, depth + 1), Effects(c.Right, depth + 1));
+                case H.ConditionalAccessExpr c:
+                    return Math.Max(Effects(c.Receiver, depth + 1), Effects(c.Access, depth + 1));
+                case H.RangeExpr r:
+                    return Math.Max(r.Low is null ? 0 : Effects(r.Low, depth + 1), r.High is null ? 0 : Effects(r.High, depth + 1));
+                case H.NewArrayExpr n:
+                    return Effects(n.Lengths, depth + 1);
+                case H.ArrayLiteralExpr a:
+                    return Effects(a.Items, depth + 1);
+                case H.BorrowExpr b:
+                    return Effects(b.Place, depth + 1);
+                case H.AddressOfExpr a:
+                    return Effects(a.Place, depth + 1);
+                case H.DerefExpr d:
+                    return Effects(d.Pointer, depth + 1);
+                case H.CallExpr call:
+                    return Math.Max(1, Math.Max(call.Receiver is null ? 0 : Effects(call.Receiver, depth + 1), Effects(call.Arguments, depth + 1)));
+                case H.InvokeExpr invoke:
+                    return Math.Max(1, Math.Max(Effects(invoke.Function, depth + 1), Effects(invoke.Arguments, depth + 1)));
+                case H.NewExpr n:
+                    return Math.Max(1, Math.Max(Effects(n.Arguments, depth + 1), Effects(n.Initializers.Select(i => i.Value), depth + 1)));
+                case H.WithExpr w:
+                    return Math.Max(1, Math.Max(Effects(w.Value, depth + 1), Effects(w.Changes.Select(c => c.Value), depth + 1)));
+                case H.PropertyExpr p:
+                    return Math.Max(1, Math.Max(p.Instance is null ? 0 : Effects(p.Instance, depth + 1), Effects(p.Indices, depth + 1)));
+                case H.InterpolatedExpr i:
+                    return Math.Max(1, Effects(i.Parts.Select(p => p.Value), depth + 1));
+                default:
+                    // Blocks, switches, awaits and anything new: assume the worst.
+                    return 2;
+            }
+        }
+
+        /// <summary>Whether a store to <paramref name="target"/> changes a local or parameter itself (it, or a field of a value in it).</summary>
+        private static bool WritesLocal(H.Expr target)
+        {
+            while (target is H.FieldExpr { Instance: { } instance })
+                target = instance;
+            return target is H.LocalExpr or H.ParamExpr;
+        }
+
+        /// <summary>A pattern's effects: a binding writes a local; a property or positional pattern may call.</summary>
+        private static int Effects(H.Pattern pattern) => pattern switch
+        {
+            H.TypePattern or H.ConstantPattern or H.DiscardPattern or H.RelationalPattern or H.RangePattern => 0,
+            H.AndPattern and => Math.Max(Effects(and.Left), Effects(and.Right)),
+            H.OrPattern or => Math.Max(Effects(or.Left), Effects(or.Right)),
+            H.NotPattern not => Effects(not.Operand),
+            _ => 2,
+        };
+
+        private static int Effects(IEnumerable<H.Expr> operands, int depth = 0)
+        {
+            int result = 0;
+            foreach (var operand in operands)
+            {
+                result = Math.Max(result, Effects(operand, depth));
+                if (result == 2)
+                    break;
+            }
+            return result;
         }
 
         /// <summary>
@@ -1359,7 +1580,7 @@ namespace Larva.Hir.Lowering
         private void CopyFields(Place target, Place source, StructType type)
         {
             b.Assign(target, Rvalue.ZeroFiller(type));
-            var fields = lowerer.Structs[type.Id].Fields;
+            var fields = lowerer.Struct(type.Id).Fields;
             for (int f = 0; f < fields.Length; f++)
             {
                 var fieldType = fields[f].Substitute(type.Arguments);
@@ -1373,7 +1594,7 @@ namespace Larva.Hir.Lowering
         /// <summary>Whether values of <paramref name="type"/> are copied field by field (value types holding objects).</summary>
         private bool FieldCopied(IrType type)
         {
-            if (type is not StructType st || lowerer.Structs[st.Id].Mutable)
+            if (type is not StructType st || lowerer.Struct(st.Id).Mutable)
                 return false;
             if (copied.TryGetValue(type, out bool known))
                 return known;
@@ -1469,7 +1690,7 @@ namespace Larva.Hir.Lowering
         /// <summary>A handle (object, array, pointer, reference) in a local, to project through.</summary>
         private Place HandleLocal(H.Expr e)
         {
-            if (AsPlace(e) is { IsLocal: true } local)
+            if (!pinLocals && AsPlace(e) is { IsLocal: true } local)
                 return local;
             int temp = Temp(Lower(e.Type));
             Into(new Place(temp), e);
@@ -1478,11 +1699,35 @@ namespace Larva.Hir.Lowering
 
         private int IndexLocal(H.Expr e)
         {
-            if (AsPlace(e) is { IsLocal: true } local)
+            if (!pinLocals && AsPlace(e) is { IsLocal: true } local)
                 return local.Local;
             int temp = Temp(Lower(e.Type));
             Into(new Place(temp), e);
             return temp;
+        }
+
+        /// <summary>
+        /// While set, the locals a place projects through (an array's handle, an index) are copied into temporaries:
+        /// the place of an assignment's target is taken before its value runs, and that value writes a local
+        /// (<c>arr[k] = k++</c> stores at the old k).
+        /// </summary>
+        private bool pinLocals;
+
+        /// <summary>The place <paramref name="target"/> names, with its locals pinned when <paramref name="value"/> writes locals.</summary>
+        private Place? TargetPlace(H.Expr target, H.Expr value)
+        {
+            if (Effects(value) < 2)
+                return AsPlace(target);
+            bool saved = pinLocals;
+            pinLocals = true;
+            try
+            {
+                return AsPlace(target);
+            }
+            finally
+            {
+                pinLocals = saved;
+            }
         }
 
         /// <summary>Whether <paramref name="e"/> is an object's array kept in place (<see cref="H.FieldFlags.InPlace"/>).</summary>
@@ -1536,8 +1781,102 @@ namespace Larva.Hir.Lowering
             _ => throw new LoweringException($"the operator {op} is lowered in a later phase"),
         };
 
+        /// <summary>The nesting of expressions a body may have; deeper ones are reported, not lowered (the host stack is finite).</summary>
+        internal const int MaxDepth = 10_000;
+
+        /// <summary>A left spine longer than this is lowered in a loop instead of by recursion (<see cref="Chain"/>).</summary>
+        private const int ChainThreshold = 32;
+
+        /// <summary>How many expressions are being lowered one inside the other (<see cref="Into"/>, <see cref="Condition"/>).</summary>
+        private int depth;
+
+        private void Enter()
+        {
+            if (++depth > MaxDepth || !System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                throw new LoweringException($"the expression is nested too deeply (more than {Math.Min(depth, MaxDepth)} levels): split it");
+        }
+
         /// <summary>Evaluates <paramref name="e"/> into <paramref name="target"/>.</summary>
         private void Into(Place target, H.Expr e)
+        {
+            Enter();
+            try
+            {
+                if (IsChain(e))
+                    Chain(target, e);
+                else
+                    IntoCore(target, e);
+            }
+            finally
+            {
+                depth--;
+            }
+        }
+
+        /// <summary>
+        /// The left operand of a step of a left-deep chain: <c>x + y</c> has <c>x</c>; a call has its receiver, or (static)
+        /// its first argument, when that is a call of the same method (<c>Concat(Concat(a, b), c)</c>, <c>s.A(x).A(y)</c>),
+        /// not on a struct receiver (a struct method evaluates its arguments before borrowing the receiver). Null otherwise.
+        /// </summary>
+        private H.Expr? Spine(H.Expr e) => e switch
+        {
+            H.BinaryExpr { Op: not (H.BinaryOp.And or H.BinaryOp.Or) } bin => bin.Left,
+            H.CallExpr { Receiver: H.CallExpr inner } call when inner.Method == call.Method
+                && !(inner.Type is H.NamedType { Type.IsDefinition: true } n && lowerer.Types[n.Type.Index].IsStruct) => inner,
+            H.CallExpr { Receiver: null, Arguments: [H.CallExpr inner, ..] } call when inner.Method == call.Method => inner,
+            _ => null,
+        };
+
+        /// <summary>Whether <paramref name="e"/> heads a left spine deeper than <see cref="ChainThreshold"/>.</summary>
+        private bool IsChain(H.Expr e)
+        {
+            int length = 0;
+            for (var step = Spine(e); step is not null; step = Spine(step))
+            {
+                if (++length > ChainThreshold)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// A long left-deep chain (<c>a + a + … + a</c>, a string joined of thousands of pieces) lowered in a loop: the
+        /// leftmost leaf first, then each step in order with its left operand already in a temporary (the order recursion
+        /// gives: the left value exists before the right operand is evaluated).
+        /// </summary>
+        private void Chain(Place target, H.Expr e)
+        {
+            var steps = new List<H.Expr>();
+            var leaf = e;
+            for (var left = Spine(leaf); left is not null; left = Spine(leaf))
+            {
+                steps.Add(leaf);
+                leaf = left;
+            }
+            int held = Temp(Lower(leaf.Type));
+            IntoCore(new Place(held), leaf);
+            H.Expr value = new HeldExpr(held, leaf.Type);
+            for (int i = steps.Count - 1; i >= 0; i--)
+            {
+                H.Expr step = steps[i] switch
+                {
+                    H.BinaryExpr bin => bin with { Left = value },
+                    H.CallExpr { Receiver: not null } call => call with { Receiver = value },
+                    H.CallExpr call => call with { Arguments = [value, .. call.Arguments[1..]] },
+                    var other => throw new LoweringException($"{other.GetType().Name} in a chain"),
+                };
+                if (i == 0)
+                {
+                    IntoCore(target, step);
+                    return;
+                }
+                int temp = Temp(Lower(step.Type));
+                IntoCore(new Place(temp), step);
+                value = new HeldExpr(temp, step.Type);
+            }
+        }
+
+        private void IntoCore(Place target, H.Expr e)
         {
             var type = Lower(e.Type);
             switch (e)
@@ -1571,7 +1910,7 @@ namespace Larva.Hir.Lowering
                 case H.LiteralExpr literal:
                     b.Assign(target, Constant(literal.Value, type));
                     return;
-                case H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.FieldExpr { Instance: not null } or H.ElementExpr or H.DerefExpr or PendingExpr when AsPlace(e) is { } place:
+                case H.LocalExpr or H.ParamExpr or H.ThisExpr or H.ReceiverExpr or H.FieldExpr { Instance: not null } or H.ElementExpr or H.DerefExpr or PendingExpr or HeldExpr when AsPlace(e) is { } place:
                     b.Assign(target, Copied(place, e.Type));
                     return;
                 case H.FieldExpr f:
@@ -1978,9 +2317,8 @@ namespace Larva.Hir.Lowering
             if ((bin.Left.Type is H.GenericParamType || bin.Right.Type is H.GenericParamType)
                 && RequiredOperator(HirLowerer.OperatorRequirementName(OperatorSymbol(bin.Op), false), [bin.Left, bin.Right], bin.Type, target))
                 return;
-            var left = Value(bin.Left);
-            var right = Value(bin.Right);
-            b.Assign(target, Arithmetic(Op(bin.Op), left, right, Lower(bin.Left.Type)));
+            var operands = Operands([bin.Left, bin.Right]);
+            b.Assign(target, Arithmetic(Op(bin.Op), operands[0], operands[1], Lower(bin.Left.Type)));
         }
 
         /// <summary>
@@ -2055,10 +2393,22 @@ namespace Larva.Hir.Lowering
                     return new Place(value);
                 }
             }
-            var place = AsPlace(a.Target) ?? throw new LoweringException("assigns a value that is not a place");
+            var place = TargetPlace(a.Target, a.Value) ?? throw new LoweringException("assigns a value that is not a place");
             WritesElement(a.Target);
             if (a.Compound is { } compound)
-                b.Assign(place, Arithmetic(Op(compound), Operand.Copy(place), Value(a.Value), Lower(a.Target.Type)));
+            {
+                // `x op= v`: x is read before v runs when v may change it (`x += x++`, `c.N += c.Bump()`).
+                var type = Lower(a.Target.Type);
+                int effects = Effects(a.Value);
+                var old = Operand.Copy(place);
+                if (effects == 2 || effects == 1 && !place.IsLocal)
+                {
+                    int before = Temp(type);
+                    b.Assign(before, old);
+                    old = Operand.Copy(before);
+                }
+                b.Assign(place, Arithmetic(Op(compound), old, Value(a.Value), type));
+            }
             else
                 Into(place, a.Value);
             return place;
@@ -2183,7 +2533,7 @@ namespace Larva.Hir.Lowering
             var target = Of(to);
             if (source is null || target is null)
                 return false;
-            for (StructType? s = source; s is not null; s = lowerer.Structs[s.Id].Base)
+            for (StructType? s = source; s is not null; s = lowerer.Struct(s.Id).Base)
             {
                 if (s.Id == target.Id)
                     return false;
@@ -2250,7 +2600,7 @@ namespace Larva.Hir.Lowering
                 }
                 else if (info.IsPrimitive)
                 {
-                    arguments.Add(Value(call.Receiver));
+                    arguments.Add(Value(call.Receiver, Effects(call.Arguments)));
                 }
                 else
                 {
@@ -2267,21 +2617,18 @@ namespace Larva.Hir.Lowering
                             int converted = Temp(direct.This);
                             b.Assign(converted, Convert(Operand.Copy(handle), thisType, direct.This));
                             var directArguments = new List<Operand> { Operand.Copy(converted) };
-                            foreach (var argument in call.Arguments)
-                                directArguments.Add(Value(argument));
+                            directArguments.AddRange(Operands(call.Arguments));
                             Emit(direct.Function, direct.TypeArguments, directArguments, target);
                             return;
                         }
-                        foreach (var argument in call.Arguments)
-                            arguments.Add(Value(argument));
+                        arguments.AddRange(Operands(call.Arguments));
                         VirtualCall(info, m, classArguments, handle, arguments, target);
                         return;
                     }
                     arguments.Add(Operand.Copy(handle));
                 }
             }
-            foreach (var argument in call.Arguments)
-                arguments.Add(Value(argument));
+            arguments.AddRange(Operands(call.Arguments));
             Emit(lowerer.MethodFunctions[call.Method], typeArguments, arguments, target);
             if (writeBack is { } back)
                 b.Assign(back.Back, Copied(back.Temp, call.Receiver!.Type));
@@ -2355,11 +2702,7 @@ namespace Larva.Hir.Lowering
                 int which = Array.FindIndex(plan.Generics[index].Requirements, r => r.SameAs(requirement));
                 if (which < 0)
                     continue;
-                var arguments = new List<Operand>();
-                if (call.Receiver is { } receiver)
-                    arguments.Add(Value(receiver));
-                foreach (var argument in call.Arguments)
-                    arguments.Add(Value(argument));
+                var arguments = Operands(call.Receiver is { } receiver ? [receiver, .. call.Arguments] : call.Arguments);
                 int next = NewBlock();
                 b.CallRequired(index, which, [.. arguments], target, next, Handlers());
                 At(next);
@@ -2387,7 +2730,7 @@ namespace Larva.Hir.Lowering
                 int which = Array.FindIndex(plan.Generics[index].Requirements, r => r.Name == name && r.Result == resultType && r.Parameters.SequenceEqual(types));
                 if (which < 0)
                     continue;
-                var arguments = operands.Select(Value).ToArray();
+                var arguments = Operands(operands).ToArray();
                 int next = NewBlock();
                 b.CallRequired(index, which, arguments, target, next, Handlers());
                 At(next);
@@ -2400,7 +2743,7 @@ namespace Larva.Hir.Lowering
                 int which = index < plan.Generics.Length ? Array.FindIndex(plan.Generics[index].Requirements, r => r.Name == name && r.Result == resultType && r.Parameters.SequenceEqual(types)) : -1;
                 if (which >= 0)
                 {
-                    var arguments = operands.Select(Value).ToArray();
+                    var arguments = Operands(operands).ToArray();
                     int next = NewBlock();
                     b.CallRequired(index, which, arguments, target, next, Handlers());
                     At(next);
@@ -2600,7 +2943,7 @@ namespace Larva.Hir.Lowering
                 int which = index < plan.Generics.Length ? Array.FindIndex(plan.Generics[index].Requirements, r => r.Name == Requirement.Constructor && r.Result == type && r.Parameters.SequenceEqual(types)) : -1;
                 if (which < 0)
                     throw new LoweringException($"no constructor requirement new({string.Join(", ", types.Select(t => t.ToString()))}) on {n.Type}");
-                var arguments = n.Arguments.Select(Value).ToArray();
+                var arguments = Operands(n.Arguments).ToArray();
                 int next = NewBlock();
                 b.CallRequired(index, which, arguments, target, next, Handlers());
                 At(next);
@@ -2641,8 +2984,7 @@ namespace Larva.Hir.Lowering
                 if (n.Constructor is { } constructor)
                 {
                     var arguments = new List<Operand> { Operand.Copy(handle) };
-                    foreach (var argument in n.Arguments)
-                        arguments.Add(Value(argument));
+                    arguments.AddRange(Operands(n.Arguments));
                     Emit(lowerer.MethodFunctions[constructor], typeArguments, arguments, new Place(Temp(IrType.Unit)));
                 }
                 foreach (var init in n.Initializers)
@@ -2660,8 +3002,7 @@ namespace Larva.Hir.Lowering
                     int reference = Temp(IrType.RefMut(structType));
                     b.Assign(reference, Rvalue.RefMut(value));
                     var arguments = new List<Operand> { Operand.Move(reference) };
-                    foreach (var argument in n.Arguments)
-                        arguments.Add(Value(argument));
+                    arguments.AddRange(Operands(n.Arguments));
                     Emit(lowerer.MethodFunctions[constructor], typeArguments, arguments, new Place(Temp(IrType.Unit)));
                 }
                 foreach (var init in n.Initializers)
@@ -2697,7 +3038,7 @@ namespace Larva.Hir.Lowering
             Emit(lowerer.MethodFunctions[H.MemberToken.Def(info.Index, lengthMethod)], typeArguments, [.. held.Select(h => Operand.Copy(h))], new Place(length));
             if (lowerer.ExternalOrigin(info) is { } externalOrigin)
                 throw new LoweringException(HirLowerer.CrossingError($"`{info.Name}`", externalOrigin, "its objects live in that domain's collector and cannot be made here"));
-            var element = ((IR.ArrayType)lowerer.Structs[structType.Id].Fields[^1]).Element.Substitute(typeArguments);
+            var element = ((IR.ArrayType)lowerer.Struct(structType.Id).Fields[^1]).Element.Substitute(typeArguments);
             int handle = Temp(type);
             int vt = Temp(HirLowerer.VtablePointer(IrType.Struct(info.Vtable, typeArguments)));
             b.Assign(handle, new ArrayRvalue(lowerer.ObjectAlloc, element, Operand.Copy(length)) { Owner = structType });

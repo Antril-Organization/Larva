@@ -755,10 +755,12 @@ namespace Larva.Build
         {
             foreach (var entry in Document.Named("FILES").SelectMany(c => c.Entries).Where(e => e.Key is not ("copy" or "into")))
                 Report(diagnostics, "QN121", $"`{entry.Key}` is not a FILES key (copy, into)", entry.Value, error: false);
-            string into = Values("FILES", "into").LastOrDefault()?.Display.Replace('\\', '/').Trim('/') ?? "";
-            if (into.Split('/').Contains(".."))
+            string given = Values("FILES", "into").LastOrDefault()?.Display.Replace('\\', '/') ?? "";
+            string into = given.Trim('/');
+            if (into.Split('/').Contains("..") || given.StartsWith('/') || Path.IsPathRooted(given) || into.Contains(':'))
             {
-                Report(diagnostics, "QN131", "`into` is a folder under the build's: it cannot climb out with `..`", Values("FILES", "into").Last());
+                // Relative and inside: not `..`, not `/x`, not `C:/x` (a rooted path on any system, whichever this one is).
+                Report(diagnostics, "QN131", "`into` is a folder under the build's: it cannot climb out with `..` or be an absolute path", Values("FILES", "into").Last());
                 into = "";
             }
             var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

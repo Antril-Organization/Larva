@@ -1,6 +1,7 @@
 // JSON: a value read from text (JsonValue.Parse) or built by hand, and written back (ToString, compact). Objects keep
-// their members in order. Numbers are f64 (an integer prints without a fraction). Text is UTF-8 in and out; `\uXXXX`
-// escapes (surrogate pairs included) become the character's bytes.
+// their members in order. Numbers are f64 (an integer prints without a fraction; nan and the infinities are no JSON:
+// writing one is a FormatError). Text is UTF-8 in and out; `\uXXXX` escapes (surrogate pairs included) become the
+// character's bytes, a lone surrogate U+FFFD. Nesting is limited to JsonReader.MaxDepth (512).
 
 into namespace System.Text
 {
@@ -70,6 +71,8 @@ into namespace System.Text
 				sb.Append(boolean ? "true" : "false");
 			else if (kind == JsonKind.Number)
 			{
+				if (number - number != 0)
+					throw new FormatError("JSON has no value for " + number.ToString());
 				i64 whole = (i64)number;
 				if ((f64)whole == number && number > -9007199254740992.0 && number < 9007199254740992.0)
 					sb.Append(whole.ToString());
@@ -234,13 +237,23 @@ into namespace System.Text
 			}
 	}
 
-	/// Reads a value from UTF-8 units.
+	/// Reads a value from UTF-8 units. Arrays and objects nest at most MaxDepth deep (a FormatError beyond).
 	public final class JsonReader
 	{
 		u8[] p;
 		i32 at;
+		i32 depth;
+
+		Enter()
+		{
+			depth++;
+			if (depth > MaxDepth)
+				Fail("nesting deeper than " + MaxDepth);
+		}
 
 		public:
+			const i32 MaxDepth = 512;
+
 			new(u8[] units)
 			{
 				p = units;
@@ -303,19 +316,46 @@ into namespace System.Text
 				at += w.Length;
 			}
 
+			/// A number by the JSON grammar: `-`?, `0` or digits not starting with one, a fraction `.` digits, an
+			/// exponent `e`/`E`, a sign, digits (no leading zeros, no `1.`, no `.5`).
 			ReadNumber() : JsonValue
 			{
 				i32 start = at;
 				if (p[at] == '-')
 					at++;
-				loop (at < p.Length && ((p[at] >= '0' && p[at] <= '9') || p[at] == '.' || p[at] == 'e' || p[at] == 'E' || p[at] == '+' || p[at] == '-'))
+				if (at < p.Length && p[at] == '0')
 					at++;
+				else if (Digits() == 0)
+					Fail("bad number");
+				if (at < p.Length && p[at] == '.')
+				{
+					at++;
+					if (Digits() == 0)
+						Fail("bad number");
+				}
+				if (at < p.Length && (p[at] == 'e' || p[at] == 'E'))
+				{
+					at++;
+					if (at < p.Length && (p[at] == '+' || p[at] == '-'))
+						at++;
+					if (Digits() == 0)
+						Fail("bad number");
+				}
 				u8[] digits = new u8[at - start];
 				Array.Copy(p, start, digits, 0, at - start);
 				f64? parsed = Float64.TryParse(new String<u8>(digits));
 				if (parsed == null)
 					Fail("bad number");
 				return JsonValue.Of(parsed ?? 0.0);
+			}
+
+			/// Past the digits here; how many there were.
+			Digits() : i32
+			{
+				i32 start = at;
+				loop (at < p.Length && p[at] >= '0' && p[at] <= '9')
+					at++;
+				return at - start;
 			}
 
 			ReadText() : str
@@ -353,13 +393,28 @@ into namespace System.Text
 						bytes.Add((u8)e);
 					else if (e == 'u')
 					{
+						// A surrogate pair makes one character; a surrogate on its own (or a high one whose next escape
+						// is not a low one) becomes U+FFFD and consumes only its own escape.
 						u32 code = ReadHex4();
-						if (code >= 0xD800 && code < 0xDC00 && at + 1 < p.Length && p[at] == '\\' && p[at + 1] == 'u')
+						if (code >= 0xD800 && code < 0xDC00)
 						{
-							at += 2;
-							u32 low = ReadHex4();
-							code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+							i32 before = at;
+							u32 low = 0;
+							if (at + 1 < p.Length && p[at] == '\\' && p[at + 1] == 'u')
+							{
+								at += 2;
+								low = ReadHex4();
+							}
+							if (low >= 0xDC00 && low < 0xE000)
+								code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+							else
+							{
+								at = before;
+								code = 0xFFFD;
+							}
 						}
+						else if (code >= 0xDC00 && code < 0xE000)
+							code = 0xFFFD;
 						u8[] encoded = Unicode.Encode<u8>([code]);
 						loop (i32 i = 0..encoded.Length)
 							bytes.Add(encoded[i]);
@@ -393,11 +448,13 @@ into namespace System.Text
 			ReadArray() : JsonValue
 			{
 				at++;
+				Enter();
 				JsonValue array = JsonValue.NewArray();
 				SkipSpace();
 				if (at < p.Length && p[at] == ']')
 				{
 					at++;
+					depth--;
 					return array;
 				}
 				loop (true)
@@ -413,17 +470,20 @@ into namespace System.Text
 					if (c != ',')
 						Fail("expected , or ]");
 				}
+				depth--;
 				return array;
 			}
 
 			ReadObject() : JsonValue
 			{
 				at++;
+				Enter();
 				JsonValue obj = JsonValue.NewObject();
 				SkipSpace();
 				if (at < p.Length && p[at] == '}')
 				{
 					at++;
+					depth--;
 					return obj;
 				}
 				loop (true)
@@ -447,6 +507,7 @@ into namespace System.Text
 					if (c != ',')
 						Fail("expected , or }");
 				}
+				depth--;
 				return obj;
 			}
 	}

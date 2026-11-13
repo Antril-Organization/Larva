@@ -30,6 +30,11 @@
     <DebugType>embedded</DebugType>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- The helpers that need no registry (what an earlier installation leaves, what is in use) are tested there. -->
+    <InternalsVisibleTo Include="Larva.Cli.Tests" />
+  </ItemGroup>
+
   <ItemGroup Condition="'$(Payload)' != ''">
     <EmbeddedResource Include="$(Payload)" LogicalName="payload.zip" />
   </ItemGroup>

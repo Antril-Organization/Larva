@@ -349,12 +349,25 @@ namespace Larva.IR.Lowering
                 // The locals still read somewhere (anything not known to read only operands counts as reading them all).
                 var read = new HashSet<int>();
                 bool unknown = false;
+                // A place reads its base local and every index local in its projections (`xs[_5]` reads _5 too).
+                void Evaluate(Place place)
+                {
+                    read.Add(place.Local);
+                    foreach (int index in place.IndexLocals())
+                        read.Add(index);
+                }
+                // A written place is still read when it is not a bare local: the base and the indexes are needed.
+                void Written(Place target)
+                {
+                    if (!target.IsLocal)
+                        Evaluate(target);
+                }
                 void Use(Operand? operand)
                 {
                     if (operand is CopyOperand { Place: var copied })
-                        read.Add(copied.Local);
+                        Evaluate(copied);
                     else if (operand is MoveOperand { Place: var moved })
-                        read.Add(moved.Local);
+                        Evaluate(moved);
                 }
                 foreach (var block in rewritten)
                 {
@@ -363,8 +376,7 @@ namespace Larva.IR.Lowering
                         switch (statement)
                         {
                             case AssignStatement assign:
-                                if (!assign.Target.IsLocal)
-                                    read.Add(assign.Target.Local);
+                                Written(assign.Target);
                                 switch (assign.Value)
                                 {
                                     case UseRvalue use: Use(use.Operand); break;
@@ -393,8 +405,7 @@ namespace Larva.IR.Lowering
                             foreach (var argument in call.Arguments)
                                 Use(argument);
                             Use(call.Callee);
-                            if (!call.Destination.IsLocal)
-                                read.Add(call.Destination.Local);
+                            Written(call.Destination);
                             break;
                         case ThrowTerminator raise: Use(raise.Value); break;
                         case GotoTerminator or ReturnTerminator or UnreachableTerminator: break;

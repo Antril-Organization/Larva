@@ -151,21 +151,77 @@ namespace Larva.Hir.Lowering
                 }
             }
 
+            /// <summary>
+            /// A type named in a body (an expression's, a type argument's): its definitions are in use, including those
+            /// among its type arguments (<c>Describe&lt;Config&gt;()</c> makes a <c>Config</c> through <c>T</c>).
+            /// </summary>
+            private void Use(H.HirType? type)
+            {
+                switch (type)
+                {
+                    case H.NamedType named:
+                        if (named.Type.IsDefinition)
+                            Use(named.Type.Index);
+                        foreach (var argument in named.Arguments)
+                            Use(argument);
+                        break;
+                    case H.ArrayType array:
+                        Use(array.Element);
+                        break;
+                    case H.InlineArrayType inline:
+                        Use(inline.Element);
+                        Use(inline.SizeOf);
+                        break;
+                    case H.NullableType nullable:
+                        Use(nullable.Inner);
+                        break;
+                    case H.ReferenceType reference:
+                        Use(reference.Target);
+                        break;
+                    case H.PointerType pointer:
+                        Use(pointer.Target);
+                        break;
+                    case H.FuncType func:
+                        Use(func.Result);
+                        foreach (var parameter in func.Parameters)
+                            Use(parameter);
+                        break;
+                    case H.PackExpansionType pack:
+                        Use(pack.Pattern);
+                        break;
+                }
+            }
+
             public override void Visit(H.Expr? e)
             {
+                if (e is not null)
+                    Use(e.Type);
                 switch (e)
                 {
                     case H.FieldExpr { Field.IsDefinition: true } f:
                         Use(f.Field.Type);
+                        if (f.TypeArguments is { } fieldArguments)
+                        {
+                            foreach (var argument in fieldArguments)
+                                Use(argument);
+                        }
                         break;
                     case H.CallExpr { Method.IsDefinition: true } call:
                         Enqueue(call.Method.Type, call.Method.Member);
+                        foreach (var argument in call.TypeArguments)
+                            Use(argument);
                         break;
                     case H.NewExpr { Constructor: { IsDefinition: true } constructor }:
                         Enqueue(constructor.Type, constructor.Member);
                         break;
                     case H.NewExpr { Type: H.NamedType { Type.IsDefinition: true } made }:
                         Use(made.Type.Index);
+                        break;
+                    case H.TypeOfExpr t:
+                        Use(t.Operand);
+                        break;
+                    case H.SizeOfExpr z:
+                        Use(z.Operand);
                         break;
                     case H.PropertyExpr { Property.IsDefinition: true } p:
                     {
@@ -178,6 +234,8 @@ namespace Larva.Hir.Lowering
                     }
                     case H.MethodRefExpr { Method.IsDefinition: true } m:
                         Enqueue(m.Method.Type, m.Method.Member);
+                        foreach (var argument in m.TypeArguments)
+                            Use(argument);
                         break;
                 }
                 base.Visit(e);

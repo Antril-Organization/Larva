@@ -20,6 +20,9 @@ internal sealed class LarvaProcess
     public required string UserLanguages { get; init; }
     public string? Token { get; set; }
 
+    /// <summary>Folders of language packs given as <c>LARVA_LANGUAGES</c> (none: the child sees no such variable).</summary>
+    public string? Languages { get; set; }
+
     private static string FindRepository()
     {
         for (var folder = new DirectoryInfo(AppContext.BaseDirectory); folder is not null; folder = folder.Parent)
@@ -46,6 +49,8 @@ internal sealed class LarvaProcess
         start.Environment["LARVA_CONFIG"] = Config;
         start.Environment["LARVA_USER_LANGUAGES"] = UserLanguages;
         start.Environment.Remove("LARVA_LANGUAGES");
+        if (Languages is not null)
+            start.Environment["LARVA_LANGUAGES"] = Languages;
         start.Environment.Remove("HIVE_TOKEN");
         if (Token is not null)
             start.Environment["HIVE_TOKEN"] = Token;
