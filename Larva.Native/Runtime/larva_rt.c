@@ -2468,8 +2468,8 @@ typedef struct {
     uint8_t pinned;       /* holds a pinned object (this collection) */
     uint32_t used;        /* bytes of objects from the block's start */
     uint32_t *starts;     /* object offsets, made when an ambiguous word points in (this collection) */
-    uint32_t start_count;
-    uint32_t starts_used; /* `used` when they were made (a block still filling makes them again) */
+    uint32_t start_count, start_capacity;
+    uint32_t starts_used; /* how far the walk went: a block still filling extends them from there */
     uint32_t dirty;       /* bytes to zero before it is used again (zeroed then, while they go into the cache) */
 } NurseryBlock;
 
@@ -3272,27 +3272,39 @@ static void index_large(void) {
         large_ends[i] = large_starts[i] + (uintptr_t)payload_bytes(header_of((void *)large_starts[i]));
 }
 
-/* The object starts of a nursery block, by walking it (once per collection). */
+/* The object starts of a nursery block, by walking it: once per collection, and a block still filling (objects are only
+   ever added at its end) is walked on from where the last walk stopped, so registering each new object (a finalizer)
+   costs its own object, not the whole block again. */
 static void block_starts(NurseryBlock *block, size_t index) {
-    if (block->starts)
-        return;
-    size_t capacity = 64, count = 0;
-    uint32_t *starts = (uint32_t *)malloc(capacity * sizeof(uint32_t));
+    uint32_t count = block->start_count, capacity = block->start_capacity;
+    uint32_t *starts = block->starts;
+    if (!starts) {
+        count = 0;
+        capacity = 64;
+        starts = (uint32_t *)malloc(capacity * sizeof(uint32_t));
+        if (!starts)
+            fail_alloc();
+        block->starts_used = 0;
+    }
     char *base = block_start(index);
-    for (uint32_t at = 0; at < block->used;) {
+    uint32_t at = block->starts_used;
+    while (at < block->used) {
         GcHeader *header = (GcHeader *)(base + at);
         if (!header->type)
-            break;
+            break;  /* not written yet (another thread's object): the next walk starts here */
         if (count == capacity) {
             capacity *= 2;
             starts = (uint32_t *)realloc(starts, capacity * sizeof(uint32_t));
+            if (!starts)
+                fail_alloc();
         }
         starts[count++] = at;
         at += (uint32_t)total_bytes(payload_bytes(header));
     }
     block->starts = starts;
-    block->start_count = (uint32_t)count;
-    block->starts_used = block->used;
+    block->start_count = count;
+    block->start_capacity = capacity;
+    block->starts_used = at;
 }
 
 static size_t *walked_blocks;
@@ -3341,10 +3353,6 @@ static void *nursery_object(uintptr_t address) {
     refresh_block_used(index);
     if (offset >= block->used)
         return NULL;
-    if (block->starts && block->starts_used != block->used) {
-        free(block->starts);
-        block->starts = NULL;
-    }
     if (!block->starts) {
         block_starts(block, index);
         if (walked_count == walked_capacity) {
@@ -3352,6 +3360,8 @@ static void *nursery_object(uintptr_t address) {
             walked_blocks = (size_t *)realloc(walked_blocks, walked_capacity * sizeof(size_t));
         }
         walked_blocks[walked_count++] = index;
+    } else if (block->starts_used < block->used) {
+        block_starts(block, index);  /* the objects made since the last walk */
     }
     /* The last start at or before the offset. */
     uint32_t low = 0, high = block->start_count;
