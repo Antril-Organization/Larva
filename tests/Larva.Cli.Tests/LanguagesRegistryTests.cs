@@ -260,6 +260,28 @@ public sealed class LanguagesRegistryTests
         Assert.Contains("sub/notes.txt is not among its `files`", world.Larva.Fails("languages"));
     }
 
+    [Fact]
+    public void Packs_with_malformed_manifests_are_skipped_with_a_warning()
+    {
+        var world = new LanguageWorld("languages-malformed");
+        world.LocalPack("Antril");
+        string bad = Path.Combine(world.Root, "packs", "Bad");
+        Directory.CreateDirectory(bad);
+        foreach (string manifest in new[] { """{"id":"bad","abi":"one","entry":"x.dll"}""", """{"id":"bad","abi":1,"entry":"x.dll","extensions":[1]}""", """{"id":"bad","files":["x.dll"]}""", """{"id":5}""", "[1, 2]", "{not json" })
+        {
+            File.WriteAllText(Path.Combine(bad, "language.json"), manifest);
+            string output = world.Larva.Ok("languages");
+            Assert.DoesNotContain("Unhandled exception", output);
+            Assert.Contains("warning: a language pack was skipped", output);
+            Assert.Contains("Antril", output);
+        }
+        // Builds go on with the packs that can be read.
+        File.WriteAllText(Path.Combine(world.Root, "Main.ant"), "Main() : i32 => 0;\n");
+        string built = world.Larva.Ok("build", "--check", "Main.ant");
+        Assert.Contains("warning: a language pack was skipped", built);
+        Assert.DoesNotContain("Unhandled exception", built);
+    }
+
     private static int FreePort()
     {
         var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);

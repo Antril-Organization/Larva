@@ -65,21 +65,51 @@ internal sealed unsafe class LanguagePack
     private delegate* unmanaged<byte*, void> free;
     private JsonObject? info;
 
-    /// <summary>The pack in <paramref name="folder"/> (its manifest read, nothing checked or loaded yet), or null with why.</summary>
+    /// <summary>
+    /// The pack in <paramref name="folder"/> (its manifest read and of the right shape, nothing checked or loaded yet), or
+    /// null with why. A manifest that is not JSON, not an object, or has a field of the wrong kind is a broken pack, never
+    /// a crash: the fields are read without further checks afterwards.
+    /// </summary>
     public static LanguagePack? Read(string folder, out string? problem, bool fromRegistry = false)
     {
         problem = null;
         string path = Path.Combine(folder, ManifestName);
         try
         {
-            if (JsonNode.Parse(File.ReadAllBytes(path)) is JsonObject manifest)
+            if (JsonNode.Parse(File.ReadAllBytes(path)) is not JsonObject manifest)
+                problem = $"{path}: not a JSON object";
+            else if (Malformed(manifest) is { } malformed)
+                problem = $"{path}: {malformed}";
+            else
                 return new LanguagePack { Folder = Path.GetFullPath(folder), Manifest = manifest, FromRegistry = fromRegistry };
-            problem = $"{path}: not a JSON object";
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or JsonException)
         {
             problem = $"{path}: {e.Message}";
         }
+        return null;
+    }
+
+    /// <summary>What is wrong with the kinds of a manifest's fields, or null.</summary>
+    private static string? Malformed(JsonObject manifest)
+    {
+        static bool IsText(JsonNode? node) => node is JsonValue value && value.TryGetValue<string>(out _);
+        foreach (string key in new[] { "id", "name", "version", "description", "author", "license", "homepage", "entry", "larva", "icon", "publicKey", "fingerprint", "signature" })
+        {
+            if (manifest[key] is { } node && !IsText(node))
+                return $"`{key}` is not text";
+        }
+        foreach (string key in new[] { "abi", "hir" })
+        {
+            if (manifest[key] is { } node && !(node is JsonValue value && value.TryGetValue<int>(out _)))
+                return $"`{key}` is not a whole number";
+        }
+        if (manifest["extensions"] is { } extensions && (extensions is not JsonArray list || list.Any(e => !IsText(e))))
+            return "`extensions` is not a list of text";
+        if (manifest["files"] is { } files && (files is not JsonObject hashes || hashes.Any(h => !IsText(h.Value))))
+            return "`files` is not an object of file: hash";
+        if (manifest["registry"] is { } registry && registry is not JsonObject)
+            return "`registry` is not an object";
         return null;
     }
 
@@ -372,7 +402,7 @@ internal static class LanguageRegistry
         }
     }
 
-    /// <summary>Manifests that could not be read.</summary>
+    /// <summary>Packs that could not be read (their manifests missing, not JSON or malformed): skipped, and said once as warnings.</summary>
     public static IReadOnlyList<string> Problems
     {
         get

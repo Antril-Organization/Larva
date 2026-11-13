@@ -132,8 +132,7 @@ internal static class LanguagesCommand
     private static int List()
     {
         Console.OutputEncoding = new UTF8Encoding(false);
-        foreach (string problem in LanguageRegistry.Problems)
-            Console.Error.WriteLine($"larva: {problem}");
+        // Packs that could not be read were said as warnings when larva started.
         if (LanguageRegistry.All.Count == 0)
         {
             Console.WriteLine($"no language pack installed (looked in {string.Join(", ", LanguageRegistry.Folders)})");
