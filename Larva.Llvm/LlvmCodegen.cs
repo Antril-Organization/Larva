@@ -1063,7 +1063,8 @@ namespace Larva.Llvm
             }
             // A body that never returns (it only throws, panics or loops): `noreturn` on the declaration too, so callers in
             // other objects of a partitioned program know their failure paths end there (LLVM infers it only from a body).
-            if (!function.IsDeclaration && function.Blocks.Length > 0 && !function.Blocks.Any(x => x.Terminator is ReturnTerminator))
+            // Not with flag exceptions (WebAssembly, POSIX): there a throw sets the flag and returns to the caller.
+            if (!flagExceptions && !function.IsDeclaration && function.Blocks.Length > 0 && !function.Blocks.Any(x => x.Terminator is ReturnTerminator))
                 AddParameterAttribute(functions[index], -1, "noreturn");
             // The borrow checker guarantees what `noalias` promises: no other access while a borrow is alive.
             if (noalias)
