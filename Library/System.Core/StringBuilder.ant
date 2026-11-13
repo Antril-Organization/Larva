@@ -43,6 +43,15 @@ into namespace System
 				return this;
 			}
 
+			/// Adds `count` bytes of the text from `start`.
+			Append(str text, i32 start, i32 count) : StringBuilder
+			{
+				Reserve(count < 0 ? 0 : count);
+				text.CopyTo(start, buffer, length, count);
+				length += count;
+				return this;
+			}
+
 			/// Adds one character (a UTF-16 code unit, as character literals are), in UTF-8.
 			Append(u16 unit) : StringBuilder
 			{
