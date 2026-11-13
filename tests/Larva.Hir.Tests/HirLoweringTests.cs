@@ -35,6 +35,10 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         ("Rethrow", -4, -12, "rethrow from a catch, caught again"),
         ("Nulls", null, 12, "null, ?? and == null"),
         ("Statics", null, 8, "static fields"),
+        ("CheckedLambda", 5, 6, "a lambda inside checked { } adds"),
+        ("CheckedLambda", int.MaxValue, -1, "a lambda inside checked { } is checked: its overflow is caught"),
+        ("CheckedFloatMin", int.MinValue, int.MinValue, "checked f32 → i32 accepts the smallest i32"),
+        ("CheckedFloatBelow", -(1 << 30) - 128, 7, "checked f32 → i32 rejects the f32 below the smallest i32"),
     ];
 
     /// <summary>The benchmark program lowered once, for the facts that run it and build executables of it.</summary>

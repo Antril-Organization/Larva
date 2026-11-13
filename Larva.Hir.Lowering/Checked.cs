@@ -148,10 +148,18 @@ namespace Larva.Hir.Lowering
             if (from.IsFloat)
             {
                 // In range: above the value below the smallest, below the value past the largest (NaN is neither).
-                var low = to.IsSigned ? -System.Numerics.BigInteger.Pow(2, bits - 1) - 1 : System.Numerics.BigInteger.MinusOne;
+                // The value past the largest is a power of two, exact in every float type; the one below the smallest
+                // (−2ⁿ − 1) is not when the type's mantissa is shorter than n: rounded it would be the smallest itself and
+                // `above` would reject it, so then the test is `≥ the smallest` (and nothing lies between the two).
+                var min = to.IsSigned ? -System.Numerics.BigInteger.Pow(2, bits - 1) : System.Numerics.BigInteger.Zero;
+                var low = min - 1;
                 var high = to.IsSigned ? System.Numerics.BigInteger.Pow(2, bits - 1) : System.Numerics.BigInteger.Pow(2, bits);
+                var format = FloatFormat.Of(from.BitWidth!.Value);
+                bool lowExact = (System.Numerics.BigInteger)(double)low == low && SoftFloat.ToDouble(SoftFloat.FromDouble((double)low, format), format) == (double)low;
                 int above = Temp(IrType.Bool), below = Temp(IrType.Bool), inside = Temp(IrType.Bool);
-                b.Assign(above, Rvalue.Binary(BinaryOp.Gt, Operand.Copy(x), FloatConstant((double)low, from)))
+                b.Assign(above, lowExact
+                    ? Rvalue.Binary(BinaryOp.Gt, Operand.Copy(x), FloatConstant((double)low, from))
+                    : Rvalue.Binary(BinaryOp.Ge, Operand.Copy(x), FloatConstant((double)min, from)))
                  .Assign(below, Rvalue.Binary(BinaryOp.Lt, Operand.Copy(x), FloatConstant((double)high, from)))
                  .Assign(inside, Rvalue.Binary(BinaryOp.And, Operand.Copy(above), Operand.Copy(below)))
                  .Assign(bad, Rvalue.Unary(UnaryOp.Not, Operand.Copy(inside)));

@@ -673,6 +673,7 @@ namespace Larva.Hir.Lowering
             method = outer.method;
             context = outer.context;
             closures = outer.closures!;
+            overflowChecks = outer.overflowChecks; // a lambda written inside `checked { }` is checked too
             lambda = index;
             var scan = closures.Scan;
             var hir = scan.Lambdas[index];

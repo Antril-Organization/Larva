@@ -220,6 +220,40 @@ internal static class HirPrograms
         }
         // Statics(): Counter = 5; Counter += 3; return Counter;
         M("Statics").Do(S(Set(C, Int(5))), S(AddTo(C, Int(3))), Ret(C)).Done();
+
+        // static class System.Fail { static Overflow() { throw new Error(99); } }: what `checked` calls when a value does not fit.
+        var failDef = new TypeDef { Namespace = "System", Name = "Fail", Kind = TypeKind.Class, Flags = TypeFlags.Static | TypeFlags.Abstract };
+        var fail = p.Assembly.Add(failDef);
+        HirProgram.Method(fail, failDef, "Overflow", HirType.Void, MethodFlags.Static);
+        new MethodBuilder(failDef.Methods[^1]).Do(Throw(New(E_, errorNew, Int(99)))).Done();
+
+        // CheckedLambda(n): checked { f = x => x + 1; try { return f(n); } catch (Error e) { return -1; } } return 0;
+        {
+            var m = M("CheckedLambda", n);
+            var fType = new FuncType([I], I);
+            var f = m.Local("f", fType);
+            var lx = m.Local("x", I);
+            var e = m.Local("e", E_);
+            m.Do(new H.CheckedStmt(Blk(
+                    Let(f, new LambdaExpr([lx.Local], Ret(Add(lx, Int(1))), fType)),
+                    Try(Blk(Ret(new InvokeExpr(f, [Arg(0)], I))), [new H.CatchClause(E_, e.Local, null, Blk(Ret(Int(-1))))])), Checked: true),
+                Ret(Int(0))).Done();
+        }
+        // CheckedFloatMin(n): try { return checked((i32)(f32)n); } catch (Error e) { return 7; }  — with n the smallest i32: it fits (f32 cannot write the value below it)
+        // CheckedFloatBelow(n): try { return checked((i32)((f32)n * 2)); } catch (Error e) { return 7; }  — n = -(2³⁰ + 128): the next f32 down does not
+        // (the values come from the argument so nothing folds the test away)
+        {
+            var f32 = new PrimitiveType(Primitive.F32);
+            ConvertExpr ToF32(Expr value) => new(value, ConversionKind.Numeric, f32);
+            CheckedExpr ToI32(Expr value) => new(new ConvertExpr(value, ConversionKind.Numeric, I), Checked: true, I);
+            var two = new LiteralExpr(new FloatConstant(0x40000000, Primitive.F32), f32);
+            foreach (var (name, value) in new (string, Expr)[] { ("CheckedFloatMin", ToF32(Arg(0))), ("CheckedFloatBelow", Mul(ToF32(Arg(0)), two)) })
+            {
+                var m = M(name, n);
+                var e = m.Local("e", E_);
+                m.Do(Try(Blk(Ret(ToI32(value))), [new H.CatchClause(E_, e.Local, null, Blk(Ret(Int(7))))]), Ret(Int(0))).Done();
+            }
+        }
         return p;
     }
 
