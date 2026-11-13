@@ -5,7 +5,7 @@ using static Larva.Wasm.WasmCodegen;
 
 namespace Larva.Wasm
 {
-    /// <summary>Compiles one function: frame slots in linear memory, a dispatch loop over the blocks.</summary>
+    /// <summary>Compiles one function: frame slots in linear memory; structured control flow, or a dispatch loop over the blocks.</summary>
     internal sealed class WasmFunctionCompiler
     {
         // Wasm locals: the two parameters, then the frame pointer, the dispatch state, an address, the caller's stack
@@ -17,7 +17,7 @@ namespace Larva.Wasm
         /// <summary>The GC of the function's domain (the program's, with one domain).</summary>
         private readonly GcConfig gc;
         private bool Has(GcCapabilities capability) => (gc.Capabilities & capability) != 0;
-        private readonly Code c = new();
+        private Code c = new();
         private readonly IrFunction function;
         private readonly IrModule module;
         private readonly TypeContext context;
@@ -102,76 +102,44 @@ namespace Larva.Wasm
             states = blocks + clauseLandings.Count;
             if (needsCleanup)
                 cleanupLanding = states++;
-
-            // Body: the dispatch loop, one nested block per state.
-            c.Loop();
-            for (int s = 0; s < states; s++)
-                c.Block();
-            c.LocalGet(State);
-            c.BrTable(states);
-            for (int b = 0; b < blocks; b++)
-            {
-                c.End();
-                caseIndex = b;
-                depth = 0;
-                var block = function.Blocks[b];
-                for (int s = 0; s < block.Statements.Length; s++)
-                {
-                    current = new Location(b, s);
-                    tempCursor = 0;
-                    Statement(block.Statements[s]);
-                }
-                current = new Location(b, block.Statements.Length);
-                tempCursor = 0;
-                Terminator(block.Terminator);
-            }
+            landingTargets = new int[clauseLandings.Count];
             foreach (var (target, landing) in clauseLandings)
+                landingTargets[landing - blocks] = target;
+
+            // Body: structured control flow when the graph is reducible (nearly always), else the dispatch loop.
+            int checks = cg.BoundsChecks, eliminated = cg.BoundsChecksEliminated;
+            if (PlanStructured())
             {
-                c.End();
-                caseIndex = landing;
-                depth = 0;
-                // The exception in flight is now the one being handled; the one handled before (if any) is finished.
-                FreeCaught();
-                c.LocalGet(Fp);
-                c.GlobalGet(InFlight);
-                c.I64ExtendI32U();
-                c.I64Store(caughtPayload);
-                c.LocalGet(Fp);
-                c.GlobalGet(ExceptionType);
-                c.I64ExtendI32U();
-                c.I64Store(caughtType);
-                c.I32(0);
-                c.GlobalSet(InFlight);
-                JumpTo(target);
+                try
+                {
+                    DoTree(0);
+                    c.Unreachable();
+                }
+                catch (IrreducibleException)
+                {
+                    // Not expected (the plan checked the graph): the dispatch loop takes any graph.
+                    structured = false;
+                    c = new Code();
+                    labels.Clear();
+                    (cg.BoundsChecks, cg.BoundsChecksEliminated) = (checks, eliminated);
+                }
             }
-            if (needsCleanup)
+            if (!structured)
             {
+                // The dispatch loop, one nested block per state.
+                c.Loop();
+                for (int s = 0; s < states; s++)
+                    c.Block();
+                c.LocalGet(State);
+                c.BrTable(states);
+                for (int s = 0; s < states; s++)
+                {
+                    c.End();
+                    EmitState(s);
+                }
                 c.End();
-                caseIndex = cleanupLanding;
-                depth = 0;
-                tempCursor = 0;
-                for (int l = 0; l < function.Locals.Length; l++)
-                    ReleaseOwned(new Place(l), []);
-                if (handles)
-                    FreeCaught();
-                foreach (var pin in pins.Values)
-                {
-                    c.LocalGet(Fp);
-                    c.I64Load(pin);
-                    c.I32WrapI64();
-                    c.Call(cg.Runtime("larva_unpin"));
-                }
-                if (regionDepth != int.MinValue)
-                {
-                    c.LocalGet(Fp);
-                    c.I64Load(regionDepth);
-                    c.I32WrapI64();
-                    c.Call(cg.Runtime("larva_region_unwind"));
-                }
-                Leave(); // the exception goes on to the caller
+                c.Unreachable();
             }
-            c.End();
-            c.Unreachable();
 
             // Prologue: the frame, the stack check, the arguments, drop flags and exception slots.
             int frameSize = Align(frame, 16);
@@ -230,11 +198,314 @@ namespace Larva.Wasm
             return (Locals, p);
         }
 
+        /// <summary>The code of one state: a block's statements and terminator, a catch landing, or the cleanup landing.</summary>
+        private void EmitState(int state)
+        {
+            caseIndex = state;
+            depth = 0;
+            int blocks = function.Blocks.Length;
+            if (state < blocks)
+            {
+                var block = function.Blocks[state];
+                for (int s = 0; s < block.Statements.Length; s++)
+                {
+                    current = new Location(state, s);
+                    tempCursor = 0;
+                    Statement(block.Statements[s]);
+                }
+                current = new Location(state, block.Statements.Length);
+                tempCursor = 0;
+                Terminator(block.Terminator);
+            }
+            else if (state != cleanupLanding)
+            {
+                // The exception in flight is now the one being handled; the one handled before (if any) is finished.
+                FreeCaught();
+                c.LocalGet(Fp);
+                c.GlobalGet(InFlight);
+                c.I64ExtendI32U();
+                c.I64Store(caughtPayload);
+                c.LocalGet(Fp);
+                c.GlobalGet(ExceptionType);
+                c.I64ExtendI32U();
+                c.I64Store(caughtType);
+                c.I32(0);
+                c.GlobalSet(InFlight);
+                JumpTo(landingTargets[state - blocks]);
+            }
+            else
+            {
+                tempCursor = 0;
+                for (int l = 0; l < function.Locals.Length; l++)
+                    ReleaseOwned(new Place(l), []);
+                if (handles)
+                    FreeCaught();
+                foreach (var pin in pins.Values)
+                {
+                    c.LocalGet(Fp);
+                    c.I64Load(pin);
+                    c.I32WrapI64();
+                    c.Call(cg.Runtime("larva_unpin"));
+                }
+                if (regionDepth != int.MinValue)
+                {
+                    c.LocalGet(Fp);
+                    c.I64Load(regionDepth);
+                    c.I32WrapI64();
+                    c.Call(cg.Runtime("larva_region_unwind"));
+                }
+                Leave(); // the exception goes on to the caller
+            }
+        }
+
+        // ── Structured control flow ────────────────────────────
+        //
+        // For a reducible graph (every loop entered only at its header) the code is nested blocks, loops and ifs, the
+        // translation of "Beyond Relooper" (Ramsey, 2022): over the dominator tree, a state's code is wrapped in one
+        // `block` per child that is a merge node (entered by two forward jumps or more; the innermost block for the
+        // earliest in reverse postorder), each child's code following its block's `end`, and in a `loop` when the state is
+        // a loop header. A jump backward (to a loop header) or to a merge node is a `br` to its label; any other jump goes
+        // to a state that only that jump enters, whose code is emitted in its place. Each state's code is emitted once.
+
+        private sealed class IrreducibleException : Exception;
+
+        private enum LabelKind : byte { If, Block, Loop }
+
+        private bool structured;
+        private int[] landingTargets = [];
+        private int[] order = [];               // reverse postorder number of each state (-1: unreachable)
+        private bool[] merge = [], loopHeader = [];
+        private List<int>[] mergeChildren = [];
+        private int node = -1;                  // the state whose code is being emitted
+        private readonly List<(LabelKind Kind, int State)> labels = [];
+
+        /// <summary>The jumps of a state's code, in the order <see cref="EmitState"/> makes them (repeats included).</summary>
+        private List<int> Successors(int state)
+        {
+            var targets = new List<int>();
+            int blocks = function.Blocks.Length;
+            void Dispatching(CatchClause[]? handlers)
+            {
+                foreach (var clause in handlers ?? [])
+                {
+                    targets.Add(clauseLandings[clause.Block]);
+                    if (clause.Type is null)
+                        return;
+                }
+                if (handlers is not null && needsCleanup)
+                    targets.Add(cleanupLanding);
+            }
+            if (state == cleanupLanding)
+                return targets;
+            if (state >= blocks)
+            {
+                targets.Add(landingTargets[state - blocks]);
+                return targets;
+            }
+            switch (function.Blocks[state].Terminator)
+            {
+                case GotoTerminator jump: targets.Add(jump.Target); break;
+                case IfTerminator branch: targets.Add(branch.Else); targets.Add(branch.Then); break;
+                case SwitchTerminator @switch: targets.AddRange(@switch.Targets); targets.Add(@switch.Otherwise); break;
+                case CallTerminator call: Dispatching(call.Handlers); targets.Add(call.Target); break;
+                case ThrowTerminator @throw: Dispatching(@throw.Handlers); break;
+                case ResumeTerminator resume: Dispatching(resume.Handlers); break;
+                case DropTerminator drop: targets.Add(drop.Target); break;
+            }
+            return targets;
+        }
+
+        /// <summary>Plans the structured translation: false when the graph is irreducible (the dispatch loop is used).</summary>
+        private bool PlanStructured()
+        {
+            var successors = new List<int>[states];
+            for (int s = 0; s < states; s++)
+                successors[s] = Successors(s);
+
+            // Reverse postorder (an iterative depth-first search from the entry, state 0).
+            order = new int[states];
+            Array.Fill(order, -1);
+            var postorder = new List<int>(states);
+            var visited = new bool[states];
+            var stack = new Stack<(int State, int Next)>();
+            stack.Push((0, 0));
+            visited[0] = true;
+            while (stack.Count > 0)
+            {
+                var (state, next) = stack.Pop();
+                if (next < successors[state].Count)
+                {
+                    stack.Push((state, next + 1));
+                    int target = successors[state][next];
+                    if (!visited[target])
+                    {
+                        visited[target] = true;
+                        stack.Push((target, 0));
+                    }
+                }
+                else
+                {
+                    postorder.Add(state);
+                }
+            }
+            int reachable = postorder.Count;
+            var byOrder = new int[reachable];
+            for (int i = 0; i < reachable; i++)
+            {
+                int state = postorder[reachable - 1 - i];
+                order[state] = i;
+                byOrder[i] = state;
+            }
+
+            // Immediate dominators (Cooper, Harvey and Kennedy), over the reachable states.
+            var predecessors = new List<int>[states];
+            for (int s = 0; s < states; s++)
+                predecessors[s] = [];
+            foreach (int s in byOrder)
+            {
+                foreach (int t in successors[s])
+                    predecessors[t].Add(s);
+            }
+            var idom = new int[states];
+            Array.Fill(idom, -1);
+            idom[0] = 0;
+            int Intersect(int a, int b)
+            {
+                while (a != b)
+                {
+                    while (order[a] > order[b])
+                        a = idom[a];
+                    while (order[b] > order[a])
+                        b = idom[b];
+                }
+                return a;
+            }
+            for (bool changed = true; changed;)
+            {
+                changed = false;
+                for (int i = 1; i < reachable; i++)
+                {
+                    int state = byOrder[i], best = -1;
+                    foreach (int p in predecessors[state])
+                    {
+                        if (idom[p] >= 0)
+                            best = best < 0 ? p : Intersect(p, best);
+                    }
+                    if (best >= 0 && idom[state] != best)
+                    {
+                        idom[state] = best;
+                        changed = true;
+                    }
+                }
+            }
+            bool Dominates(int a, int b)
+            {
+                while (b != a && b != 0)
+                    b = idom[b];
+                return b == a;
+            }
+
+            // Loop headers (targets of backward jumps, which must dominate where they come from) and merge nodes.
+            merge = new bool[states];
+            loopHeader = new bool[states];
+            var forwardIn = new int[states];
+            foreach (int s in byOrder)
+            {
+                foreach (int t in successors[s])
+                {
+                    if (order[t] <= order[s])
+                    {
+                        if (!Dominates(t, s))
+                            return false; // irreducible: a loop entered elsewhere than at its header
+                        loopHeader[t] = true;
+                    }
+                    else
+                    {
+                        forwardIn[t]++;
+                    }
+                }
+            }
+            mergeChildren = new List<int>[states];
+            for (int s = 0; s < states; s++)
+                mergeChildren[s] = [];
+            foreach (int s in byOrder)
+            {
+                merge[s] = forwardIn[s] >= 2;
+                if (merge[s])
+                    mergeChildren[idom[s]].Add(s);
+            }
+            foreach (var children in mergeChildren)
+                children.Sort((a, b) => order[b].CompareTo(order[a])); // the latest first: the outermost block
+            structured = true;
+            return true;
+        }
+
+        private void DoTree(int state)
+        {
+            if (loopHeader[state])
+            {
+                c.Loop();
+                labels.Add((LabelKind.Loop, state));
+                NodeWithin(state, 0);
+                labels.RemoveAt(labels.Count - 1);
+                c.End();
+            }
+            else
+            {
+                NodeWithin(state, 0);
+            }
+        }
+
+        private void NodeWithin(int state, int child)
+        {
+            var children = mergeChildren[state];
+            if (child == children.Count)
+            {
+                int outer = node;
+                node = state;
+                EmitState(state);
+                node = outer;
+                return;
+            }
+            c.Block();
+            labels.Add((LabelKind.Block, children[child]));
+            NodeWithin(state, child + 1);
+            labels.RemoveAt(labels.Count - 1);
+            c.End();
+            DoTree(children[child]);
+        }
+
+        /// <summary>A jump in structured code: a `br` to the target's label, or the target's code in its place.</summary>
+        private void StructuredJump(int state)
+        {
+            if (order[state] <= order[node] || merge[state])
+            {
+                for (int i = labels.Count - 1; i >= 0; i--)
+                {
+                    if (labels[i].State == state && labels[i].Kind != LabelKind.If)
+                    {
+                        c.Br(labels.Count - 1 - i);
+                        return;
+                    }
+                }
+                throw new IrreducibleException();
+            }
+            // Only this jump enters the target: its code goes here, and the code around it carries on as it was.
+            var (savedCurrent, savedCursor, savedCase, savedDepth) = (current, tempCursor, caseIndex, depth);
+            DoTree(state);
+            (current, tempCursor, caseIndex, depth) = (savedCurrent, savedCursor, savedCase, savedDepth);
+        }
+
         // ── Control ────────────────────────────────────────────
 
-        /// <summary>Continues at another state (block or landing) through the dispatch loop.</summary>
+        /// <summary>Continues at another state (block or landing): structured, or through the dispatch loop.</summary>
         private void JumpTo(int state)
         {
+            if (structured)
+            {
+                StructuredJump(state);
+                return;
+            }
             c.I32(state);
             c.LocalSet(State);
             c.Br(states - 1 - caseIndex + depth);
@@ -244,12 +515,14 @@ namespace Larva.Wasm
         {
             c.If();
             depth++;
+            labels.Add((LabelKind.If, -1));
         }
 
         private void CloseIf()
         {
             c.End();
             depth--;
+            labels.RemoveAt(labels.Count - 1);
         }
 
         /// <summary>Returns to the caller: the result to where it asked, the stack pointer back.</summary>

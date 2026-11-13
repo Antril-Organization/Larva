@@ -122,6 +122,68 @@ public sealed class WasmTests : CheckedTest
             text.Contains("larva_f64_rem") && text.Contains("larva_print_f64") && !text.Contains("larva_gc_new") && !text.Contains("larva_mulhi_u64"), text.Length.ToString());
     }
 
+    /// <summary>
+    /// Control flow is structured (blocks, loops and ifs) when the graph is reducible: nested loops, a switch whose cases
+    /// meet again, a loop left from two places. A loop entered in two places (irreducible) takes the dispatch loop.
+    /// </summary>
+    [Fact]
+    public void Reducible_and_irreducible_control_flow_run_alike()
+    {
+        // for i in 0..3 { for j in 0..i+1 { switch (i + j) % 3 { 0: s += 1; 1: s += 10; else: s += 100 } } if s > 150 break }
+        var f = new FunctionBuilder("main", IrType.Unit);
+        int i = f.Local(IrType.I64, "i", mutable: true), j = f.Local(IrType.I64, "j", mutable: true), sum = f.Local(IrType.I64, "s", mutable: true);
+        int test = f.Temp(IrType.Bool), which = f.Temp(IrType.I64);
+        int outer = f.NewBlock(), inner = f.NewBlock(), body = f.NewBlock(), zero = f.NewBlock(), one = f.NewBlock(), other = f.NewBlock();
+        int next = f.NewBlock(), innerDone = f.NewBlock(), done = f.NewBlock();
+        f.Assign(i, Int(0, IrType.I64)).Assign(sum, Int(0, IrType.I64)).Goto(outer);
+        f.At(outer);
+        f.Assign(test, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(3, IrType.I64))).Assign(j, Int(0, IrType.I64)).If(Copy(test), inner, done);
+        f.At(inner);
+        f.Assign(test, Rvalue.Binary(BinaryOp.Le, Copy(j), Copy(i))).If(Copy(test), body, innerDone);
+        f.At(body);
+        f.Assign(which, Rvalue.Binary(BinaryOp.Add, Copy(i), Copy(j))).Assign(which, Rvalue.Binary(BinaryOp.Rem, Copy(which), Int(3, IrType.I64)))
+         .Switch(Copy(which), [zero, one], other);
+        foreach (var (block, add) in new[] { (zero, 1L), (one, 10L), (other, 100L) })
+        {
+            f.At(block);
+            f.Assign(sum, Rvalue.Binary(BinaryOp.Add, Copy(sum), Int(add, IrType.I64))).Goto(next);
+        }
+        f.At(next);
+        f.Assign(j, Rvalue.Binary(BinaryOp.Add, Copy(j), Int(1, IrType.I64))).Goto(inner);
+        f.At(innerDone);
+        Print(f, "print.i64", new UseRvalue(Copy(sum)));
+        f.Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64)))
+         .Assign(test, Rvalue.Binary(BinaryOp.Gt, Copy(sum), Int(150, IrType.I64))).If(Copy(test), done, outer);
+        f.At(done);
+        Print(f, "print.i64", new UseRvalue(Copy(i)));
+        f.Return();
+        var (exit, output, errors) = Node(new IrModule([], [f.Build()]) { Name = "reducible" });
+        Check("the reducible program runs", exit == 0, errors);
+        Check("sums 1, then 1+10+100, then 111+100+1+10 (over 150: the outer loop is left), i = 3", Lines(output).SequenceEqual(["1", "111", "222", "3"]), string.Join(" ", Lines(output)));
+
+        // Two ways into one loop: a → b → a … entered at a or at b.
+        foreach (bool atA in new[] { true, false })
+        {
+            var g = new FunctionBuilder("main", IrType.Unit);
+            int k = g.Local(IrType.I64, "k", mutable: true), flag = g.Local(IrType.Bool, "flag"), cond = g.Temp(IrType.Bool);
+            int a = g.NewBlock(), b = g.NewBlock(), end = g.NewBlock();
+            g.Assign(k, Int(0, IrType.I64)).Assign(flag, Bool(atA)).If(Copy(flag), a, b);
+            foreach (var (block, step, then) in new[] { (a, 1L, b), (b, 2L, a) })
+            {
+                g.At(block);
+                g.Assign(k, Rvalue.Binary(BinaryOp.Add, Copy(k), Int(step, IrType.I64)));
+                Print(g, "print.i64", new UseRvalue(Copy(k)));
+                g.Assign(cond, Rvalue.Binary(BinaryOp.Lt, Copy(k), Int(5, IrType.I64))).If(Copy(cond), then, end);
+            }
+            g.At(end);
+            g.Return();
+            (exit, output, errors) = Node(new IrModule([], [g.Build()]) { Name = "irreducible" });
+            Check($"the irreducible program runs (entered at {(atA ? "a" : "b")})", exit == 0, errors);
+            string[] expected = atA ? ["1", "3", "4", "6"] : ["2", "3", "5"];
+            Check($"entered at {(atA ? "a: 1 3 4 6" : "b: 2 3 5")}", Lines(output).SequenceEqual(expected), string.Join(" ", Lines(output)));
+        }
+    }
+
     /// <summary>Float `%` is fmod (the dividend's sign), through the runtime's `larva_f64_rem`; singles go through doubles exactly.</summary>
     [Fact]
     public void Float_remainder_is_fmod()
