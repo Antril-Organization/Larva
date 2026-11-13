@@ -456,11 +456,16 @@ internal static class LarvaVersion
     public static string Current { get; } = typeof(LarvaVersion).Assembly.GetCustomAttributes(typeof(AssemblyInformationalVersionAttribute), false)
         is [AssemblyInformationalVersionAttribute { InformationalVersion: var informational }, ..] ? informational.Split('+')[0] : "0.0.0";
 
-    /// <summary>Negative when <paramref name="a"/> is older than <paramref name="b"/>: numbers compared part by part.</summary>
+    /// <summary>
+    /// Negative when <paramref name="a"/> is older than <paramref name="b"/>, as semantic versioning orders them: the
+    /// numbers part by part; then a prerelease (<c>1.2.0-beta.1</c>) before its release (<c>1.2.0</c>); prereleases by
+    /// their dot-separated identifiers (numbers numerically and before words, words in ASCII order, fewer identifiers
+    /// first); build metadata (<c>+…</c>) ignored.
+    /// </summary>
     public static int Compare(string a, string b)
     {
-        var x = a.TrimStart('v', '>', '=', '^').Split('.', '-');
-        var y = b.TrimStart('v', '>', '=', '^').Split('.', '-');
+        var (x, xPre) = Split(a);
+        var (y, yPre) = Split(b);
         for (int i = 0; i < Math.Max(x.Length, y.Length); i++)
         {
             int p = i < x.Length && int.TryParse(x[i], out var px) ? px : 0;
@@ -468,6 +473,27 @@ internal static class LarvaVersion
             if (p != q)
                 return p.CompareTo(q);
         }
-        return 0;
+        if (xPre is null || yPre is null)
+            return (xPre is null ? 1 : 0) - (yPre is null ? 1 : 0);
+        var xs = xPre.Split('.');
+        var ys = yPre.Split('.');
+        for (int i = 0; i < Math.Min(xs.Length, ys.Length); i++)
+        {
+            bool xn = int.TryParse(xs[i], out var xv), yn = int.TryParse(ys[i], out var yv);
+            int order = xn && yn ? xv.CompareTo(yv) : xn != yn ? (xn ? -1 : 1) : string.CompareOrdinal(xs[i], ys[i]);
+            if (order != 0)
+                return order;
+        }
+        return xs.Length.CompareTo(ys.Length);
+    }
+
+    /// <summary>The numbers of a version and its prerelease (null when it is a release), without build metadata.</summary>
+    private static (string[] Numbers, string? Prerelease) Split(string version)
+    {
+        string text = version.TrimStart('v', '>', '=', '^');
+        if (text.IndexOf('+') is var plus && plus >= 0)
+            text = text[..plus];
+        int dash = text.IndexOf('-');
+        return dash < 0 ? (text.Split('.'), null) : (text[..dash].Split('.'), text[(dash + 1)..]);
     }
 }

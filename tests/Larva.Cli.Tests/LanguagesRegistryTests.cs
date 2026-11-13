@@ -282,6 +282,30 @@ public sealed class LanguagesRegistryTests
         Assert.DoesNotContain("Unhandled exception", built);
     }
 
+    /// <summary>A prerelease is older than its release: it is neither installed over it nor offered as an update to it.</summary>
+    [Fact]
+    public void Prereleases_sort_below_their_release()
+    {
+        var world = new LanguageWorld("languages-prerelease");
+        world.Approve("1.0.0-beta.1");
+        world.Approve("1.0.0");
+        var index = JsonNode.Parse(File.ReadAllText(Path.Combine(world.Registry, "antril", "index.json")))!;
+        Assert.Equal(["1.0.0-beta.1", "1.0.0"], index["versions"]!.AsArray().Select(v => (string?)v!["version"]).ToArray());
+        Assert.Contains("installed Antril 1.0.0", world.Larva.Ok("languages", "install", "antril", "--provider", world.Registry));
+
+        world.Approve("1.0.1-rc.2");
+        world.Approve("1.0.1-rc.10");
+        world.Approve("1.0.1-alpha");
+        index = JsonNode.Parse(File.ReadAllText(Path.Combine(world.Registry, "antril", "index.json")))!;
+        Assert.Equal(["1.0.0-beta.1", "1.0.0", "1.0.1-alpha", "1.0.1-rc.2", "1.0.1-rc.10"], index["versions"]!.AsArray().Select(v => (string?)v!["version"]).ToArray());
+        Assert.Contains("(was 1.0.0)", world.Larva.Ok("languages", "update", "antril", "--provider", world.Registry));
+        Assert.Equal("1.0.1-rc.10", (string?)LanguageWorld.Manifest(Path.Combine(world.User, "antril"))["version"]);
+        world.Approve("1.0.1");
+        Assert.Contains("(was 1.0.1-rc.10)", world.Larva.Ok("languages", "update", "antril", "--provider", world.Registry));
+        world.Approve("1.0.1-rc.11");
+        Assert.Contains("up to date", world.Larva.Ok("languages", "update", "antril", "--provider", world.Registry));
+    }
+
     private static int FreePort()
     {
         var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
