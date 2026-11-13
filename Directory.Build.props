@@ -3,4 +3,17 @@
   <PropertyGroup>
     <Optimize>true</Optimize>
   </PropertyGroup>
+
+  <!--
+    The compiler's passes run in the published, natively compiled (trimmed) larva: reflection there sees only what the
+    trimmer kept, so a pass that walks objects by reflection silently does nothing (iterators and async once compiled
+    wrong that way). Every build of these libraries runs the trim and AOT analyzers, and what they find is an error.
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'Larva.IL' Or '$(MSBuildProjectName)' == 'Larva.IR' Or '$(MSBuildProjectName)' == 'Larva.Hir'
+      Or '$(MSBuildProjectName)' == 'Larva.Hir.Lowering' Or '$(MSBuildProjectName)' == 'Larva.Hir.Services' Or '$(MSBuildProjectName)' == 'Larva.Llvm'
+      Or '$(MSBuildProjectName)' == 'Larva.X64' Or '$(MSBuildProjectName)' == 'Larva.Wasm' Or '$(MSBuildProjectName)' == 'Larva.Driver'
+      Or '$(MSBuildProjectName)' == 'Larva.Build'">
+    <IsAotCompatible>true</IsAotCompatible>
+    <WarningsAsErrors>$(WarningsAsErrors);IL2026;IL2046;IL2057;IL2058;IL2059;IL2060;IL2062;IL2065;IL2067;IL2068;IL2069;IL2070;IL2071;IL2072;IL2073;IL2074;IL2075;IL2076;IL2077;IL2078;IL2079;IL2080;IL2087;IL2088;IL2089;IL2090;IL2091;IL2111;IL3050;IL3051</WarningsAsErrors>
+  </PropertyGroup>
 </Project>

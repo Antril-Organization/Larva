@@ -1,5 +1,3 @@
-using System.Reflection;
-
 namespace Larva.IR.Lowering
 {
     /// <summary>
@@ -313,67 +311,193 @@ namespace Larva.IR.Lowering
         }
 
         // ── Rewriting every place in a statement, terminator, rvalue or operand ──
-
-        private static readonly MethodInfo Clone = typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        private static readonly Dictionary<Type, PropertyInfo[]> Properties = [];
+        // Written out per record, without reflection: a trimmed, natively compiled larva keeps neither the property
+        // metadata nor the init setters a reflective walk needs, and such a walk would silently rewrite nothing.
 
         /// <summary>A copy of an IR record with <paramref name="map"/> applied to every <see cref="Place"/> in it.</summary>
-        private static object Map(object value, Func<Place, Place> map)
+        private static object Map(object value, Func<Place, Place> map) => value switch
         {
-            switch (value)
+            Statement statement => MapStatement(statement, map),
+            Terminator terminator => MapTerminator(terminator, map),
+            Rvalue rvalue => MapRvalue(rvalue, map),
+            Operand operand => MapOperand(operand, map),
+            Place place => map(place),
+            _ => throw new InvalidOperationException($"coroutines: cannot rewrite the places of a {value.GetType().Name}"),
+        };
+
+        private static Statement MapStatement(Statement statement, Func<Place, Place> map)
+        {
+            switch (statement)
             {
-                case Place place:
-                    return map(place);
-                case IrType or string or CatchClause or RequirementRef:
-                    return value;
-                case Array array:
+                case AssignStatement assign:
                 {
-                    var element = array.GetType().GetElementType()!;
-                    if (element.IsPrimitive || element == typeof(string) || typeof(IrType).IsAssignableFrom(element) || element == typeof(CatchClause))
-                        return value;
-                    Array? copy = null;
-                    for (int i = 0; i < array.Length; i++)
-                    {
-                        object? before = array.GetValue(i);
-                        object? after = before is null ? null : Map(before, map);
-                        if (ReferenceEquals(before, after))
-                            continue;
-                        copy ??= (Array)array.Clone();
-                        copy.SetValue(after, i);
-                    }
-                    return copy ?? array;
+                    var target = map(assign.Target);
+                    var value = MapRvalue(assign.Value, map);
+                    return ReferenceEquals(target, assign.Target) && ReferenceEquals(value, assign.Value) ? assign : assign with { Target = target, Value = value };
                 }
-                case Statement or Terminator or Rvalue or Operand:
+                case FreeStatement free:
                 {
-                    object? copy = null;
-                    foreach (var property in PropertiesOf(value.GetType()))
-                    {
-                        object? before = property.GetValue(value);
-                        if (before is null || before.GetType().IsPrimitive || before is Enum)
-                            continue;
-                        object after = Map(before, map);
-                        if (ReferenceEquals(before, after))
-                            continue;
-                        copy ??= Clone.Invoke(value, null);
-                        property.SetValue(copy, after);
-                    }
-                    return copy ?? value;
+                    var pointer = map(free.Pointer);
+                    return ReferenceEquals(pointer, free.Pointer) ? free : free with { Pointer = pointer };
                 }
+                case StoreGlobalStatement store:
+                {
+                    var value = MapOperand(store.Value, map);
+                    return ReferenceEquals(value, store.Value) ? store : store with { Value = value };
+                }
+                case StorageLiveStatement or StorageDeadStatement or NopStatement or RegionEnterStatement or RegionExitStatement:
+                    return statement;
                 default:
-                    return value;
+                    throw new InvalidOperationException($"coroutines: unknown statement {statement.GetType().Name}");
             }
         }
 
-        private static PropertyInfo[] PropertiesOf(Type type)
+        private static Terminator MapTerminator(Terminator terminator, Func<Place, Place> map)
         {
-            lock (Properties)
+            switch (terminator)
             {
-                if (!Properties.TryGetValue(type, out var found))
+                case IfTerminator i:
                 {
-                    found = [.. type.GetProperties(BindingFlags.Instance | BindingFlags.Public).Where(p => p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0)];
-                    Properties[type] = found;
+                    var condition = MapOperand(i.Condition, map);
+                    return ReferenceEquals(condition, i.Condition) ? i : i with { Condition = condition };
                 }
-                return found;
+                case SwitchTerminator s:
+                {
+                    var value = MapOperand(s.Value, map);
+                    return ReferenceEquals(value, s.Value) ? s : s with { Value = value };
+                }
+                case CallTerminator c:
+                {
+                    var arguments = MapOperands(c.Arguments, map);
+                    var destination = map(c.Destination);
+                    var callee = c.Callee is null ? null : MapOperand(c.Callee, map);
+                    return ReferenceEquals(arguments, c.Arguments) && ReferenceEquals(destination, c.Destination) && ReferenceEquals(callee, c.Callee)
+                        ? c : c with { Arguments = arguments, Destination = destination, Callee = callee };
+                }
+                case ThrowTerminator t:
+                {
+                    var value = MapOperand(t.Value, map);
+                    return ReferenceEquals(value, t.Value) ? t : t with { Value = value };
+                }
+                case DropTerminator d:
+                {
+                    var place = map(d.Place);
+                    return ReferenceEquals(place, d.Place) ? d : d with { Place = place };
+                }
+                case GotoTerminator or ReturnTerminator or ResumeTerminator or UnreachableTerminator:
+                    return terminator;
+                default:
+                    throw new InvalidOperationException($"coroutines: unknown terminator {terminator.GetType().Name}");
+            }
+        }
+
+        private static Operand[] MapOperands(Operand[] operands, Func<Place, Place> map)
+        {
+            Operand[]? copy = null;
+            for (int i = 0; i < operands.Length; i++)
+            {
+                var after = MapOperand(operands[i], map);
+                if (ReferenceEquals(after, operands[i]))
+                    continue;
+                copy ??= (Operand[])operands.Clone();
+                copy[i] = after;
+            }
+            return copy ?? operands;
+        }
+
+        private static Operand MapOperand(Operand operand, Func<Place, Place> map)
+        {
+            switch (operand)
+            {
+                case CopyOperand copy:
+                {
+                    var place = map(copy.Place);
+                    return ReferenceEquals(place, copy.Place) ? copy : copy with { Place = place };
+                }
+                case MoveOperand move:
+                {
+                    var place = map(move.Place);
+                    return ReferenceEquals(place, move.Place) ? move : move with { Place = place };
+                }
+                case ConstOperand:
+                    return operand;
+                default:
+                    throw new InvalidOperationException($"coroutines: unknown operand {operand.GetType().Name}");
+            }
+        }
+
+        private static Rvalue MapRvalue(Rvalue rvalue, Func<Place, Place> map)
+        {
+            Operand O(Operand operand) => MapOperand(operand, map);
+            switch (rvalue)
+            {
+                case UseRvalue u:
+                {
+                    var operand = O(u.Operand);
+                    return ReferenceEquals(operand, u.Operand) ? u : u with { Operand = operand };
+                }
+                case BinaryRvalue b:
+                {
+                    var left = O(b.Left);
+                    var right = O(b.Right);
+                    return ReferenceEquals(left, b.Left) && ReferenceEquals(right, b.Right) ? b : b with { Left = left, Right = right };
+                }
+                case UnaryRvalue u:
+                {
+                    var operand = O(u.Operand);
+                    return ReferenceEquals(operand, u.Operand) ? u : u with { Operand = operand };
+                }
+                case RefRvalue r:
+                {
+                    var place = map(r.Place);
+                    return ReferenceEquals(place, r.Place) ? r : r with { Place = place };
+                }
+                case CastRvalue c:
+                {
+                    var operand = O(c.Operand);
+                    return ReferenceEquals(operand, c.Operand) ? c : c with { Operand = operand };
+                }
+                case AllocRvalue a:
+                {
+                    var value = O(a.Value);
+                    var finalizer = a.Finalizer is null ? null : O(a.Finalizer);
+                    return ReferenceEquals(value, a.Value) && ReferenceEquals(finalizer, a.Finalizer) ? a : a with { Value = value, Finalizer = finalizer };
+                }
+                case ArrayRvalue a:
+                {
+                    var length = O(a.Length);
+                    return ReferenceEquals(length, a.Length) ? a : a with { Length = length };
+                }
+                case LenRvalue l:
+                {
+                    var array = map(l.Array);
+                    return ReferenceEquals(array, l.Array) ? l : l with { Array = array };
+                }
+                case HandleCastRvalue h:
+                {
+                    var handle = O(h.Handle);
+                    return ReferenceEquals(handle, h.Handle) ? h : h with { Handle = handle };
+                }
+                case WrapRvalue w:
+                {
+                    var value = O(w.Value);
+                    return ReferenceEquals(value, w.Value) ? w : w with { Value = value };
+                }
+                case IsNullRvalue n:
+                {
+                    var value = map(n.Value);
+                    return ReferenceEquals(value, n.Value) ? n : n with { Value = value };
+                }
+                case UnwrapRvalue u:
+                {
+                    var value = O(u.Value);
+                    return ReferenceEquals(value, u.Value) ? u : u with { Value = value };
+                }
+                case StaticRvalue or CaughtRvalue or SizeOfRvalue or ZeroRvalue or GlobalRvalue or TypeIdRvalue or ImplementationRvalue
+                    or ClassIdRvalue or InstancesRvalue or FunctionRefRvalue:
+                    return rvalue;
+                default:
+                    throw new InvalidOperationException($"coroutines: unknown rvalue {rvalue.GetType().Name}");
             }
         }
     }
