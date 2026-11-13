@@ -54,14 +54,17 @@ namespace Larva.IR.Analysis
             private readonly TypeContext context = TypeContext.For(function, module);
             private readonly MoveAnalysis moves = new(function, module);
             private readonly LoanAnalysis loans = new(function, module);
-            private readonly Liveness liveness = Liveness.Compute(function);
+            private Liveness? liveness; // computed when a local first holds a loan (see ActiveLoans)
             private readonly List<BorrowError> errors = [];
             private readonly HashSet<(Location, BorrowErrorKind, string)> reported = [];
 
             public List<BorrowError> Run()
             {
                 var moveEntries = Dataflow.Forward(function, moves);
-                var loanEntries = Dataflow.Forward(function, loans);
+                // Without a `&` / `&mut` there are no loans: no local holds one, at any point.
+                var loanEntries = loans.Loans.Count == 0
+                    ? [.. moveEntries.Select(entry => entry is null ? null : loans.Entry())]
+                    : Dataflow.Forward(function, loans);
 
                 for (int b = 0; b < function.Blocks.Length; b++)
                 {
@@ -399,13 +402,21 @@ namespace Larva.IR.Analysis
 
             // ── Helpers ────────────────────────────────────────────
 
-            /// <summary>Loans held by locals that are live before <paramref name="location"/>.</summary>
-            private IReadOnlyList<Loan> ActiveLoans(Location location, LoanState state) =>
-                [.. liveness.LiveBefore(location)
-                    .SelectMany(state.LoansOf)
-                    .Distinct()
-                    .Order()
-                    .Select(id => loans.Loans[id])];
+            /// <summary>Loans held by locals that are live before <paramref name="location"/>, in loan order.</summary>
+            private IReadOnlyList<Loan> ActiveLoans(Location location, LoanState state)
+            {
+                // Only the locals holding loans matter (few), not every live local.
+                if (state.Held.Count == 0)
+                    return [];
+                var live = (liveness ??= Liveness.Compute(function)).LiveBefore(location);
+                HashSet<int> active = [];
+                foreach (var (local, held) in state.Held)
+                {
+                    if (live.Contains(local))
+                        active.UnionWith(held);
+                }
+                return [.. active.Order().Select(id => loans.Loans[id])];
+            }
 
             /// <summary>Place text with the local's source name when it has one, e.g. <c>`pt.1`</c>.</summary>
             private string Describe(Place place)
