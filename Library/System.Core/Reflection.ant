@@ -1,9 +1,8 @@
-// Reflection: a program's types and their members at run time, modelled on .NET's (Type, FieldInfo, PropertyInfo,
-// MethodInfo, ConstructorInfo, Activator). When a program uses `typeof` or `GetType()`, the compiler describes each
+// Reflection: a program's types and their members at run time (Type, FieldInfo, PropertyInfo, MethodInfo,
+// ConstructorInfo, Activator). When a program uses `typeof` or `GetType()`, the compiler describes each
 // type: its Type has a name, a namespace and a kind, and a describer (a class the compiler writes per type) gives the
 // rest the first time it is asked for: base type, type arguments, interfaces, members, and access to those members.
 
-import System.Collections.Generic;
 import System.Reflection;
 import System.Threading;
 
