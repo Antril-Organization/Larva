@@ -1,7 +1,7 @@
 // JSON: a value read from text (JsonValue.Parse) or built by hand, and written back (ToString, compact). Objects keep
 // their members in order. Numbers are f64 (an integer prints without a fraction; nan and the infinities are no JSON:
 // writing one is a FormatError). Text is UTF-8 in and out; `\uXXXX` escapes (surrogate pairs included) become the
-// character's bytes, a lone surrogate U+FFFD. Nesting is limited to JsonReader.MaxDepth (512).
+// character's bytes, a lone surrogate U+FFFD. Nesting is limited to JsonReader.MaxDepth (256).
 
 into namespace System.Text
 {
@@ -252,7 +252,7 @@ into namespace System.Text
 		}
 
 		public:
-			const i32 MaxDepth = 512;
+			const i32 MaxDepth = 256; // deep enough for any sane document, shallow enough for a 1 MB stack with reference counting
 
 			new(u8[] units)
 			{
