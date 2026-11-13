@@ -477,16 +477,34 @@ into namespace System.Threading.Tasks
 			return any;
 		}
 
-		/// Completes the timers that are due; when none is, sleeps until the first one.
+		/// Completes the timers that are due; when none is, sleeps until the first one. Once threads complete tasks, the
+		/// sleep is on Changed (a task completed on another thread wakes it): the timer only bounds it.
 		Timers()
 		{
 			i64 now = Environment.TickCount64;
 			if (Due(now))
 				return;
 			i64 soon = due[Soonest()];
-			if (soon > now)
+			if (soon <= now)
+			{
+				Due(soon);
+				return;
+			}
+			if (!threaded)
+			{
 				Thread.Sleep((i32)(soon - now));
-			Due(soon);
+				Due(soon);
+				return;
+			}
+			sync.Lock();
+			if (inbox.Count == 0)
+			{
+				sleepers++;
+				changed.Wait(sync, (i32)(soon - now));
+				sleepers--;
+			}
+			sync.Unlock();
+			Due(Environment.TickCount64);
 		}
 	}
 
