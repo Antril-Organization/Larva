@@ -9,6 +9,11 @@ namespace Larva.Hir.Lowering
     {
         private void LowerBodies()
         {
+            if (LowersReachedOnly)
+            {
+                LowerReached();
+                return;
+            }
             BeginParallelAdditions();
             if (Options.Parallel)
                 System.Threading.Tasks.Parallel.ForEach(Plans, LowerPlan);

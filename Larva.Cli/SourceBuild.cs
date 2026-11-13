@@ -22,6 +22,9 @@ using Larva.IR.Linking;
 /// </summary>
 internal static class SourceBuild
 {
+    /// <summary>The core library's assembly name (its origin in a linked program).</summary>
+    private const string CoreAssemblyName = "System.Core";
+
     private sealed class Timings
     {
         private readonly Stopwatch watch = Stopwatch.StartNew();
@@ -398,6 +401,8 @@ internal static class SourceBuild
             StaticConstructorsFromEntry = true,
             Gc = rootGc,
             ExternalAssemblies = externals.Select(e => e.Name).ToHashSet(),
+            // System.Core was checked when it was built: only what the program reaches of it is lowered.
+            ReachedOnly = name == CoreAssemblyName ? new HashSet<string>() : new HashSet<string> { CoreAssemblyName },
         });
         timings.Mark("lowering");
         if (!lowered.Success)

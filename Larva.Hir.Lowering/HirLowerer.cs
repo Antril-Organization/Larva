@@ -35,6 +35,14 @@ namespace Larva.Hir.Lowering
         /// constructors of the types those can reach run. Off for hosts that call any function of the program.
         /// </summary>
         public bool StaticConstructorsFromEntry { get; init; }
+
+        /// <summary>
+        /// Input assemblies (by name, see <see cref="H.HirAssembly.Origins"/>) whose methods are lowered only when the
+        /// program reaches them from its entry, its exported methods and the other assemblies' methods (see Reached.cs);
+        /// the others become stubs that stop the program. For libraries already checked (System.Core) linked into a
+        /// program: most of their methods are never run. Ignored with <see cref="ExportAll"/>.
+        /// </summary>
+        public IReadOnlySet<string> ReachedOnly { get; init; } = new HashSet<string>();
     }
 
     /// <summary>An error of lowering: in <paramref name="Where"/> (a type or method), at <paramref name="Source"/> when the HIR said where.</summary>
@@ -50,6 +58,9 @@ namespace Larva.Hir.Lowering
 
         /// <summary>The IR function of each method (by its token), for hosts and tests.</summary>
         public required IReadOnlyDictionary<H.MemberToken, int> Functions { get; init; }
+
+        /// <summary>The functions left as stubs that stop the program, since nothing lowered reaches them (<see cref="LoweringOptions.ReachedOnly"/>).</summary>
+        public IReadOnlySet<int> Unlowered { get; init; } = new HashSet<int>();
 
         public bool Success => Module is not null && Errors.Count == 0;
 
@@ -414,7 +425,7 @@ namespace Larva.Hir.Lowering
                 Data = [.. Data],
                 Implementations = [.. Implementations],
             };
-            return new LoweringResult { Module = module, Errors = [], Functions = MethodFunctions };
+            return new LoweringResult { Module = module, Errors = [], Functions = MethodFunctions, Unlowered = Unlowered };
         }
 
         // ── Types ──────────────────────────────────────────
