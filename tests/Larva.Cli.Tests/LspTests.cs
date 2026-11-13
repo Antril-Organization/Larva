@@ -48,6 +48,60 @@ public sealed class LspTests
         server.Notify("exit", null);
     }
 
+    /// <summary>
+    /// A burst of typing (20 changes sent at once) then a completion: the changes a newer one replaces are never analyzed,
+    /// so the completion is answered at once, about the last text.
+    /// </summary>
+    [Fact]
+    public void A_burst_of_changes_does_not_hold_up_completion()
+    {
+        var world = new LanguageWorld("lsp-burst");
+        world.Approve("0.8.0");
+        world.Larva.Ok("languages", "install", "antril", "--provider", world.Registry);
+        string app = Path.Combine(world.Root, "app");
+        Directory.CreateDirectory(app);
+        File.WriteAllText(Path.Combine(app, "App.queen"), "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   output: out/App.exe\n");
+        string source = Path.Combine(app, "Program.ant");
+        // Big enough that analyzing every change in turn takes seconds.
+        string body = string.Concat(Enumerable.Range(0, 400).Select(j =>
+            $"Work{j}(i32 a) : i32\n{{\n    i32 s = 0;\n    loop (i32 k = 0..a) {{ s += k * {j}; }}\n    Console.WriteLine(s);\n    return s;\n}}\n"));
+        string Text(int version) => $"import System;\nHelper{version}() {{ }}\nMain()\n{{\n    Hel\n}}\n" + body;
+        File.WriteAllText(source, Text(0));
+
+        using var server = new Server(world.Larva);
+        server.Request("initialize", new JsonObject { ["processId"] = null, ["rootUri"] = Uri(app), ["capabilities"] = new JsonObject() });
+        server.Notify("initialized", new JsonObject());
+        server.Notify("textDocument/didOpen", new JsonObject
+        {
+            ["textDocument"] = new JsonObject { ["uri"] = Uri(source), ["languageId"] = "antril", ["version"] = 0, ["text"] = Text(0) },
+        });
+        Assert.NotNull(server.Diagnostics(Uri(source)));
+
+        var clock = Stopwatch.StartNew();
+        for (int version = 1; version <= 20; version++)
+        {
+            server.Notify("textDocument/didChange", new JsonObject
+            {
+                ["textDocument"] = new JsonObject { ["uri"] = Uri(source), ["version"] = version },
+                ["contentChanges"] = new JsonArray(new JsonObject { ["text"] = Text(version) }),
+            });
+        }
+        var completion = server.Request("textDocument/completion", new JsonObject
+        {
+            ["textDocument"] = new JsonObject { ["uri"] = Uri(source) },
+            ["position"] = new JsonObject { ["line"] = 4, ["character"] = 7 },
+        });
+        clock.Stop();
+        var items = (completion as JsonObject)?["items"] as JsonArray ?? completion as JsonArray ?? [];
+        var helpers = items.Select(i => (string?)i!["label"]).Where(l => l?.StartsWith("Helper", StringComparison.Ordinal) == true).ToList();
+        Assert.True(helpers.SequenceEqual(["Helper20"]), "the completion is about the last text: " + string.Join(", ", helpers) + "\n" + server.Log);
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(3), $"the completion is answered in {clock.Elapsed.TotalSeconds:F1} s");
+        // The document's diagnostics are published once more (for the last text), not once per change.
+        Assert.NotNull(server.Diagnostics(Uri(source)));
+        server.Request("shutdown", null);
+        server.Notify("exit", null);
+    }
+
     private static string Uri(string path) => "file:///" + path.Replace('\\', '/').Replace(":", "%3A");
 
     /// <summary>The language server of this working copy, in the world of a <see cref="LarvaProcess"/>, driven over its standard streams.</summary>

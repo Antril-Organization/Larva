@@ -40,14 +40,54 @@ internal sealed class LspServer
         return server.Loop();
     }
 
+    /// <summary>
+    /// How long a document waits after its last change before it is analyzed (a burst of typing is analyzed once, at
+    /// its end). A request about a document that is waiting analyzes it at once.
+    /// </summary>
+    private const int Debounce = 200;
+
+    /// <summary>The messages the reader thread has read, in the order they came (completed at the end of the input).</summary>
+    private readonly System.Collections.Concurrent.BlockingCollection<JsonObject> inbox = [];
+
+    /// <summary>Documents changed and not analyzed yet, and when (<see cref="Environment.TickCount64"/>) each is due.</summary>
+    private readonly Dictionary<string, long> due = new(StringComparer.Ordinal);
+
     private int Loop()
     {
-        // A message that cannot be read (a bad header, a body that is not JSON) is logged and skipped: the editor's
-        // next message is read as usual. Only the end of the input (or `exit`) ends the server.
-        while (Read(out var message))
+        // A reader thread reads messages as they come, so a burst of changes is taken in at once: each document keeps
+        // only its latest text and is analyzed once its changes stop (or when a request needs it), not once per change.
+        // Messages are handled on this thread, one at a time, in the order they came.
+        var reader = new Thread(() =>
         {
-            if (message is null)
+            try
+            {
+                // A message that cannot be read (a bad header, a body that is not JSON) is logged and skipped: the
+                // editor's next message is read as usual. Only the end of the input ends the reading.
+                while (Read(out var message))
+                {
+                    if (message is not null)
+                        inbox.Add(message);
+                }
+            }
+            catch (Exception e) when (e is IOException or ObjectDisposedException)
+            {
+            }
+            finally
+            {
+                inbox.CompleteAdding();
+            }
+        }) { IsBackground = true, Name = "larva lsp reader" };
+        reader.Start();
+        // The end of the input (or `exit`) ends the server.
+        while (true)
+        {
+            if (!inbox.TryTake(out var message, Wait()))
+            {
+                if (inbox.IsCompleted)
+                    return 0;
+                AnalyzeDue();
                 continue;
+            }
             try
             {
                 if (Handle(message) is false)
@@ -59,8 +99,64 @@ internal sealed class LspServer
                 if (message["id"] is { } id)
                     Send(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id.DeepClone(), ["error"] = new JsonObject { ["code"] = -32603, ["message"] = e.Message } });
             }
+            AnalyzeDue();
         }
-        return 0;
+    }
+
+    /// <summary>How long the loop waits for the next message: until the first waiting document is due (forever when none is).</summary>
+    private int Wait()
+    {
+        if (due.Count == 0)
+            return Timeout.Infinite;
+        return (int)Math.Clamp(due.Values.Min() - Environment.TickCount64, 0, Debounce);
+    }
+
+    /// <summary>The waiting documents whose time has come, analyzed (and their diagnostics published).</summary>
+    private void AnalyzeDue()
+    {
+        while (due.Count > 0)
+        {
+            long now = Environment.TickCount64;
+            string? next = null;
+            foreach (var (uri, at) in due)
+            {
+                if (at <= now)
+                {
+                    next = uri;
+                    break;
+                }
+            }
+            if (next is null)
+                return;
+            try
+            {
+                Flush(next);
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                Console.Error.WriteLine($"larva lsp: {e}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Before a request is answered: the project files waiting to be analyzed (what they set applies to their sources),
+    /// then the document it is about (every waiting one for a request about the workspace), so the answer is about the
+    /// latest text. The other waiting documents keep waiting.
+    /// </summary>
+    private void BeforeRequest(string method, JsonObject? parameters)
+    {
+        if (due.Count == 0)
+            return;
+        foreach (var queen in due.Keys.Where(IsQueen).ToList())
+            Flush(queen);
+        if (parameters?["textDocument"]?["uri"] is JsonValue value && value.TryGetValue(out string? uri))
+            Flush(uri);
+        else if (method is "workspace/symbol" or "larva/decompile")
+        {
+            foreach (var waiting in due.Keys.ToList())
+                Flush(waiting);
+        }
     }
 
     // ── Transport ──────────────────────────────────────
@@ -179,6 +275,8 @@ internal sealed class LspServer
             return true;
         }
         var parameters = message["params"] as JsonObject;
+        if (id is not null)
+            BeforeRequest(method, parameters);
         switch (method)
         {
             case "initialize":
@@ -224,6 +322,7 @@ internal sealed class LspServer
             {
                 string uri = parameters!["textDocument"]!["uri"]!.GetValue<string>();
                 documents.Remove(uri);
+                due.Remove(uri);
                 if (analyzed.Remove(uri, out var pack))
                     Ask(pack, "lsp.close", new JsonObject { ["uri"] = uri });
                 Notify("textDocument/publishDiagnostics", new JsonObject { ["uri"] = uri, ["diagnostics"] = new JsonArray() });
@@ -570,12 +669,21 @@ internal sealed class LspServer
             Changed(openUri, openText);
     }
 
+    /// <summary>A document's new text: kept, and the document analyzed a moment after its last change (<see cref="Debounce"/>).</summary>
     private void Changed(string uri, string text)
     {
         documents[uri] = text;
         analyzed.Remove(uri);
         // A library type's decompiled source: read-only and not the program's (its names are known from the decompiler).
         if (uri.StartsWith("larva:", StringComparison.OrdinalIgnoreCase))
+            return;
+        due[uri] = Environment.TickCount64 + Debounce;
+    }
+
+    /// <summary>A document waiting to be analyzed, analyzed now (its latest text), and its diagnostics published.</summary>
+    private void Flush(string uri)
+    {
+        if (!due.Remove(uri) || !documents.TryGetValue(uri, out var text))
             return;
         if (IsQueen(uri))
         {
