@@ -382,7 +382,7 @@ namespace Larva.Bindings
         {
             var declarations = new List<string>();
             var current = new StringBuilder();
-            int depth = 0, parens = 0;
+            int depth = 0, parens = 0, externBlocks = 0;
             bool directive = false, lineStart = true;
             for (int i = 0; i < code.Length; i++)
             {
@@ -407,12 +407,26 @@ namespace Larva.Bindings
                 }
                 if (c == '{')
                 {
+                    // `extern "C" {` (a header read without the preprocessor, or an unguarded block): the declarations
+                    // inside are read as they are, the braces dropped.
+                    if (depth == 0 && parens == 0 && current.ToString().Trim() is "extern \"C\"" or "extern \"C++\"")
+                    {
+                        externBlocks++;
+                        current.Clear();
+                        continue;
+                    }
                     depth++;
                     current.Append(c);
                     continue;
                 }
                 if (c == '}')
                 {
+                    if (depth == 0 && externBlocks > 0)
+                    {
+                        externBlocks--;
+                        current.Clear();
+                        continue;
+                    }
                     depth--;
                     current.Append(c);
                     // A function definition: its body ends the declaration without a `;`.

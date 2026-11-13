@@ -299,6 +299,45 @@ public sealed class BindingsTests : CheckedTest
         Check("through clang: both defines and the function", realDescription.Contains("const A_ONE = 1\n") && realDescription.Contains("const A_TWO = 2\n") && realDescription.Contains("F(i32 x) : i32\n"));
     }
 
+    /// <summary>
+    /// `extern "C" { … }`: the declarations inside are read as they are (the braces are not a body). Through clang the
+    /// `#ifdef __cplusplus` guards go away because the preprocessor runs as C (`-x c`); read as it is, the block stays.
+    /// </summary>
+    [Fact]
+    public void Extern_C_blocks_are_read_through()
+    {
+        var reader = new HeaderReader(longIs64: false);
+        string description = reader.Read("""
+            #ifdef __cplusplus
+            extern "C" {
+            #endif
+            #define INSIDE 1
+            int Inside(int x);
+            typedef struct { int a; } S;
+            extern "C" {
+              extern int Nested(S* s);
+              struct T { S s; int (*cb)(void); };
+            }
+            #ifdef __cplusplus
+            }
+            #endif
+            int Outside(S* s, struct T* t);
+            int Body(int x) { if (x) { return 1; } return 0; }
+            """, "lib.dll");
+        Log(description);
+        Check("the functions and the struct inside the block, a nested block, and what follows the block",
+            description.Contains("const INSIDE = 1\n") && description.Contains("struct S { i32 a }\n") && description.Contains("struct T { S s; func*<> : i32 cb }\n")
+            && description.Contains("Inside(i32 x) : i32\n") && description.Contains("Nested(S* s) : i32\n") && description.Contains("Outside(S* s, T* t) : i32\n")
+            && description.Contains("Body(i32 x) : i32\n") && reader.Skipped.Count == 0, string.Join("; ", reader.Skipped.Select(s => $"{s.Name}: {s.Why}")));
+        if (HeaderReader.FindClang() is null)
+            return;
+        string folder = TestEnvironment.TempFolder("headers");
+        string header = Path.Combine(folder, "externc.h");
+        File.WriteAllText(header, "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint Inside(int x);\n#ifdef __cplusplus\n}\n#endif\n");
+        var real = new HeaderReader(longIs64: false);
+        Check("through clang, run as C, the guarded block is gone and the function read", real.ReadFile(header, "lib.dll").Contains("Inside(i32 x) : i32\n"));
+    }
+
     /// <summary>A real header, preprocessed by clang: the C runtime's stdlib.h.</summary>
     [Fact]
     public void Stdlib_h_through_clang_becomes_a_description_of_ucrtbase()
