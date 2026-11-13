@@ -35,11 +35,16 @@ namespace Larva.IR.Analysis
         {
             var entries = new TState?[function.Blocks.Length];
             entries[0] = analysis.Entry();
-            Queue<int> worklist = new([0]);
+            // Blocks in reverse postorder: each runs after its predecessors (but for back edges), so a block is redone only
+            // when a loop brings it something new. (First-in-first-out redid every block after a join once per incoming
+            // edge: cubic in a chain of hundreds of `&&`.)
+            var order = ReversePostorder(function);
+            PriorityQueue<int, int> worklist = new();
+            worklist.Enqueue(0, order[0]);
             var queued = new bool[function.Blocks.Length];
             queued[0] = true;
 
-            while (worklist.TryDequeue(out int b))
+            while (worklist.TryDequeue(out int b, out _))
             {
                 queued[b] = false;
                 var state = analysis.Clone(entries[b]!);
@@ -74,11 +79,46 @@ namespace Larva.IR.Analysis
                     if (changed && !queued[successor])
                     {
                         queued[successor] = true;
-                        worklist.Enqueue(successor);
+                        worklist.Enqueue(successor, order[successor]);
                     }
                 }
             }
             return entries;
+        }
+
+        /// <summary>
+        /// Each block's position in reverse postorder from <c>bb0</c> (a block's first successor comes before its other
+        /// ones); unreachable blocks get <see cref="int.MaxValue"/>.
+        /// </summary>
+        internal static int[] ReversePostorder(IrFunction function)
+        {
+            int count = function.Blocks.Length;
+            var order = new int[count];
+            Array.Fill(order, int.MaxValue);
+            var visited = new bool[count];
+            var successors = new int[count][];
+            var stack = new Stack<(int Block, int Next)>();
+            int position = count;
+            visited[0] = true;
+            stack.Push((0, 0));
+            while (stack.TryPop(out var frame))
+            {
+                // Successors are visited last to first, so the first one finishes last and comes first in the order.
+                var next = successors[frame.Block] ??= [.. function.Blocks[frame.Block].Terminator.Successors.Distinct().Reverse()];
+                if (frame.Next < next.Length)
+                {
+                    stack.Push((frame.Block, frame.Next + 1));
+                    int successor = next[frame.Next];
+                    if (!visited[successor])
+                    {
+                        visited[successor] = true;
+                        stack.Push((successor, 0));
+                    }
+                    continue;
+                }
+                order[frame.Block] = --position;
+            }
+            return order;
         }
     }
 }
