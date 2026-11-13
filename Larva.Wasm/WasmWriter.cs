@@ -17,17 +17,23 @@ namespace Larva.Wasm
     /// conversions): types, imported functions, one memory and one function table (both exported), globals, exports,
     /// function bodies and active data segments.
     /// </summary>
+    /// <remarks>
+    /// Functions are named by handles while the module is built: an import's is negative, a defined function's its
+    /// position among the defined ones. Imports can then be added at any time (while the code that calls them is
+    /// generated), although they come first in the index space: every function index (calls in the bodies, the table,
+    /// the exports) is resolved when the module is written.
+    /// </remarks>
     public sealed class WasmModule
     {
         private readonly List<FuncType> types = [];
         private readonly List<(string Module, string Name, int Type)> imports = [];
         private readonly List<int> functionTypes = [];
-        private readonly List<byte[]> bodies = [];
+        private readonly List<(byte[] Locals, Code Code)?> bodies = [];
         private readonly List<(ValType Type, bool Mutable, long Value)> globals = [];
         private readonly List<(string Name, byte Kind, int Index)> exports = [];
         private readonly List<(int Address, byte[] Bytes)> data = [];
 
-        /// <summary>Functions placed in the table (from index 1; 0 stays null), by function index.</summary>
+        /// <summary>Functions placed in the table (from index 1; 0 stays null), by function handle.</summary>
         public List<int> Table { get; } = [];
 
         public int MemoryPages { get; set; } = 1;
@@ -41,27 +47,28 @@ namespace Larva.Wasm
             return types.Count - 1;
         }
 
-        /// <summary>Imports a function; imports come before defined functions in the index space, so add them first.</summary>
+        /// <summary>Imports a function (at any time); returns its handle.</summary>
         public int Import(string module, string name, FuncType type)
         {
-            if (functionTypes.Count > 0)
-                throw new InvalidOperationException("imports must be added before functions");
             imports.Add((module, name, Type(type)));
-            return imports.Count - 1;
+            return -imports.Count;
         }
 
         public int ImportCount => imports.Count;
 
-        /// <summary>Declares a function (its body comes later) and returns its index.</summary>
+        /// <summary>Declares a function (its body comes later) and returns its handle.</summary>
         public int Declare(FuncType type)
         {
             functionTypes.Add(Type(type));
-            bodies.Add([]);
-            return imports.Count + functionTypes.Count - 1;
+            bodies.Add(null);
+            return functionTypes.Count - 1;
         }
 
+        /// <summary>The function index of a handle (valid once every import is added).</summary>
+        public int Resolve(int handle) => handle < 0 ? -handle - 1 : imports.Count + handle;
+
         /// <summary>A function body: local declarations and code, without the trailing <c>end</c> (added here).</summary>
-        public void Define(int function, IReadOnlyList<ValType> locals, byte[] code)
+        internal void Define(int function, IReadOnlyList<ValType> locals, Code code)
         {
             var body = new Bytes();
             var groups = new List<(int Count, ValType Type)>();
@@ -78,9 +85,7 @@ namespace Larva.Wasm
                 body.U32((uint)count);
                 body.Byte((byte)type);
             }
-            body.Raw(code);
-            body.Byte(0x0B);
-            bodies[function - imports.Count] = body.ToArray();
+            bodies[function] = (body.ToArray(), code);
         }
 
         public int Global(ValType type, bool mutable, long value)
@@ -89,6 +94,7 @@ namespace Larva.Wasm
             return globals.Count - 1;
         }
 
+        /// <summary>Exports a function by its handle.</summary>
         public void ExportFunction(string name, int function) => exports.Add((name, 0, function));
         public void ExportGlobal(string name, int global) => exports.Add((name, 3, global));
 
@@ -182,7 +188,7 @@ namespace Larva.Wasm
                 {
                     s.Name(name);
                     s.Byte(kind);
-                    s.U32((uint)index);
+                    s.U32((uint)(kind == 0 ? Resolve(index) : index));
                 }
             });
             if (Table.Count > 0)
@@ -196,7 +202,7 @@ namespace Larva.Wasm
                     s.Byte(0x0B);
                     s.U32((uint)Table.Count);
                     foreach (int function in Table)
-                        s.U32((uint)function);
+                        s.U32((uint)Resolve(function));
                 });
             }
             if (data.Count > 0)
@@ -206,10 +212,16 @@ namespace Larva.Wasm
             Section(module, 10, s =>
             {
                 s.U32((uint)bodies.Count);
+                var code = new Bytes();
                 foreach (var body in bodies)
                 {
-                    s.U32((uint)body.Length);
-                    s.Raw(body);
+                    var (locals, instructions) = body ?? throw new InvalidOperationException("a declared function has no body");
+                    code.Clear();
+                    code.Raw(locals);
+                    instructions.WriteTo(code, Resolve);
+                    code.Byte(0x0B);
+                    s.U32((uint)code.Length);
+                    s.Raw(code);
                 }
             });
             if (data.Count > 0)
@@ -237,7 +249,7 @@ namespace Larva.Wasm
             write(content);
             module.Byte(id);
             module.U32((uint)content.Length);
-            module.Raw(content.ToArray());
+            module.Raw(content);
         }
     }
 
@@ -251,6 +263,13 @@ namespace Larva.Wasm
         public void Byte(byte value) => bytes.Add(value);
 
         public void Raw(IEnumerable<byte> values) => bytes.AddRange(values);
+
+        public void Raw(Bytes other) => bytes.AddRange(other.bytes);
+
+        /// <summary>Appends <paramref name="count"/> bytes of <paramref name="other"/> from <paramref name="start"/>.</summary>
+        public void Raw(Bytes other, int start, int count) => bytes.AddRange(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(other.bytes).Slice(start, count));
+
+        public void Clear() => bytes.Clear();
 
         public void U32(uint value)
         {

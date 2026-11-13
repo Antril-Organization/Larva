@@ -1,11 +1,37 @@
 namespace Larva.Wasm
 {
-    /// <summary>Instruction emitter for one function body (the opcodes the code generator uses).</summary>
+    /// <summary>
+    /// Instruction emitter for one function body (the opcodes the code generator uses). A call names its function by a
+    /// handle (see <see cref="WasmModule"/>): the index is written when the module is (<see cref="WriteTo"/>).
+    /// </summary>
     internal sealed class Code
     {
         private readonly Bytes b = new();
+        private readonly List<(int At, int Function)> calls = [];
 
-        public byte[] ToArray() => b.ToArray();
+        public int Length => b.Length;
+
+        /// <summary>The code with every call's function index resolved.</summary>
+        public void WriteTo(Bytes output, Func<int, int> resolve)
+        {
+            int at = 0;
+            foreach (var (position, function) in calls)
+            {
+                output.Raw(b, at, position - at);
+                output.U32((uint)resolve(function));
+                at = position;
+            }
+            output.Raw(b, at, b.Length - at);
+        }
+
+        /// <summary>Appends another body's code (its calls kept for resolution).</summary>
+        public void Append(Code other)
+        {
+            int start = b.Length;
+            b.Raw(other.b);
+            foreach (var (position, function) in other.calls)
+                calls.Add((start + position, function));
+        }
 
         private void Op(byte op) => b.Byte(op);
 
@@ -36,7 +62,7 @@ namespace Larva.Wasm
         }
 
         public void Return() => Op(0x0F);
-        public void Call(int function) { Op(0x10); b.U32((uint)function); }
+        public void Call(int function) { Op(0x10); calls.Add((b.Length, function)); }
         public void CallIndirect(int type) { Op(0x11); b.U32((uint)type); b.U32(0); }
         public void Drop() => Op(0x1A);
 

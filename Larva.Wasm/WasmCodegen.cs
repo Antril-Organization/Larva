@@ -11,13 +11,15 @@ namespace Larva.Wasm
     /// <summary>
     /// WebAssembly code generation without LLVM: a baseline compiler in the spirit of the direct x86-64 back end.
     /// <list type="bullet">
-    /// <item>Frames live in linear memory (a shadow stack growing down from <c>$sp</c>): every IR local has its slot there, so
-    /// every value has an address and the collector finds every root by scanning the stack, conservatively.</item>
+    /// <item>Frames live in linear memory (a shadow stack growing down from <c>$sp</c>): every IR local that may hold a handle
+    /// (or whose address is taken) has its slot there, so the collector finds every root by scanning the stack,
+    /// conservatively. Integers, bools and floats whose address is never taken, and the temps of such values, are wasm
+    /// locals.</item>
     /// <item>One calling convention for all Larva functions, <c>(args: i32, ret: i32) -&gt; ()</c>: the caller lays the
     /// arguments out in its frame and passes where they are and where the result goes. Indirect calls (function values,
     /// finalizers) are then a <c>call_indirect</c> of that one type through the exported table.</item>
-    /// <item>Control flow: each function is a dispatch loop over its basic blocks (<c>br_table</c> on a state local), which
-    /// takes any IR control-flow graph as it is.</item>
+    /// <item>Control flow: structured (blocks, loops and ifs) when the function's graph is reducible; else a dispatch loop
+    /// over its basic blocks (<c>br_table</c> on a state local), which takes any control-flow graph as it is.</item>
     /// <item>Exceptions: <c>throw</c> stores the payload (a heap cell) and its type id in two globals and goes to the site's
     /// handlers; after every call a pending exception does the same, or the frame cleans up and returns with it.</item>
     /// <item>Pointers are 32-bit but kept in 8-byte slots (zero-extended), so struct layouts are the native ones.</item>
@@ -170,21 +172,17 @@ namespace Larva.Wasm
         internal static FuncType RuntimeType(string name) =>
             RuntimeTypes.TryGetValue(name, out var type) ? type : throw new WasmBackendException($"the runtime has no `{name}`");
 
+        /// <summary>The runtime functions imported so far (on first use), by name: their function handles.</summary>
         private readonly Dictionary<string, int> runtime = [];
-        private readonly HashSet<string>? used;
 
         public int BoundsChecks { get; set; }
         public int BoundsChecksEliminated { get; set; }
 
-        /// <param name="used">First pass: collects the runtime functions the code calls (indices are placeholders).</param>
-        public WasmCodegen(IrModule module, GcConfig gc, bool eliminateBoundsChecks, HashSet<string>? used, IReadOnlySet<string>? imports)
+        public WasmCodegen(IrModule module, GcConfig gc, bool eliminateBoundsChecks)
         {
             this.module = module;
             this.gc = gc;
             this.eliminateBoundsChecks = eliminateBoundsChecks;
-            this.used = used;
-            foreach (string name in RuntimeTypes.Keys.Where(n => imports is null || imports.Contains(n)))
-                runtime[name] = Wasm.Import("env", name, RuntimeTypes[name]);
             Uniform = Wasm.Type(new FuncType([ValType.I32, ValType.I32], []));
             FunctionIndex = new int[module.Functions.Length];
             for (int f = 0; f < module.Functions.Length; f++)
@@ -250,10 +248,15 @@ namespace Larva.Wasm
         internal IrModule Module => module;
         internal bool EliminateBoundsChecks => eliminateBoundsChecks;
 
+        /// <summary>
+        /// The handle of a runtime function, imported on its first use: only what the code calls is imported, in one
+        /// pass (the module resolves the indices when it is written, imports first).
+        /// </summary>
         internal int Runtime(string name)
         {
-            used?.Add(name);
-            return runtime.TryGetValue(name, out int index) ? index : 0;
+            if (!runtime.TryGetValue(name, out int handle))
+                runtime[name] = handle = Wasm.Import("env", name, RuntimeType(name));
+            return handle;
         }
 
         /// <summary>The table slot of a function (what a function value holds), made on first use.</summary>
@@ -277,7 +280,7 @@ namespace Larva.Wasm
                 if (FunctionIndex[f] < 0)
                     continue;
                 ValType[] locals;
-                byte[] code;
+                Code code;
                 try
                 {
                     (locals, code) = new WasmFunctionCompiler(this, module.Functions[f]).Compile();

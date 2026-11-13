@@ -86,6 +86,146 @@ public sealed class WasmTests : CheckedTest
         Check("atomic.add.i32, mem.copy, mem.cmp and gc.domain give 5 15 7 0 0", Lines(output).SequenceEqual(["5", "15", "7", "0", "0"]), string.Join(" ", Lines(output)));
     }
 
+    /// <summary>
+    /// The module is generated once: a runtime function is imported when the code first calls it (here only in the second
+    /// function, after the first one's calls were emitted), and every function index (calls, table, exports) is resolved
+    /// when the module is written, imports first. Only what the code calls is imported.
+    /// </summary>
+    [Fact]
+    public void Runtime_functions_are_imported_on_first_use()
+    {
+        var main = new FunctionBuilder("main", IrType.Unit);
+        int bits = main.Local(IrType.I64, "bits", mutable: true);
+        int x = main.Local(IrType.F64, "x", mutable: true);
+        int y = main.Local(IrType.F64, "y");
+        int after = main.NewBlock();
+        main.Assign(bits, Int(BitConverter.DoubleToInt64Bits(7.5), IrType.I64))
+            .Assign(x, new IntrinsicRvalue("f64.from_bits", [Copy(bits)]))
+            .Call(1, [Copy(x)], new Place(y), after);
+        main.At(after);
+        Print(main, "print.f64", new UseRvalue(Copy(y)));
+        main.Return();
+        var helper = new FunctionBuilder("helper", IrType.F64);
+        int argument = helper.Argument(IrType.F64, "a");
+        int two = helper.Local(IrType.F64, "two", mutable: true);
+        int twoBits = helper.Local(IrType.I64, "bits", mutable: true);
+        helper.Assign(twoBits, Int(BitConverter.DoubleToInt64Bits(2.0), IrType.I64))
+            .Assign(two, new IntrinsicRvalue("f64.from_bits", [Copy(twoBits)]))
+            .Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(argument), Copy(two)))
+            .Return();
+        var module = new IrModule([], [main.Build(), helper.Build()]) { Name = "late" };
+        var (exit, output, errors) = Node(module);
+        Check("the module is valid and runs", exit == 0, errors);
+        Check("helper(7.5) = 7.5 % 2 = 1.5", Lines(output).SequenceEqual(["1.5"]), string.Join(" ", Lines(output)));
+        string text = System.Text.Encoding.ASCII.GetString(Wasm(module));
+        Check("larva_f64_rem (first called by the second function) and the printers are imported, nothing unused",
+            text.Contains("larva_f64_rem") && text.Contains("larva_print_f64") && !text.Contains("larva_gc_new") && !text.Contains("larva_mulhi_u64"), text.Length.ToString());
+    }
+
+    /// <summary>
+    /// Control flow is structured (blocks, loops and ifs) when the graph is reducible: nested loops, a switch whose cases
+    /// meet again, a loop left from two places. A loop entered in two places (irreducible) takes the dispatch loop.
+    /// </summary>
+    [Fact]
+    public void Reducible_and_irreducible_control_flow_run_alike()
+    {
+        // for i in 0..3 { for j in 0..i+1 { switch (i + j) % 3 { 0: s += 1; 1: s += 10; else: s += 100 } } if s > 150 break }
+        var f = new FunctionBuilder("main", IrType.Unit);
+        int i = f.Local(IrType.I64, "i", mutable: true), j = f.Local(IrType.I64, "j", mutable: true), sum = f.Local(IrType.I64, "s", mutable: true);
+        int test = f.Temp(IrType.Bool), which = f.Temp(IrType.I64);
+        int outer = f.NewBlock(), inner = f.NewBlock(), body = f.NewBlock(), zero = f.NewBlock(), one = f.NewBlock(), other = f.NewBlock();
+        int next = f.NewBlock(), innerDone = f.NewBlock(), done = f.NewBlock();
+        f.Assign(i, Int(0, IrType.I64)).Assign(sum, Int(0, IrType.I64)).Goto(outer);
+        f.At(outer);
+        f.Assign(test, Rvalue.Binary(BinaryOp.Lt, Copy(i), Int(3, IrType.I64))).Assign(j, Int(0, IrType.I64)).If(Copy(test), inner, done);
+        f.At(inner);
+        f.Assign(test, Rvalue.Binary(BinaryOp.Le, Copy(j), Copy(i))).If(Copy(test), body, innerDone);
+        f.At(body);
+        f.Assign(which, Rvalue.Binary(BinaryOp.Add, Copy(i), Copy(j))).Assign(which, Rvalue.Binary(BinaryOp.Rem, Copy(which), Int(3, IrType.I64)))
+         .Switch(Copy(which), [zero, one], other);
+        foreach (var (block, add) in new[] { (zero, 1L), (one, 10L), (other, 100L) })
+        {
+            f.At(block);
+            f.Assign(sum, Rvalue.Binary(BinaryOp.Add, Copy(sum), Int(add, IrType.I64))).Goto(next);
+        }
+        f.At(next);
+        f.Assign(j, Rvalue.Binary(BinaryOp.Add, Copy(j), Int(1, IrType.I64))).Goto(inner);
+        f.At(innerDone);
+        Print(f, "print.i64", new UseRvalue(Copy(sum)));
+        f.Assign(i, Rvalue.Binary(BinaryOp.Add, Copy(i), Int(1, IrType.I64)))
+         .Assign(test, Rvalue.Binary(BinaryOp.Gt, Copy(sum), Int(150, IrType.I64))).If(Copy(test), done, outer);
+        f.At(done);
+        Print(f, "print.i64", new UseRvalue(Copy(i)));
+        f.Return();
+        var (exit, output, errors) = Node(new IrModule([], [f.Build()]) { Name = "reducible" });
+        Check("the reducible program runs", exit == 0, errors);
+        Check("sums 1, then 1+10+100, then 111+100+1+10 (over 150: the outer loop is left), i = 3", Lines(output).SequenceEqual(["1", "111", "222", "3"]), string.Join(" ", Lines(output)));
+
+        // Two ways into one loop: a → b → a … entered at a or at b.
+        foreach (bool atA in new[] { true, false })
+        {
+            var g = new FunctionBuilder("main", IrType.Unit);
+            int k = g.Local(IrType.I64, "k", mutable: true), flag = g.Local(IrType.Bool, "flag"), cond = g.Temp(IrType.Bool);
+            int a = g.NewBlock(), b = g.NewBlock(), end = g.NewBlock();
+            g.Assign(k, Int(0, IrType.I64)).Assign(flag, Bool(atA)).If(Copy(flag), a, b);
+            foreach (var (block, step, then) in new[] { (a, 1L, b), (b, 2L, a) })
+            {
+                g.At(block);
+                g.Assign(k, Rvalue.Binary(BinaryOp.Add, Copy(k), Int(step, IrType.I64)));
+                Print(g, "print.i64", new UseRvalue(Copy(k)));
+                g.Assign(cond, Rvalue.Binary(BinaryOp.Lt, Copy(k), Int(5, IrType.I64))).If(Copy(cond), then, end);
+            }
+            g.At(end);
+            g.Return();
+            (exit, output, errors) = Node(new IrModule([], [g.Build()]) { Name = "irreducible" });
+            Check($"the irreducible program runs (entered at {(atA ? "a" : "b")})", exit == 0, errors);
+            string[] expected = atA ? ["1", "3", "4", "6"] : ["2", "3", "5"];
+            Check($"entered at {(atA ? "a: 1 3 4 6" : "b: 2 3 5")}", Lines(output).SequenceEqual(expected), string.Join(" ", Lines(output)));
+        }
+    }
+
+    /// <summary>
+    /// Integers, bools and floats whose address is never taken live in wasm locals: a store gives them their type's width
+    /// (an i32 wraps, an i8 and a u8 too) as a store to a frame slot does, a single keeps its bits. A scalar whose address
+    /// is taken stays in the frame, and a write through the pointer is seen; handles stay in the frame, where a
+    /// collection finds them.
+    /// </summary>
+    [Fact]
+    public void Scalars_in_locals_keep_their_width_and_addressed_ones_stay_in_memory()
+    {
+        var f = new FunctionBuilder("main", IrType.Unit) { Unsafe = true };
+        int wide = f.Local(IrType.I32, "wide", mutable: true), small = f.Local(IrType.I8, "small", mutable: true), bytes = f.Local(IrType.U8, "bytes", mutable: true);
+        int single = f.Local(IrType.F32, "single", mutable: true), bits = f.Local(IrType.I64, "bits", mutable: true), flag = f.Local(IrType.Bool, "flag", mutable: true);
+        int y = f.Local(IrType.I64, "y", mutable: true), p = f.Local(IrType.PtrMut(IrType.I64), "p");
+        int box = f.Local(IrType.Gc(IrType.I64), "box"), garbage = f.Local(IrType.Gc(IrType.I64), "garbage", mutable: true), unit = f.Temp(IrType.Unit);
+        f.Assign(wide, Int(int.MaxValue)).Assign(wide, Rvalue.Binary(BinaryOp.Add, Copy(wide), Int(1)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(wide), IrType.I64));                                             // -2147483648
+        f.Assign(small, Int(127, IrType.I8)).Assign(small, Rvalue.Binary(BinaryOp.Add, Copy(small), Int(1, IrType.I8)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(small), IrType.I64));                                            // -128
+        f.Assign(bytes, Int(250, IrType.U8)).Assign(bytes, Rvalue.Binary(BinaryOp.Mul, Copy(bytes), Int(3, IrType.U8)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(bytes), IrType.I64));                                            // 750 % 256 = 238
+        f.Assign(bits, Int(BitConverter.DoubleToInt64Bits(1.5), IrType.I64));
+        int asDouble = f.Temp(IrType.F64);
+        f.Assign(asDouble, new IntrinsicRvalue("f64.from_bits", [Copy(bits)]))
+         .Assign(single, Rvalue.Cast(Copy(asDouble), IrType.F32))
+         .Assign(single, Rvalue.Binary(BinaryOp.Mul, Copy(single), Float32(3f)))
+         .Assign(single, Rvalue.Unary(UnaryOp.Neg, Copy(single)));
+        Print(f, "print.f64", Rvalue.Cast(Copy(single), IrType.F64));                                           // -4.5
+        f.Assign(flag, Rvalue.Binary(BinaryOp.Lt, Copy(small), Int(0, IrType.I8))).Assign(flag, Rvalue.Unary(UnaryOp.Not, Copy(flag)));
+        Print(f, "print.i64", Rvalue.Cast(Copy(flag), IrType.I64));                                             // 0
+        f.Assign(y, Int(5, IrType.I64)).Assign(p, Rvalue.RefMut(new Place(y)))
+         .Assign(new Place(p).Deref(), Int(9, IrType.I64));
+        Print(f, "print.i64", new UseRvalue(Copy(y)));                                                          // 9
+        f.Assign(box, Rvalue.Gc(Int(77, IrType.I64)));
+        for (int i = 0; i < 3; i++)
+            f.Assign(garbage, Rvalue.Gc(Int(i, IrType.I64))).Assign(unit, new IntrinsicRvalue("gc.request", []));
+        Print(f, "print.i64", new UseRvalue(Copy(new Place(box).Deref())));                                      // 77
+        f.Return();
+        var (exit, output, errors) = Node(new IrModule([], [f.Build()]) { Name = "locals" });
+        Check("the program runs", exit == 0, errors);
+        Check("-2147483648 -128 238 -4.5 0 9 77", Lines(output).SequenceEqual(["-2147483648", "-128", "238", "-4.5", "0", "9", "77"]), string.Join(" ", Lines(output)));
+    }
+
     /// <summary>Float `%` is fmod (the dividend's sign), through the runtime's `larva_f64_rem`; singles go through doubles exactly.</summary>
     [Fact]
     public void Float_remainder_is_fmod()
@@ -164,21 +304,15 @@ public sealed class WasmTests : CheckedTest
 
     internal static string[] Lines(string output) => output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.TrimEnd('\r')).ToArray();
 
+    /// <summary>The module's <c>.wasm</c> bytes.</summary>
+    internal static byte[] Wasm(IrModule module, GcConfig? gc = null) => Compile(module, gc).Module;
+
     /// <summary>The module linked as a program, compiled by the wasm back end, written next to its runtime and run by Node.</summary>
     internal static (int Exit, string Output, string Errors) Node(IrModule module, GcConfig? gc = null, params string[] arguments)
     {
-        var options = new CompilationOptions { Gc = gc ?? GcConfig.Default, BorrowCheck = BorrowCheckMode.Off };
-        var compiled = Compiler.CompileObject(module, options);
-        if (!compiled.Success)
-            throw new InvalidOperationException(string.Join("\n", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
-        var linked = Linker.Link([compiled.Object!], new LinkOptions { Entry = "main", Compilation = options });
-        if (!linked.Success)
-            throw new InvalidOperationException(string.Join("\n", linked.Errors));
-        var result = WasmBackend.Compile(linked, new WasmOptions { Compilation = options });
-        if (!result.Success)
-            throw new InvalidOperationException(result.ToString());
+        var program = Compile(module, gc);
         string folder = TestEnvironment.TempFolder("wasm");
-        string js = result.Program!.Write(Path.Combine(folder, module.Name + ".wasm"))[1];
+        string js = program.Write(Path.Combine(folder, module.Name + ".wasm"))[1];
         var start = new ProcessStartInfo("node") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         start.ArgumentList.Add(js);
         foreach (string argument in arguments)
@@ -194,5 +328,21 @@ public sealed class WasmTests : CheckedTest
                 process.Kill();
             return (process.ExitCode, output, errors.Result);
         }
+    }
+
+    /// <summary>The module linked as a program and compiled by the wasm back end.</summary>
+    internal static WasmProgram Compile(IrModule module, GcConfig? gc = null)
+    {
+        var options = new CompilationOptions { Gc = gc ?? GcConfig.Default, BorrowCheck = BorrowCheckMode.Off };
+        var compiled = Compiler.CompileObject(module, options);
+        if (!compiled.Success)
+            throw new InvalidOperationException(string.Join("\n", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
+        var linked = Linker.Link([compiled.Object!], new LinkOptions { Entry = "main", Compilation = options });
+        if (!linked.Success)
+            throw new InvalidOperationException(string.Join("\n", linked.Errors));
+        var result = WasmBackend.Compile(linked, new WasmOptions { Compilation = options });
+        if (!result.Success)
+            throw new InvalidOperationException(result.ToString());
+        return result.Program!;
     }
 }
