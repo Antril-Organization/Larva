@@ -17,7 +17,7 @@ using Larva.X64;
 const string Usage = """
     usage: larva new  [<template> [<Name>] [--lang <language>] [-o <folder>]]   a project from a template (none: the list)
            larva run  [<project.queen|folder>] [--rebuild] [build options] [-- <arguments>...]   the project you are in, built if it changed, run
-           larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen>...]   (none: the project you are in)
+           larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--entry Namespace.Type.Function] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen>...]   (none: the project you are in)
            larva lib  -o <Name.dll> [--borrowcheck enforce|warn|off] [--core <dir>] <source file>...   (against System.Core)
            larva config [<key> [<value>] | --unset <key>]    this machine's defaults (BUILD keys, hive.provider, languages.provider, languages.trust)
            larva hive <key|pack|publish|install|add|restore|verify|info|list|trust> ...   packages (larva hive: the list)
