@@ -41,9 +41,10 @@ namespace Larva.Hir.Lowering
         /// <summary>A step's type parameters: its class's are the function's owner's, then the function's own.</summary>
         private static HirLowerer.GenericContext ContextOf(HirLowerer lowerer, HirLowerer.TypeInfo owner, H.MethodDef method)
         {
+            // Which of them are handles (`class`): their nullables are optional handles (HirLowerer.ContextOf).
             if ((method.Flags & (H.MethodFlags.Iterator | H.MethodFlags.Async)) != 0 && owner.Definition.DeclaringType >= 0)
-                return new HirLowerer.GenericContext(lowerer.Types[owner.Definition.DeclaringType].GenericCount);
-            return new HirLowerer.GenericContext(owner.GenericCount);
+                return HirLowerer.ContextOf(owner) with { TypeCount = lowerer.Types[owner.Definition.DeclaringType].GenericCount };
+            return HirLowerer.ContextOf(owner, method);
         }
 
         private void PrepareCoroutine()

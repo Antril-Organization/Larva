@@ -678,8 +678,9 @@ namespace Larva.Hir.Lowering
         internal static TypeConstraint ConstraintOf(H.GenericParam generic) =>
             generic.OneOf is { Length: > 0 } list && list.All(t => t is H.PrimitiveType)
                 ? TypeConstraint.OneOf([.. list.Select(t => Primitive(((H.PrimitiveType)t).Kind))])
-                : (generic.Kinds & H.ConstraintKinds.Object) != 0
-                    ? TypeConstraint.Object & TypeConstraint.Unborrowed // a class's: an object handle (cast to the class, thrown)
+                : (generic.Kinds & (H.ConstraintKinds.Object | H.ConstraintKinds.Managed)) != 0
+                    // a class's, or `class`/`managed`: a handle (cast to the class, thrown; its nullable an optional handle)
+                    ? TypeConstraint.Object & TypeConstraint.Unborrowed
                     : TypeConstraint.Copy & TypeConstraint.Unborrowed; // type arguments are never `&T` borrows
 
         /// <summary>Structs before the types that contain them, bases before derived classes.</summary>
@@ -721,7 +722,7 @@ namespace Larva.Hir.Lowering
         private void LayOut(TypeInfo info)
         {
             var definition = info.Definition;
-            var context = new GenericContext(info.GenericCount);
+            var context = ContextOf(info);
             info.FieldIndex = new int[definition.Fields.Count];
             info.FieldGlobal = new int[definition.Fields.Count];
             var fields = new List<IrType>();
@@ -893,7 +894,32 @@ namespace Larva.Hir.Lowering
         /// Where type parameters land in IR: those of the type first (<c>T0…</c>), then the method's. A function has both, a
         /// type's struct only its own.
         /// </summary>
-        internal readonly record struct GenericContext(int TypeCount);
+        internal readonly record struct GenericContext(int TypeCount)
+        {
+            /// <summary>
+            /// The type parameters (by IR index, the first 64) that are always held by a handle (<c>class</c>, <c>managed</c>,
+            /// a class constraint): their nullable is an optional handle, as any class's is, not a value with a flag.
+            /// </summary>
+            public ulong Handles { get; init; }
+
+            public bool IsHandle(int index) => index < 64 && (Handles >> index & 1) != 0;
+        }
+
+        /// <summary>The generic context of a type's code, or of one of its methods (its own type parameters after the type's).</summary>
+        internal static GenericContext ContextOf(TypeInfo info, H.MethodDef? method = null)
+        {
+            ulong handles = 0;
+            void Mark(IReadOnlyList<H.GenericParam> generics, int first)
+            {
+                for (int g = 0; g < generics.Count && first + g < 64; g++)
+                    if ((generics[g].Kinds & (H.ConstraintKinds.Managed | H.ConstraintKinds.Object)) != 0)
+                        handles |= 1UL << (first + g);
+            }
+            Mark(info.Definition.Generics, 0);
+            if (method is not null)
+                Mark(method.Generics, info.GenericCount);
+            return new GenericContext(info.GenericCount) { Handles = handles };
+        }
 
         /// <summary>The IR type of a HIR type, in a generic context (errors for what is not lowered yet).</summary>
         internal IrType Lower(H.HirType type, string where, GenericContext context)
@@ -920,6 +946,9 @@ namespace Larva.Hir.Lowering
                         return RootHandle;
                     break;
                 }
+                case H.NullableType { Inner: H.GenericParamType g } when context.IsHandle(g.Owner == H.GenericOwner.Type ? g.Index : context.TypeCount + g.Index):
+                    // `T?` of a `class` T: an optional handle, as the nullable of the class it stands for is.
+                    return new OptionalType(Lower(g, where, context));
                 case H.NullableType { Inner: var inner } when Lower(inner, where, context) is var lowered && lowered is GcType or IR.PointerType:
                     return new OptionalType(lowered);
                 case H.NullableType { Inner: var inner }:
@@ -1032,7 +1061,7 @@ namespace Larva.Hir.Lowering
                         Error(where, "a virtual method cannot be generic", method.Location);
                         continue;
                     }
-                    var context = new GenericContext(info.GenericCount);
+                    var context = ContextOf(info, method);
                     IrType? self = null;
                     if (!method.IsStatic)
                     {
@@ -1328,7 +1357,8 @@ namespace Larva.Hir.Lowering
                             continue;
                         }
                         var selfType = info.IsPrimitive ? info.Definition.Underlying! : new H.NamedType(H.TypeToken.Def(info.Index), OwnParameters(info));
-                        int first = required.IsStatic ? 0 : 1;
+                        // Parameter 0: the object, or for a static member a null `?*Self` that tells the types apart.
+                        int first = 1;
                         var arguments = new List<H.Expr>();
                         for (int p = 0; p < parameters.Length; p++)
                             arguments.Add(new H.ParamExpr(p + first, parameters[p]));
@@ -1366,8 +1396,9 @@ namespace Larva.Hir.Lowering
                         }
                         H.Stmt body = result == H.HirType.Void ? new H.ExprStmt(call) : new H.ReturnStmt(call);
                         H.Parameter[] wrapperParameters = [.. parameters.Select((t, i) => new H.Parameter($"p{i}", t))];
-                        if (!required.IsStatic)
-                            wrapperParameters = [new H.Parameter("self", selfType), .. wrapperParameters];
+                        wrapperParameters = required.IsStatic
+                            ? [new H.Parameter("$self", new H.NullableType(new H.PointerType(selfType, false))), .. wrapperParameters]
+                            : [new H.Parameter("self", selfType), .. wrapperParameters];
                         var wrapper = new H.MethodDef($"$impl.{iface.Name}.{required.Name}", result, wrapperParameters)
                         {
                             Flags = H.MethodFlags.Static | H.MethodFlags.Generated,
@@ -1537,10 +1568,14 @@ namespace Larva.Hir.Lowering
             return result;
         }
 
-        /// <summary><c>I.M(T, params…) -&gt; result</c>: calling interface method <paramref name="method"/> on a <paramref name="self"/>.</summary>
+        /// <summary>
+        /// <c>I.M(T, params…) -&gt; result</c>: calling interface method <paramref name="method"/> on a <paramref name="self"/>.
+        /// A static member takes a <c>?*T</c> first instead (always null): its own parameters may not name T (<c>Count() -&gt;
+        /// i32</c>), and the requirement must still tell the types that implement it apart.
+        /// </summary>
         internal Requirement InterfaceRequirement(TypeInfo iface, H.MethodDef method, H.HirType[] arguments, H.HirType self, string where, GenericContext context) =>
             new(RequirementName(iface, method),
-                [.. method.IsStatic ? [] : new[] { Lower(self, where, context) }, .. method.Parameters.Select(p => Lower(Substitute(p.Type, arguments), where, context))],
+                [method.IsStatic ? new OptionalType(new IR.PointerType(Lower(self, where, context), false)) : Lower(self, where, context), .. method.Parameters.Select(p => Lower(Substitute(p.Type, arguments), where, context))],
                 Lower(Substitute(method.Result, arguments), where, context));
 
         /// <summary>The method of <paramref name="info"/> (or a base) named <paramref name="name"/> taking those parameters.</summary>

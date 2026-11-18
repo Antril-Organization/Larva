@@ -93,7 +93,7 @@ namespace Larva.Hir.Lowering
             {
                 if (!info.IsInterface)
                     continue;
-                var context = new GenericContext(info.GenericCount);
+                var context = ContextOf(info);
                 var methods = InterfaceMethods(new H.NamedType(H.TypeToken.Def(info.Index), OwnParameters(info))).ToList();
                 var fields = methods.Select(m => (IrType)new FunctionType(
                     [RootHandle, .. m.Method.Parameters.Select(p => Lower(Substitute(p.Type, m.Arguments), info.Name, context))],
@@ -264,7 +264,7 @@ namespace Larva.Hir.Lowering
                 var (owner, iface, ownerArguments, thunk) = interfaces[e];
                 var ifaceInfo = Types[iface.Type.Index];
                 var itable = Itables[ifaceInfo.Index];
-                var context = new GenericContext(owner.GenericCount);
+                var context = ContextOf(owner);
                 var arguments = iface.Arguments.Select(a => Lower(a, owner.Name, context).Substitute(ownerArguments)).ToArray();
                 var tableType = IrType.Struct(itable.Struct, arguments);
                 int table = b.Local(tableType, null, mutable: true);
@@ -340,7 +340,7 @@ namespace Larva.Hir.Lowering
                 if (boxes.TryGetValue(info.Index, out var existing))
                     return existing;
                 var root = Types.FirstOrDefault(t => t.IsClass && t.Base < 0 && t.Definition.FullName == "System.Any");
-                var context = new GenericContext(info.GenericCount);
+                var context = ContextOf(info);
                 var own = info.OwnArguments;
                 var valueType = info.IsPrimitive || info.IsEnum
                     ? Lower(info.IsPrimitive ? info.Definition.Underlying! : new H.NamedType(H.TypeToken.Def(info.Index), []), info.Name, context)
