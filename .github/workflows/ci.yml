@@ -37,6 +37,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - name: Antril's language pack, what larva compiles .ant with
         run: dotnet build Antril/src/Antril -c Debug
       - name: Tests
