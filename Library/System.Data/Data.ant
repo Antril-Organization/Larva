@@ -1,0 +1,273 @@
+// Databases: a connection runs SQL; a command is one statement prepared once and run many times, with its parameters
+// bound by position (1, 2…) or by name, and its rows read column by column, as the database gives them (no row object
+// is made unless the program makes one). A provider (System.Data.Sqlite) derives Connection and Command.
+
+import System;
+
+into namespace System.Data
+{
+	/// What the database refused or could not do: its message and its own error code.
+	public class DataError : Exception
+	{
+		i32 code;
+
+		public:
+			new(str message, i32 code) : base(message) { this.code = code; }
+
+			/// The database's error code (SQLite: SQLITE_CONSTRAINT is 19, SQLITE_BUSY 5…).
+			i32 Code { get => code; }
+	}
+
+	/// The kind of value a column of the current row holds.
+	public enum ColumnType { Integer = 1, Real = 2, Text = 3, Blob = 4, Null = 5 }
+
+	/// A database connection: SQL run directly, statements prepared, transactions.
+	public base class Connection
+	{
+		public:
+			/// Runs `sql` (one statement or several, separated by `;`), with no parameters and no rows read: how many rows
+			/// the last statement changed.
+			Execute(str sql) : i64;
+
+			/// `sql` prepared: bind its parameters, run it, read its rows; run again with other values.
+			Prepare(str sql) : Command;
+
+			/// The key of the row the last INSERT added.
+			LastInsertId() : i64;
+
+			/// Closes the connection (its commands with it). Nothing may be run on it after.
+			Close();
+
+			/// Whether it is still open.
+			IsOpen() : bool;
+
+			/// A transaction: Commit keeps what was done after it, Rollback undoes it.
+			Begin() : Transaction => new Transaction(this);
+
+			/// Runs `body` in a transaction: committed when it returns, rolled back (and what it threw thrown again) when
+			/// it throws.
+			InTransaction(func body)
+			{
+				Transaction transaction = new Transaction(this);
+				try
+				{
+					body();
+				}
+				catch (Exception e)
+				{
+					transaction.Rollback();
+					throw e;
+				}
+				transaction.Commit();
+			}
+
+			/// The single value of the first column of the first row of `sql` (an integer), or `fallback` without rows.
+			QueryI64(str sql, i64 fallback) : i64
+			{
+				Command command = Prepare(sql);
+				i64 value = command.Step() && !command.IsNull(0) ? command.GetI64(0) : fallback;
+				command.Close();
+				return value;
+			}
+	}
+
+	/// A prepared statement. Parameters are numbered from 1 (`?1`, `?`, or by name: `:name`, `@name`, `$name`); columns
+	/// of the current row from 0. Step moves to the next row; Run runs the statement to its end.
+	public base class Command
+	{
+		public:
+			Bind(i32 index, i64 value);
+			Bind(i32 index, f64 value);
+			Bind(i32 index, str value);
+			Bind(i32 index, u8[] value);
+			Bind(i32 index, bool value) { Bind(index, value ? 1i64 : 0i64); }
+			BindNull(i32 index);
+
+			// Every primitive by its own overload, and nullable ones (null binds NULL): code made per field (a `derive`
+			// function) binds a field of any of these types with `Bind(i, this.f)`.
+			Bind(i32 index, i32 value) { Bind(index, (i64)value); }
+			Bind(i32 index, u32 value) { Bind(index, (i64)value); }
+			Bind(i32 index, i16 value) { Bind(index, (i64)value); }
+			Bind(i32 index, u16 value) { Bind(index, (i64)value); }
+			Bind(i32 index, i8 value) { Bind(index, (i64)value); }
+			Bind(i32 index, u8 value) { Bind(index, (i64)value); }
+			/// Stored as its bits in an i64 (SQLite has no unsigned 64-bit integers): read back with Get(i, u64).
+			Bind(i32 index, u64 value) { Bind(index, (i64)value); }
+			Bind(i32 index, f32 value) { Bind(index, (f64)value); }
+
+			Bind(i32 index, str? value)
+			{
+				if (value is str text)
+					Bind(index, text);
+				else
+					BindNull(index);
+			}
+
+			Bind(i32 index, u8[]? value)
+			{
+				if (value is u8[] bytes)
+					Bind(index, bytes);
+				else
+					BindNull(index);
+			}
+
+			Bind(i32 index, i64? value)
+			{
+				if (value is i64 number)
+					Bind(index, number);
+				else
+					BindNull(index);
+			}
+
+			Bind(i32 index, i32? value)
+			{
+				if (value is i32 number)
+					Bind(index, (i64)number);
+				else
+					BindNull(index);
+			}
+
+			Bind(i32 index, f64? value)
+			{
+				if (value is f64 number)
+					Bind(index, number);
+				else
+					BindNull(index);
+			}
+
+			Bind(i32 index, bool? value)
+			{
+				if (value is bool flag)
+					Bind(index, flag ? 1i64 : 0i64);
+				else
+					BindNull(index);
+			}
+
+			// A column read as the type of `like` (only its type matters): code made per field reads any of these with
+			// `item.f = command.Get(i, item.f)`.
+			Get(i32 column, i64 like) : i64 => GetI64(column);
+			Get(i32 column, i32 like) : i32 => (i32)GetI64(column);
+			Get(i32 column, u32 like) : u32 => (u32)GetI64(column);
+			Get(i32 column, i16 like) : i16 => (i16)GetI64(column);
+			Get(i32 column, u16 like) : u16 => (u16)GetI64(column);
+			Get(i32 column, i8 like) : i8 => (i8)GetI64(column);
+			Get(i32 column, u8 like) : u8 => (u8)GetI64(column);
+			Get(i32 column, u64 like) : u64 => (u64)GetI64(column);
+			Get(i32 column, f64 like) : f64 => GetF64(column);
+			Get(i32 column, f32 like) : f32 => (f32)GetF64(column);
+			Get(i32 column, bool like) : bool => GetI64(column) != 0;
+			Get(i32 column, str like) : str => GetText(column);
+			Get(i32 column, u8[] like) : u8[] => GetBytes(column);
+			Get(i32 column, str? like) : str? => IsNull(column) ? null : GetText(column);
+			Get(i32 column, u8[]? like) : u8[]? => IsNull(column) ? null : GetBytes(column);
+
+			Get(i32 column, i64? like) : i64?
+			{
+				if (IsNull(column))
+					return null;
+				return GetI64(column);
+			}
+
+			Get(i32 column, i32? like) : i32?
+			{
+				if (IsNull(column))
+					return null;
+				return (i32)GetI64(column);
+			}
+
+			Get(i32 column, f64? like) : f64?
+			{
+				if (IsNull(column))
+					return null;
+				return GetF64(column);
+			}
+
+			Get(i32 column, bool? like) : bool?
+			{
+				if (IsNull(column))
+					return null;
+				return GetI64(column) != 0;
+			}
+
+			/// The number of the parameter `name` (`:id`, with its sign), or 0 when there is none.
+			ParameterIndex(str name) : i32;
+
+			/// How many parameters the statement takes.
+			ParameterCount() : i32;
+
+			/// Every parameter set back to NULL.
+			ClearBindings();
+
+			/// Runs the statement to its next row: whether there is one (false: it has ended).
+			Step() : bool;
+
+			/// Back to the start: it can be run again (the parameters keep their values).
+			Reset();
+
+			/// Runs it to its end and resets it: how many rows it changed.
+			Run() : i64;
+
+			/// How many columns its rows have.
+			ColumnCount() : i32;
+
+			/// A column's name.
+			ColumnName(i32 column) : str;
+
+			/// The kind of value the column holds in the current row.
+			ColumnType(i32 column) : ColumnType;
+
+			IsNull(i32 column) : bool => ColumnType(column) == ColumnType.Null;
+
+			GetI64(i32 column) : i64;
+			GetI32(i32 column) : i32 => (i32)GetI64(column);
+			GetBool(i32 column) : bool => GetI64(column) != 0;
+			GetF64(i32 column) : f64;
+
+			/// The column's text (UTF-8); "" for NULL.
+			GetText(i32 column) : str;
+
+			/// The column's bytes; empty for NULL.
+			GetBytes(i32 column) : u8[];
+
+			/// The column's text, or null for NULL.
+			GetTextOrNull(i32 column) : str? => IsNull(column) ? null : GetText(column);
+
+			/// Frees the statement. Nothing may be run on it after.
+			Close();
+	}
+
+	/// Begin to Commit or Rollback. One that is neither is rolled back when its connection closes.
+	public final class Transaction
+	{
+		Connection connection;
+		bool finished;
+
+		public:
+			new(Connection connection)
+			{
+				this.connection = connection;
+				connection.Execute("BEGIN");
+				finished = false;
+			}
+
+			/// Keeps what was done.
+			Commit()
+			{
+				if (finished)
+					throw new InvalidOperationError("the transaction has already finished");
+				connection.Execute("COMMIT");
+				finished = true;
+			}
+
+			/// Undoes what was done (nothing when it has already finished).
+			Rollback()
+			{
+				if (finished)
+					return;
+				finished = true;
+				connection.Execute("ROLLBACK");
+			}
+
+			bool Finished { get => finished; }
+	}
+}
