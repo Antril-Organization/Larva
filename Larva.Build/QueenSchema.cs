@@ -17,7 +17,8 @@ namespace Larva.Build
         public static readonly QueenChunkSchema Proj = new("PROJ", "The project: its name, kind and version.",
         [
             new("name", "The project's name (the name of its executable or library).", [], "MyApp"),
-            new("type", "What the project builds: a program or a library.", ["exe", "library"]),
+            new("type", "What the project builds: a program, a library, or a tool (a program installed into larva: `larva tool install`, run as `larva <command>`).", ["exe", "library", "tool"]),
+            new("command", "With `type: tool`: the command it is run by (`larva <command>`; by default the name in lower case).", [], "nest"),
             new("version", "The project's version.", [], "v1.0"),
             new("author", "Who wrote it.", [], "My Organization"),
             new("description", "What it is (no commas: a comma ends the entry).", []),
@@ -82,7 +83,12 @@ namespace Larva.Build
             new("private", "`true`: the project is never published.", ["true", "false"]),
         ]);
 
-        public static readonly QueenChunkSchema[] Chunks = [Proj, Build, Deps, Sources, Files, Resources, Hive];
+        public static readonly QueenChunkSchema Tools = new("TOOLS", "The tools this project uses (any number of times): Hive packages of `type: tool`, run as `larva <command>` in the project's folder. `larva tool install` adds them; `larva tool restore` installs them.",
+        [
+            new("tool", "A tool: `Author/Name`, or with a version: `Author/Name@1.2`, `@^1.2`.", [], "Antril-Organization/Nest.Tool@^1.0"),
+        ]);
+
+        public static readonly QueenChunkSchema[] Chunks = [Proj, Build, Deps, Sources, Files, Resources, Hive, Tools];
 
         public static QueenChunkSchema? Chunk(string name) => Chunks.FirstOrDefault(c => c.Name == name);
 

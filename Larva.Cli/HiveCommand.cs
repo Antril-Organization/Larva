@@ -182,7 +182,7 @@ internal static class HiveCommand
         }
     }
 
-    private static string FindQueen(string? path) =>
+    internal static string FindQueen(string? path) =>
         QueenProject.Find(path ?? Directory.GetCurrentDirectory())
         ?? throw new HiveException(path is null ? "no .queen project here" : $"no project at {path}");
 
@@ -198,7 +198,7 @@ internal static class HiveCommand
         }
     }
 
-    private static QueenProject LoadProject(string? path, bool resolvePackages = true)
+    internal static QueenProject LoadProject(string? path, bool resolvePackages = true)
     {
         var diagnostics = new List<QueenDiagnostic>();
         // Installing reads the project without needing its packages installed yet.
@@ -208,7 +208,7 @@ internal static class HiveCommand
         return project ?? throw new HiveException("the project has errors");
     }
 
-    private static HiveInstaller Installer(QueenProject project)
+    internal static HiveInstaller Installer(QueenProject project)
     {
         var providers = project.Hive.Providers.Select(p => HiveProvider.Parse(p, project.Folder)).ToList();
         return new HiveInstaller(HiveCache.For(project.Hive), providers, project.Hive.RequireSignatures, Console.WriteLine);
@@ -220,7 +220,8 @@ internal static class HiveCommand
         // Read without resolving packages: they are what is being installed.
         var project = LoadProject(queen, resolvePackages: false);
         var previous = HiveLock.Load(project.Folder);
-        var packages = project.Packages.ToList();
+        // The project's tools (TOOLS) are pinned in the same lock: `larva hive install` keeps them.
+        var packages = project.Packages.Concat(project.Tools.Where(t => !project.Packages.Any(p => p.Id == t.Id))).ToList();
         if (added is not null)
         {
             packages.RemoveAll(p => p.Id == added.Id);
@@ -287,7 +288,13 @@ internal static class HiveCommand
     }
 
     /// <summary>`larva hive add`: a `package:` entry in the project's DEPS chunk (a DEPS chunk at the end when it has none).</summary>
-    private static void AddDependency(string queen, PackageReference package)
+    private static void AddDependency(string queen, PackageReference package) => AddEntry(queen, "DEPS", "package", package);
+
+    /// <summary>
+    /// A <c>key: Author/Name[@version]</c> entry in the project's <paramref name="chunkName"/> chunk (the chunk at the end
+    /// when it has none); an entry of that key for the same package is replaced, not repeated.
+    /// </summary>
+    internal static void AddEntry(string queen, string chunkName, string key, PackageReference package)
     {
         string text = File.ReadAllText(queen);
         // The file's own line endings (its first line's; LF for a file of one line) and whether it ends with one are kept.
@@ -296,12 +303,12 @@ internal static class HiveCommand
         var lines = text.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
         if (endsWithNewline && lines.Count > 0)
             lines.RemoveAt(lines.Count - 1);
-        int deps = lines.FindIndex(l => l.Trim() is "chunk DEPS:");
+        int deps = lines.FindIndex(l => l.Trim() == $"chunk {chunkName}:");
         if (deps < 0)
         {
             while (lines.Count > 0 && lines[^1].Trim().Length == 0)
                 lines.RemoveAt(lines.Count - 1);
-            lines.AddRange(["", "chunk DEPS:", $"   package: {package}"]);
+            lines.AddRange(["", $"chunk {chunkName}:", $"   {key}: {package}"]);
         }
         else
         {
@@ -314,19 +321,63 @@ internal static class HiveCommand
                 last--;
             // The package already there (at another version, or none): its entry is replaced, not repeated.
             int existing = lines.FindIndex(deps + 1, Math.Max(0, last - deps), l =>
-                l.Trim().TrimEnd(',').Trim() is var entry && entry.StartsWith("package:", StringComparison.Ordinal)
-                && PackageReference.Parse(entry["package:".Length..].Trim())?.Id == package.Id);
+                IsEntryOf(l, key, package));
             if (existing >= 0)
             {
                 string indent = lines[existing][..(lines[existing].Length - lines[existing].TrimStart().Length)];
-                lines[existing] = $"{indent}package: {package}{(lines[existing].TrimEnd().EndsWith(',') ? "," : "")}";
+                lines[existing] = $"{indent}{key}: {package}{(lines[existing].TrimEnd().EndsWith(',') ? "," : "")}";
                 File.WriteAllText(queen, string.Join(newline, lines) + (endsWithNewline ? newline : ""));
                 return;
             }
             if (last > deps)
                 lines[last] = lines[last].TrimEnd().TrimEnd(',') + ",";
-            lines.Insert(last + 1, $"   package: {package}");
+            lines.Insert(last + 1, $"   {key}: {package}");
         }
         File.WriteAllText(queen, string.Join(newline, lines) + (endsWithNewline ? newline : ""));
+    }
+
+    /// <summary>Whether a line is the <c>key:</c> entry of <paramref name="package"/> (any version).</summary>
+    private static bool IsEntryOf(string line, string key, PackageReference package) =>
+        line.Trim().TrimEnd(',').Trim() is var entry && entry.StartsWith(key + ":", StringComparison.Ordinal)
+        && PackageReference.Parse(entry[(key.Length + 1)..].Trim())?.Id == package.Id;
+
+    /// <summary>
+    /// Takes out of the project's <paramref name="chunkName"/> chunk the <c>key:</c> entry of <paramref name="package"/>
+    /// (any version); false when there is none. A chunk left empty goes too.
+    /// </summary>
+    internal static bool RemoveEntry(string queen, string chunkName, string key, PackageReference package)
+    {
+        string text = File.ReadAllText(queen);
+        string newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        bool endsWithNewline = text.Length == 0 || text.EndsWith('\n');
+        var lines = text.Split('\n').Select(l => l.TrimEnd('\r')).ToList();
+        if (endsWithNewline && lines.Count > 0)
+            lines.RemoveAt(lines.Count - 1);
+        int start = lines.FindIndex(l => l.Trim() == $"chunk {chunkName}:");
+        if (start < 0)
+            return false;
+        int end = start + 1;
+        while (end < lines.Count && !lines[end].TrimStart().StartsWith("chunk ", StringComparison.Ordinal))
+            end++;
+        int found = lines.FindIndex(start + 1, end - start - 1, l => IsEntryOf(l, key, package));
+        if (found < 0)
+            return false;
+        lines.RemoveAt(found);
+        end--;
+        // The entry before it ended with a comma because this one followed: the chunk's last entry keeps none.
+        int last = end - 1;
+        while (last > start && lines[last].Trim().Length == 0)
+            last--;
+        if (last > start && found > last)
+            lines[last] = lines[last].TrimEnd().TrimEnd(',');
+        if (last == start)
+        {
+            // Nothing left in the chunk: it goes, with the blank line before it.
+            lines.RemoveRange(start, end - start);
+            if (start > 0 && lines[start - 1].Trim().Length == 0)
+                lines.RemoveAt(start - 1);
+        }
+        File.WriteAllText(queen, string.Join(newline, lines) + (endsWithNewline ? newline : ""));
+        return true;
     }
 }

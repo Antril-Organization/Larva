@@ -29,8 +29,10 @@ namespace Hive
         /// </summary>
         public static HiveManifest Pack(QueenProject project, string compiled, string output, string? gc, string? privatePem)
         {
-            if (project.Kind != ProjectKind.Library)
-                throw new HiveException($"{project.Name} is `type: exe`: packages are libraries");
+            if (project.Kind == ProjectKind.Exe)
+                throw new HiveException($"{project.Name} is `type: exe`: packages are libraries or tools (`type: tool`)");
+            if (project.Kind == ProjectKind.Tool && project.Hive.PublishSources)
+                throw new HiveException($"{project.Name} is a tool: tools are published compiled (remove `publish: source`)");
             if (project.Hive.Private)
                 throw new HiveException($"{project.Name} is private (`private: true` in HIVE)");
             if (project.Version is not { } version)
@@ -104,7 +106,7 @@ namespace Hive
             var dependencies = project.Packages.Select(p => new HiveDependency(p.Id, p.Version?.ToString() ?? "")).ToArray();
             string queen = Path.Combine(Path.GetTempPath(), $"hive-{Guid.NewGuid():N}.queen");
             bool hasObjects = (!sources && lvos.Count > 0) || project.AllLibraries().Any(l => !QueenProject.IsAssembly(l));
-            File.WriteAllText(queen, ProjectText(name, versionText, sources, hasObjects, assemblyFiles, natives, dependencies, resources));
+            File.WriteAllText(queen, ProjectText(name, versionText, project.Kind == ProjectKind.Tool ? project.Command : null, sources, hasObjects, assemblyFiles, natives, dependencies, resources));
             try
             {
                 Add(ProjectFile, queen);
@@ -116,6 +118,7 @@ namespace Hive
                     License = project.Hive.License,
                     Kind = sources ? "source" : "compiled",
                     Gc = sources ? null : gc,
+                    Command = project.Kind == ProjectKind.Tool ? project.Command : null,
                     Dependencies = dependencies,
                 };
                 return HiveArchive.Create(output, manifest, files, privatePem);
@@ -126,12 +129,14 @@ namespace Hive
             }
         }
 
-        private static string ProjectText(PackageReference name, string version, bool sources, bool hasLibraries, List<string> assemblies,
+        private static string ProjectText(PackageReference name, string version, string? command, bool sources, bool hasLibraries, List<string> assemblies,
             List<string> natives, HiveDependency[] dependencies, List<(string Key, string Path)> resources)
         {
             var text = new StringBuilder();
             text.Append("queen 1.0;\n\n");
-            text.Append($"chunk PROJ:\n   name: {name.Name},\n   type: library,\n   version: v{version},\n   author: {name.Author}\n\n");
+            text.Append(command is null
+                ? $"chunk PROJ:\n   name: {name.Name},\n   type: library,\n   version: v{version},\n   author: {name.Author}\n\n"
+                : $"chunk PROJ:\n   name: {name.Name},\n   type: tool,\n   command: {command},\n   version: v{version},\n   author: {name.Author}\n\n");
             text.Append(sources ? "chunk SOURCES:\n   scan: false,\n   include: src/**\n\n" : "chunk SOURCES:\n   scan: false\n\n");
             var deps = new List<string>();
             if (hasLibraries)
