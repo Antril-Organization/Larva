@@ -436,6 +436,7 @@ namespace Larva.Build
             "FILES" => key == "copy",
             "RESOURCES" => key == "embed",
             "HIVE" => key == "provider",
+            "TOOLS" => key == "tool",
             _ => key is "local" or "package",
         };
 

@@ -2,7 +2,8 @@ using Larva.IR;
 
 namespace Larva.Build
 {
-    public enum ProjectKind : byte { Exe, Library }
+    /// <summary>What a project builds: a program, a library, or a tool (a program larva installs and runs as `larva <command>`).</summary>
+    public enum ProjectKind : byte { Exe, Library, Tool }
 
     public enum ProjectBackend : byte { Vm, Llvm, X64 }
 
@@ -40,6 +41,12 @@ namespace Larva.Build
         public uint[]? Version { get; private set; }
         public string? Author { get; private set; }
         public string? Description { get; private set; }
+
+        /// <summary>A tool's command (PROJ <c>command</c>; by default its name in lower case); null for other projects.</summary>
+        public string? Command { get; private set; }
+
+        /// <summary><c>tool: Author/Name[@version]</c> entries of <c>TOOLS</c>: the tools this project uses.</summary>
+        public List<PackageReference> Tools { get; } = [];
 
         public GcConfig Gc { get; private set; } = GcConfig.Default;
         public ProjectBackend Backend { get; private set; } = ProjectBackend.Vm;
@@ -110,7 +117,7 @@ namespace Larva.Build
 
         /// <summary>Where a build goes when <c>output</c> is not set: <c>bin/NAME.exe</c> or <c>bin/NAME.lvo</c>.</summary>
         public string DefaultOutput(bool native) =>
-            Output ?? Path.Combine(Folder, "bin", Name + (native && Kind == ProjectKind.Exe ? Target == ProjectTarget.Wasm ? ".wasm" : ExecutableExtension : ".lvo"));
+            Output ?? Path.Combine(Folder, "bin", Name + (native && Kind != ProjectKind.Library ? Target == ProjectTarget.Wasm ? ".wasm" : ExecutableExtension : ".lvo"));
 
         private string ExecutableExtension => (Platform ?? (OperatingSystem.IsWindows() ? "windows" : "unix")).StartsWith("windows", StringComparison.Ordinal) ? ".exe" : "";
 
@@ -507,9 +514,21 @@ namespace Larva.Build
                 {
                     "exe" => ProjectKind.Exe,
                     "library" => ProjectKind.Library,
-                    _ => Bad(type.Value, "`type` is `exe` or `library`", ProjectKind.Exe),
+                    "tool" => ProjectKind.Tool,
+                    _ => Bad(type.Value, "`type` is `exe`, `library` or `tool`", ProjectKind.Exe),
                 };
             }
+            if (proj["command"] is { } command)
+            {
+                if (Kind != ProjectKind.Tool)
+                    Report(diagnostics, "QN126", "`command` is for `type: tool` projects", command.Value, error: false);
+                else if (IsCommandName(command.Value.Display))
+                    Command = command.Value.Display;
+                else
+                    Bad<string?>(command.Value, "`command` is a word of lower-case letters, digits and `-` (`nest`, `db-tool`)", null);
+            }
+            if (Kind == ProjectKind.Tool && Command is null && Name.Length > 0)
+                Command = Name.ToLowerInvariant();
             if (proj["version"] is { } version)
             {
                 Version = version.Value switch
@@ -684,6 +703,21 @@ namespace Larva.Build
             }
             if (hive.Providers.Length == 0)
                 hive = hive with { Providers = HiveSettings.Defaults() };
+            foreach (var entry in Document.Named("TOOLS").SelectMany(c => c.Entries))
+            {
+                if (entry.Key != "tool")
+                {
+                    Report(diagnostics, "QN121", "`" + entry.Key + "` is not a TOOLS key (tool)", entry.Value, error: false);
+                    continue;
+                }
+                foreach (var value in entry.Value is QueenList listed ? listed.Items : [entry.Value])
+                {
+                    if (PackageReference.Parse(value.Display, value.Line, value.Column) is { } tool)
+                        Tools.Add(tool);
+                    else
+                        Report(diagnostics, "QN104", $"`tool` is `Author/Name`, optionally with a version (`Author/Name@1.2`, `@^1.2`), not `{value.Display}`", value);
+                }
+            }
             Hive = hive;
 
             if (CustomGc && GcCollector is null && Document.Named("BUILD").FirstOrDefault() is { } buildChunk)
@@ -699,6 +733,10 @@ namespace Larva.Build
         }
 
         private bool stdlibSet;
+
+        /// <summary>Whether <paramref name="name"/> can be a tool's command: lower-case letters, digits and `-`, starting with a letter.</summary>
+        public static bool IsCommandName(string name) =>
+            name.Length is > 0 and <= 64 && name[0] is >= 'a' and <= 'z' && name.All(c => c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-');
 
         // ── Sources ────────────────────────────────────────────
 
