@@ -109,6 +109,18 @@ internal static class SourceBuild
             references.Add(CoreReference(coreBytes, corePath));
         }
         references.AddRange(libraries.Select(l => LanguagePack.Reference(Path.GetFullPath(l))));
+        // Larva's other libraries (System.Bindings, System.Data) when a source names them, as `larva build` links them.
+        if (name != "System.Core" && !StandardLibraries.Contains(name) && UsedLibraries(inputs) is { Count: > 0 } used)
+        {
+            if (CoreLibrary(core, noCache: false, out _, out _) is not { } coreForLibraries)
+                return 1;
+            foreach (string library in used)
+            {
+                if (BindProfile.StandardLibrary(library, coreForLibraries, out string? libraryPath) is not { } libraryBytes)
+                    return 1;
+                references.Add(libraryPath is not null ? LanguagePack.Reference(libraryPath) : LanguagePack.Reference(libraryBytes));
+            }
+        }
         var result = Compile(language, inputs, name, references, library: true, options: options);
         timings.Mark("frontend");
         if (result?.Assembly is not { } bytes)
@@ -170,17 +182,32 @@ internal static class SourceBuild
         return new Compiled(result?["assembly"]?.GetValue<string>() is { } data ? Convert.FromBase64String(data) : null, result?["types"]?.GetValue<int>() ?? 0);
     }
 
-    /// <summary>Whether a source names System.Bindings (read as text: no language is asked).</summary>
-    private static bool UsesBindings(string source)
+    /// <summary>Larva's libraries beside System.Core that a build links when a source names them.</summary>
+    internal static readonly string[] StandardLibraries = ["System.Bindings", "System.Data"];
+
+    /// <summary>The <see cref="StandardLibraries"/> the sources name (each file read once, as text: no language is asked).</summary>
+    internal static List<string> UsedLibraries(IEnumerable<string> sources)
     {
-        try
+        var used = new List<string>();
+        foreach (string source in sources)
         {
-            return File.ReadAllText(source).Contains("System.Bindings", StringComparison.Ordinal);
+            string text;
+            try
+            {
+                text = File.ReadAllText(source);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+            foreach (string library in StandardLibraries)
+                if (!used.Contains(library) && text.Contains(library, StringComparison.Ordinal))
+                    used.Add(library);
+            if (used.Count == StandardLibraries.Length)
+                break;
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        {
-            return false;
-        }
+        // In the order they depend on each other (the list's).
+        return [.. StandardLibraries.Where(used.Contains)];
     }
 
     public static int Build(string[] args)
@@ -347,6 +374,7 @@ internal static class SourceBuild
         }
         var assemblyBytes = new List<byte[]>();
         var assemblyNames = new List<string>();
+        var neededLibraries = new HashSet<string>(StringComparer.Ordinal);
         foreach (string assembly in assemblies.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (!File.Exists(assembly))
@@ -358,7 +386,10 @@ internal static class SourceBuild
             // Checked here (its metadata only; bodies stay unread), before the frontend gets a damaged file to trip over.
             try
             {
-                LvaFormat.Read(bytes);
+                // The standard libraries it was compiled against come with it (Nest.dll uses System.Data).
+                foreach (var reference in LvaFormat.Read(bytes).References)
+                    if (StandardLibraries.Contains(reference.Name))
+                        neededLibraries.Add(reference.Name);
             }
             catch (HirFormatException e)
             {
@@ -370,13 +401,14 @@ internal static class SourceBuild
             references.Add(LanguagePack.Reference(assembly));
             timings.Mark(Path.GetFileName(assembly));
         }
-        // System.Bindings, when a source uses it (a binding profile kept with the project it binds for).
-        if (inputs.Any(UsesBindings))
+        // System.Bindings (a binding profile kept with the project it binds for), System.Data: when a source uses them.
+        var usedLibraries = UsedLibraries(inputs);
+        foreach (string library in StandardLibraries.Where(l => neededLibraries.Contains(l) || usedLibraries.Contains(l)))
         {
-            if (BindProfile.BindingsLibrary(coreBytes, out string? bindingsPath) is not { } bindingsBytes)
+            if (BindProfile.StandardLibrary(library, coreBytes, out string? libraryPath) is not { } libraryBytes)
                 return 1;
-            assemblyBytes.Add(bindingsBytes);
-            references.Add(bindingsPath is not null ? LanguagePack.Reference(bindingsPath) : LanguagePack.Reference(bindingsBytes));
+            assemblyBytes.Add(libraryBytes);
+            references.Add(libraryPath is not null ? LanguagePack.Reference(libraryPath) : LanguagePack.Reference(libraryBytes));
         }
         byte[][] programBytes = [];
         if (!compiledOnly)
