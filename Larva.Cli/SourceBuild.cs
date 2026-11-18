@@ -404,6 +404,8 @@ internal static class SourceBuild
         var assemblyBytes = new List<byte[]>();
         var assemblyNames = new List<string>();
         var neededLibraries = new HashSet<string>(StringComparer.Ordinal);
+        // Each input assembly's bytes by its name (what translations of quoted functions are kept by).
+        var inputBytes = new Dictionary<string, byte[]>(StringComparer.Ordinal) { [CoreAssemblyName] = coreBytes };
         foreach (string assembly in assemblies.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (!File.Exists(assembly))
@@ -416,7 +418,9 @@ internal static class SourceBuild
             try
             {
                 // The standard libraries it was compiled against come with it (Nest.dll uses System.Data).
-                foreach (var reference in LvaFormat.Read(bytes).References)
+                var read = LvaFormat.Read(bytes);
+                inputBytes[read.Name] = bytes;
+                foreach (var reference in read.References)
                     if (StandardLibraries.Contains(reference.Name))
                         neededLibraries.Add(reference.Name);
             }
@@ -437,6 +441,7 @@ internal static class SourceBuild
             if (BindProfile.StandardLibrary(library, coreBytes, out string? libraryPath) is not { } libraryBytes)
                 return 1;
             assemblyBytes.Add(libraryBytes);
+            inputBytes[library] = libraryBytes;
             references.Add(libraryPath is not null ? LanguagePack.Reference(libraryPath) : LanguagePack.Reference(libraryBytes));
         }
         byte[][] programBytes = [];
@@ -447,6 +452,7 @@ internal static class SourceBuild
             if (program?.Assembly is not { } compiledProgram)
                 return 1;
             programBytes = [compiledProgram];
+            inputBytes[name] = compiledProgram;
         }
         // Compiled only: the linked program is named apart from its libraries (a tool `nest` from the library `Nest`).
         string linkName = compiledOnly ? "$program." + name : name;
@@ -468,6 +474,12 @@ internal static class SourceBuild
                 Console.Error.WriteLine($"larva: {error}");
             return 1;
         }
+        // Quoted functions passed to parameters that name a translator ([CompileWith]): translated now (a library's own
+        // code reads them), their errors the build's.
+        var builtLibraries = new HashSet<string>(StringComparer.Ordinal) { CoreAssemblyName, corePath ?? CoreAssemblyName };
+        builtLibraries.UnionWith(StandardLibraries);
+        if (!QuoteTranslation.Run(linked.Assembly!, builtLibraries, inputBytes, timings.Mark))
+            return 1;
         var lowered = HirLowerer.Lower(linked.Assembly!, new LoweringOptions
         {
             StaticConstructorsFromEntry = true,
