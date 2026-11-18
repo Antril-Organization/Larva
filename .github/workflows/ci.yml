@@ -42,4 +42,6 @@ jobs:
       - name: Tests
         env:
           LARVA_LANGUAGES: ${{ github.workspace }}/Antril/artifacts/pack
-        run: dotnet test --solution Larva/Larva.slnx -c Debug
+        # In the repository's folder: its global.json picks the test platform.
+        working-directory: Larva
+        run: dotnet test --solution Larva.slnx -c Debug
