@@ -51,10 +51,12 @@ public sealed class RunCommandTests
         var larva = world.In(Path.GetDirectoryName(queen)!);
         string stamp = Path.Combine(Path.GetDirectoryName(queen)!, "bin", "optioned" + (OperatingSystem.IsWindows() ? ".exe" : "") + ".build");
 
-        string withOptions = larva.Ok("run", "--backend", "x64");
-        Assert.Contains("x64 back end", withOptions);
+        string[] options = OperatingSystem.IsWindows() ? ["--backend", "x64"] : ["-O1"];
+        string shown = OperatingSystem.IsWindows() ? "x64 back end" : "O1";
+        string withOptions = larva.Ok(["run", .. options]);
+        Assert.Contains(shown, withOptions);
         Assert.Contains("hello", withOptions);
-        Assert.DoesNotContain("--backend", File.ReadAllText(stamp));
+        Assert.DoesNotContain(options[0], File.ReadAllText(stamp));
 
         // Nothing changed: the program as built runs, nothing is built (plain run twice too).
         string plain = larva.Ok("run");
@@ -63,6 +65,6 @@ public sealed class RunCommandTests
         Assert.DoesNotContain("back end", larva.Ok("run"));
 
         // Options given always build.
-        Assert.Contains("x64 back end", larva.Ok("run", "--backend", "x64"));
+        Assert.Contains(shown, larva.Ok(["run", .. options]));
     }
 }

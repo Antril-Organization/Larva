@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Larva.Polyglot: names split and joined in each language's style, the model of a library, overloads and collisions. -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Larva.Polyglot\Larva.Polyglot.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir\Larva.Hir.csproj" />
+    <ProjectReference Include="..\..\Larva.Hir.Services\Larva.Hir.Services.csproj" />
+  </ItemGroup>
+
+</Project>

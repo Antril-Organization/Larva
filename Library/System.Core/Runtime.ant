@@ -53,14 +53,57 @@ into namespace System
 			static i32 CurrentManagedThreadId { get => (i32)ThreadNumber(); }
 	}
 
+	/// A collector the program writes (`gc: custom` and `gc.collector` in its project, or GC.Install): where the memory
+	/// of long-lived objects comes from and goes back to, and when to collect. The runtime still finds what is alive; the
+	/// collector decides where it lives and how often to look. Its methods run inside the runtime: what they allocate
+	/// comes from the runtime's own memory, and no collection starts while one runs.
+	public interface IGarbageCollector
+	{
+		/// `size` bytes for an object (aligned to 16; the runtime clears them), or null when there is no memory.
+		unsafe Allocate(u64 size) : u8*;
+
+		/// Memory an object no longer needs (after a collection).
+		unsafe Release(u8* block);
+
+		/// Whether to collect now: `allocated` objects were made since the last collection; `live` stayed after it.
+		ShouldCollect(i64 allocated, i64 live) : bool;
+	}
+
 	/// The collector (System.GC): asking for a collection, and what it has done.
 	public static class GC
 	{
 		extern("gc.request") Request();
 		extern("gc.collections") Collections() : i64;
 		extern("gc.objects") Objects() : i64;
+		unsafe extern("gc.custom") Custom(u64 allocate, u64 release, u64 poll);
+
+		static IGarbageCollector? installed;
+
+		// What the runtime calls: the installed collector's methods.
+		unsafe static OnAllocate(u64 size) : u8* => installed is IGarbageCollector c ? c.Allocate(size) : null;
+		unsafe static OnRelease(u8* block) { if (installed is IGarbageCollector c) c.Release(block); }
+		static OnPoll(i64 allocated, i64 live) : i32 => installed is IGarbageCollector c && c.ShouldCollect(allocated, live) ? 1 : 0;
 
 		public:
+			/// Makes `collector` the program's collector (null: the runtime's own again). Native programs only: the
+			/// interpreter and WebAssembly keep their own heaps.
+			unsafe static Install(IGarbageCollector? collector)
+			{
+				installed = collector;
+				if (collector is null)
+					Custom(0, 0, 0);
+				else
+				{
+					func*<u64> : u8* allocate = &OnAllocate;
+					func*<u8*> release = &OnRelease;
+					func*<i64, i64> : i32 poll = &OnPoll;
+					Custom(*(u64*)&allocate, *(u64*)&release, *(u64*)&poll);
+				}
+			}
+
+			/// The program's collector, or null when the runtime's own is in charge.
+			static IGarbageCollector? Installed { get => installed; }
+
 			/// Collects at the next safepoint.
 			Collect() { Request(); }
 

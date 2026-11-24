@@ -15,7 +15,9 @@ public sealed class LanguagesRegistryTests
     public void Publish_PacksAndSignsEachPlatform_AndSendsOneMultipartRequest()
     {
         var world = new LanguageWorld("languages-publish");
-        string publication = world.Publication("0.8.0", LanguageWorld.Platform, "linux-x64");
+        // This machine's platform and another one.
+        string other = LanguageWorld.Platform == "linux-x64" ? "win-x64" : "linux-x64";
+        string publication = world.Publication("0.8.0", LanguageWorld.Platform, other);
         var requests = new List<(string Method, string Path, string? Authorization, string? ContentType, byte[] Body)>();
         using var server = new HttpListener();
         int port = FreePort();
@@ -70,7 +72,7 @@ public sealed class LanguagesRegistryTests
         Assert.Equal("Bearer hive_test-token", post.Authorization);
         Assert.StartsWith("multipart/form-data", post.ContentType);
         var parts = Multipart(post.Body, post.ContentType!);
-        Assert.Equal(["linux-x64", LanguageWorld.Platform], parts.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal(new[] { other, LanguageWorld.Platform }.Order(StringComparer.Ordinal).ToArray(), parts.Keys.Order(StringComparer.Ordinal).ToArray());
         string? fingerprint = null;
         foreach (var (platform, (fileName, zip)) in parts)
         {

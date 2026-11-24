@@ -418,6 +418,17 @@ namespace Larva.Llvm
             Runtime("larva_net_port", i64, i64);
             Runtime("larva_proc_start", i64, ptr, ptr);
             Runtime("larva_proc_wait", i64, i64);
+            Runtime("larva_handle_new", i64, ptr);
+            Runtime("larva_handle_get", ptr, i64);
+            Runtime("larva_handle_free", v, i64);
+            Runtime("larva_handle_count", i64);
+            Runtime("larva_runtime_enter", v);
+            Runtime("larva_runtime_leave", v);
+            Runtime("larva_thread_detach", v);
+            Runtime("larva_init_lock", v);
+            Runtime("larva_init_unlock", v);
+            Runtime("larva_runtime_callout", v);
+            Runtime("larva_runtime_callin", v);
             Runtime("larva_math_sqrt", i64, i64);
             Runtime("larva_math_sin", i64, i64);
             Runtime("larva_math_cos", i64, i64);

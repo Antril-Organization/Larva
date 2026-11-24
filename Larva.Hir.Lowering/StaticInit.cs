@@ -66,20 +66,29 @@ namespace Larva.Hir.Lowering
             if (order.Count == 0)
                 return;
             StaticInitFunctions = [.. order];
+            // Once, whichever threads call first (a library that other languages call). Done: nothing to do. Else under
+            // the runtime's lock (the other threads wait for it): the first to get it runs them; `started` lets a
+            // constructor that calls back in (the lock is re-entrant) return at once.
             int done = Globals.Count;
             Globals.Add(new GlobalDef("$StaticInit.done", IrType.Bool));
+            int started = Globals.Count;
+            Globals.Add(new GlobalDef("$StaticInit.started", IrType.Bool));
             var b = new FunctionBuilder(StaticInitName, IrType.Unit) { Linkage = Linkage.Export };
             int already = b.Local(IrType.Bool, null, mutable: true);
-            int run = b.NewBlock(), finished = b.NewBlock();
-            b.Assign(already, Rvalue.ReadGlobal(done)).If(Operand.Copy(already), finished, run);
-            b.At(run).StoreGlobal(done, Operand.Bool(true));
+            int unit = b.Local(IrType.Unit, null, mutable: true);
+            int locked = b.NewBlock(), run = b.NewBlock(), unlock = b.NewBlock(), finished = b.NewBlock();
+            b.Assign(already, Rvalue.ReadGlobal(done)).If(Operand.Copy(already), finished, locked);
+            b.At(locked).Assign(unit, new IntrinsicRvalue("init.lock", []))
+                .Assign(already, Rvalue.ReadGlobal(started)).If(Operand.Copy(already), unlock, run);
+            b.At(run).StoreGlobal(started, Operand.Bool(true));
             foreach (int function in order)
             {
                 int next = b.NewBlock();
                 b.Call(function, [], new Place(b.Local(IrType.Unit, null, mutable: true)), next);
                 b.At(next);
             }
-            b.Goto(finished);
+            b.StoreGlobal(done, Operand.Bool(true)).Goto(unlock);
+            b.At(unlock).Assign(unit, new IntrinsicRvalue("init.unlock", [])).Goto(finished);
             b.At(finished).Return();
             StaticInitFunction = Functions.Count;
             Functions.Add(b.Build());

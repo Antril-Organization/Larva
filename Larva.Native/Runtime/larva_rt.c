@@ -35,6 +35,9 @@
  * reuses their memory (a use after collection then reads the poison every run), LARVA_GC_NOSMALL=1 puts every object on the
  * general path (no small-object chunks), to tell their bugs apart.
  */
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* pthread_getattr_np */
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1820,6 +1823,10 @@ typedef struct LarvaThread {
 #else
     pthread_t os;
 #endif
+    int32_t depth;               /* calls into Larva code from another language (larva_runtime_enter) not left yet */
+    int32_t attached;            /* another language's thread (or the first one that entered): stopped while outside */
+    int32_t outside;             /* calls out to another language's code (callbacks: larva_runtime_callout) not back yet */
+    uint64_t stopped_out;        /* bit n: the call out at depth n stopped the thread (one inside a collection does not) */
 } LarvaThread;
 
 static THREAD_LOCAL LarvaThread *this_thread;
@@ -1830,7 +1837,17 @@ static volatile int64_t threads_alive = 1;
 static int64_t next_thread_id = 1;
 static int shared_heap = 1;               /* one thread runs: it allocates through larva_heap (inline in compiled code) */
 static volatile int stop_world;           /* a collection waits for every other thread to stop */
-static int running_count;                 /* threads running (not stopped, not done), the collector apart */
+static LarvaThread *volatile world_stopper;  /* the thread that stopped the world (it runs while the others wait) */
+static volatile long running_count;       /* threads running (not stopped, not done), the collector apart: changed
+                                             atomically (threads of other languages enter and leave without a lock) */
+
+#ifdef _WIN32
+#define RUNNING_ADD(n) _InterlockedExchangeAdd(&running_count, (n))
+#define FULL_FENCE() MemoryBarrier()
+#else
+#define RUNNING_ADD(n) __atomic_fetch_add(&running_count, (n), __ATOMIC_SEQ_CST)
+#define FULL_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
 
 #ifdef _WIN32
 static CRITICAL_SECTION rt_lock, world_lock;
@@ -1904,7 +1921,7 @@ static LarvaThread *current_record(void) {
 static void become_stopped(LarvaThread *me) {
     LOCK(world_lock);
     me->state = THREAD_STOPPED;
-    running_count--;
+    RUNNING_ADD(-1);
     WAKE_ALL(world_stopped);
     UNLOCK(world_lock);
 }
@@ -1915,7 +1932,7 @@ static void become_running(LarvaThread *me) {
     while (stop_world)
         WAIT(world_resumed, world_lock);
     me->state = THREAD_RUNNING;
-    running_count++;
+    RUNNING_ADD(1);
     UNLOCK(world_lock);
 }
 
@@ -3085,6 +3102,122 @@ static void scan_pins(void (*visit)(uintptr_t)) {
     }
 }
 
+/*
+ * Handles: objects another language holds (Larva.Polyglot). A handle is a slot's index + 1 (its low 32 bits) and the
+ * slot's generation (its high 32; 0 is null). A slot is a precise root: a minor collection moves its object and updates
+ * it, a major one marks it, and a handle used after it was freed is caught by its generation. Slots live in chunks that
+ * never move, so larva_handle_get reads one without a lock; making and freeing take the runtime's lock, which a
+ * collection holds. A handle owns a reference (in reference counting, the object lives while the handle does).
+ */
+#define HANDLE_CHUNK_BITS 12
+#define HANDLE_CHUNK ((uint32_t)1 << HANDLE_CHUNK_BITS)
+#define HANDLE_CHUNKS 4096   /* 16M handles at once */
+
+typedef struct {
+    void *object;            /* NULL: free */
+    uint32_t generation;     /* moves on each free */
+    uint32_t next_free;      /* the next free slot's index + 1 (0: none) */
+} HandleSlot;
+
+static HandleSlot *handle_chunks[HANDLE_CHUNKS];
+static uint32_t handle_made;        /* slots made so far */
+static uint32_t handle_free_list;   /* the first free slot's index + 1 (0: none) */
+static int64_t handle_live;
+
+static void handle_misuse(uint64_t handle) {
+    fflush(stdout);
+    fprintf(stderr, "larva: handle %llx is not one the runtime gave, or was freed\n", (unsigned long long)handle);
+    larva_exit(101);
+}
+
+static HandleSlot *handle_slot(uint64_t handle) {
+    uint32_t low = (uint32_t)handle;
+    if (low == 0 || (low - 1) >> HANDLE_CHUNK_BITS >= HANDLE_CHUNKS)
+        return NULL;
+    HandleSlot *chunk = handle_chunks[(low - 1) >> HANDLE_CHUNK_BITS];
+    if (!chunk)
+        return NULL;
+    HandleSlot *slot = &chunk[(low - 1) & (HANDLE_CHUNK - 1)];
+    return slot->object && slot->generation == (uint32_t)(handle >> 32) ? slot : NULL;
+}
+
+/* A handle to a gc object (0 for null): a root until larva_handle_free. */
+LARVA_API uint64_t larva_handle_new(void *object) {
+    if (!object)
+        return 0;
+    int locked = rt_enter();
+    uint32_t index;
+    HandleSlot *slot;
+    if (handle_free_list) {
+        index = handle_free_list - 1;
+        slot = &handle_chunks[index >> HANDLE_CHUNK_BITS][index & (HANDLE_CHUNK - 1)];
+        handle_free_list = slot->next_free;
+    } else {
+        if (handle_made == HANDLE_CHUNKS * HANDLE_CHUNK) {
+            fputs("larva: more than 16M handles at once\n", stderr);
+            larva_exit(101);
+        }
+        index = handle_made;
+        HandleSlot **chunk = &handle_chunks[index >> HANDLE_CHUNK_BITS];
+        if (!*chunk && !(*chunk = (HandleSlot *)calloc(HANDLE_CHUNK, sizeof(HandleSlot))))
+            fail_alloc();
+        handle_made++;
+        slot = &(*chunk)[index & (HANDLE_CHUNK - 1)];
+    }
+    slot->object = object;
+    slot->next_free = 0;
+    handle_live++;
+    if (counted_handle(object))
+        larva_gc_retain(object);
+    uint64_t handle = (uint64_t)slot->generation << 32 | (uint64_t)(index + 1);
+    rt_leave(locked);
+    return handle;
+}
+
+/* The object of a handle (NULL for 0). A handle that was freed, or was never made, stops the program. */
+LARVA_API void *larva_handle_get(uint64_t handle) {
+    if ((uint32_t)handle == 0)
+        return NULL;
+    HandleSlot *slot = handle_slot(handle);
+    if (!slot)
+        handle_misuse(handle);
+    return slot->object;
+}
+
+/* Gives a handle back: its object is no longer a root (in reference counting, it loses the handle's reference). */
+LARVA_API void larva_handle_free(uint64_t handle) {
+    if ((uint32_t)handle == 0)
+        return;
+    int locked = rt_enter();
+    HandleSlot *slot = handle_slot(handle);
+    if (!slot) {
+        rt_leave(locked);
+        handle_misuse(handle);
+        return;
+    }
+    void *object = slot->object;
+    slot->object = NULL;
+    slot->generation++;
+    slot->next_free = handle_free_list;
+    handle_free_list = (uint32_t)handle;
+    handle_live--;
+    if (counted_handle(object))
+        larva_gc_release(object);
+    rt_leave(locked);
+}
+
+/* How many handles are held. */
+LARVA_API int64_t larva_handle_count(void) { return handle_live; }
+
+/* Every held handle's slot (the collections' roots). */
+static void each_handle(void (*visit)(void **slot)) {
+    for (uint32_t i = 0; i < handle_made; i++) {
+        HandleSlot *slot = &handle_chunks[i >> HANDLE_CHUNK_BITS][i & (HANDLE_CHUNK - 1)];
+        if (slot->object)
+            visit(&slot->object);
+    }
+}
+
 /* ── Arena regions ───────────────────────────────────────────────── */
 
 /* Whether an object a region recorded is still that region's (not freed since, its address not reused elsewhere). */
@@ -4169,6 +4302,11 @@ static void collect_minor(int walk_stack) {
             card_run_count++;
         }
     }
+    /* Handles (objects other languages hold): precise roots, their slots updated where their objects go. */
+    if (handle_live > 0) {
+        gc_worker = &gc_workers[0];
+        each_handle(evacuate);
+    }
     if (stats_enabled)
         minor_cards_ns += now_ns() - phase;
     copy_all(1);
@@ -4307,6 +4445,7 @@ static void collect_major(int walk_stack) {
             if (region_member(closing_regions[r].objects[i], closing_regions[r].id))
                 consider_ambiguous((uintptr_t)closing_regions[r].objects[i]);
     scan_pins(consider_ambiguous);
+    each_handle(mark_slot);
     drain_marks();
     /* Unreachable objects with a finalizer survive this collection (with what they reach): their finalizers run after
        the sweep, and a later collection frees them once they are unreachable again. */
@@ -6070,8 +6209,9 @@ static __attribute__((noinline)) void threaded_poll(void) {
     }
     /* This thread collects: every other one stops first (it does not count itself while it waits). */
     stop_world = 1;
+    world_stopper = current_record();
     larva_poll_pending = 1;
-    running_count--;
+    RUNNING_ADD(-1);  /* a full barrier: entering threads see stop_world, or this sees them in running_count */
     while (running_count > 0)
         WAIT(world_stopped, world_lock);
     UNLOCK(world_lock);
@@ -6082,8 +6222,9 @@ static __attribute__((noinline)) void threaded_poll(void) {
         adopt_shared_heap();
     rt_leave(locked);
     LOCK(world_lock);
+    world_stopper = NULL;
     stop_world = 0;
-    running_count++;
+    RUNNING_ADD(1);
     update_poll_pending();
     WAKE_ALL(world_resumed);
     UNLOCK(world_lock);
@@ -6106,6 +6247,7 @@ static void threads_init(void) {
     this_thread = &main_record;
     thread_list = &main_record;
     running_count = 1;
+    FULL_FENCE();
     threading = 1;
 }
 
@@ -6248,7 +6390,7 @@ static void *thread_main(void *argument) {
     me->state = THREAD_DONE;
     me->env = NULL;
     me->pin_count = 0;
-    running_count--;
+    RUNNING_ADD(-1);
     threads_alive--;
     me->finished = 1;
     WAKE_ALL(world_stopped);
@@ -6297,6 +6439,257 @@ LARVA_API int64_t larva_thread_start(void (*code)(void *), void *env) {
         larva_exit(101);
     }
     return (int64_t)(uintptr_t)thread;
+}
+
+/*
+ * Threads of other languages (Larva.Polyglot): a library's code runs on its callers' threads. Each call in enters and
+ * each return (or call out) leaves. The first thread that enters becomes the main record (threading starts with it); any
+ * other gets a record of its own the first time, listed like a thread Larva started. Outside Larva code a thread counts
+ * as stopped, so a collection never waits for it; with no Larva frame left on its stack (depth 0) none of its stack is
+ * scanned. Code that other threads may run alongside must poll in every loop (a library built as threaded), or a
+ * collection or an attach waits for a loop that never reaches a safepoint.
+ */
+static volatile long attach_first;  /* 1 once a thread of another language claimed the main record */
+
+static LarvaThread *attach_thread(void) {
+    if (!threading) {
+        /* Threads that call in for the first time at the same time: one starts threading (and becomes the main
+           record), the others wait for it to finish before they attach as threads of their own. */
+#ifdef _WIN32
+        if (_InterlockedCompareExchange(&attach_first, 1, 0) == 0) {
+#else
+        if (__sync_bool_compare_and_swap(&attach_first, 0, 1)) {
+#endif
+            threads_init();
+            main_record.attached = 1;
+            return &main_record;
+        }
+        while (!threading) {
+#ifdef _WIN32
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
+        FULL_FENCE();
+    }
+    size_t record = (sizeof(LarvaThread) + 127) & ~(size_t)127;
+    LarvaThread *me = (LarvaThread *)larva_aligned_alloc(record, 128);
+    if (!me)
+        fail_alloc();
+    memset(me, 0, record);
+    me->block = (size_t)-1;
+    me->state = THREAD_STOPPED;
+    me->attached = 1;
+#ifdef _WIN32
+    ULONG_PTR low, high;
+    GetCurrentThreadStackLimits(&low, &high);
+    me->stack_high = (uintptr_t)high;
+#else
+    {
+        pthread_attr_t attributes;
+        void *address;
+        size_t size;
+        pthread_getattr_np(pthread_self(), &attributes);
+        pthread_attr_getstack(&attributes, &address, &size);
+        pthread_attr_destroy(&attributes);
+        me->stack_high = (uintptr_t)address + size;
+    }
+#endif
+    me->saved_sp = me->stack_high;  /* nothing of Larva's on its stack yet */
+    this_thread = me;
+    /* Listed with every other thread stopped, as for a collection: the only thread running so far may be allocating
+       inline from the shared heap, which it gives up here (each thread allocates from a block of its own from now on). */
+    LOCK(world_lock);
+    while (stop_world)
+        WAIT(world_resumed, world_lock);
+    stop_world = 1;
+    world_stopper = current_record();
+    larva_poll_pending = 1;
+    FULL_FENCE();
+    while (running_count > 0)
+        WAIT(world_stopped, world_lock);
+    UNLOCK(world_lock);
+    int locked = rt_enter();
+    LOCK(world_lock);
+    me->id = ++next_thread_id;
+    me->next = thread_list->next;
+    thread_list->next = me;
+    threads_alive++;
+    leave_shared_heap(&main_record);
+    world_stopper = NULL;
+    stop_world = 0;
+    update_poll_pending();
+    WAKE_ALL(world_resumed);
+    UNLOCK(world_lock);
+    rt_leave(locked);
+    return me;
+}
+
+/* A collection or an attach is on: an entering thread waits for it with the lock (it counted itself; it takes that back). */
+static void enter_slow(LarvaThread *me) {
+    RUNNING_ADD(-1);
+    LOCK(world_lock);
+    WAKE_ALL(world_stopped);
+    UNLOCK(world_lock);
+    become_running(me);
+}
+
+/*
+ * A call into Larva code from another language: the thread runs Larva code until the matching larva_runtime_leave.
+ * Without a collection on it takes no lock: it counts itself running (a full barrier), then reads stop_world; a collector
+ * sets stop_world, then reads running_count (fenced too), so one of them sees the other.
+ */
+LARVA_API void larva_runtime_enter(void) {
+    LarvaThread *me = this_thread;
+    if (!me)
+        me = attach_thread();
+    me->depth++;
+    /* Stopped: outside after a return (attached), or in a call out that calls back in (any thread). */
+    if (!(me->attached || me->outside > 0) || me->state != THREAD_STOPPED)
+        return;
+    RUNNING_ADD(1);
+    if (stop_world)
+        enter_slow(me);
+    else
+        me->state = THREAD_RUNNING;
+}
+
+/* Back to the other language (a return, or a call out): until it enters again, the thread is stopped for collections. */
+LARVA_API void larva_runtime_leave(void) {
+    LarvaThread *me = this_thread;
+    if (!me || me->depth <= 0) {
+        errors++;
+        return;
+    }
+    me->depth--;
+    if (!me->attached && me->outside == 0)
+        return;
+    if (me->depth == 0 && me->outside == 0) {
+        /* No Larva frame left on its stack: nothing of it to scan (and no registers to save). */
+        if (me->saved_sp != me->stack_high) {
+            memset(me->registers, 0, sizeof me->registers);
+            me->saved_sp = me->stack_high;
+        }
+    } else {
+        SAVE_REGISTERS(me);  /* a call out: the Larva frames above stay, and are scanned from here */
+    }
+    me->state = THREAD_STOPPED;
+    /* A full barrier (the state is seen before the count); a collector that waits for this thread is woken. */
+    if (RUNNING_ADD(-1) == 1 && stop_world) {
+        LOCK(world_lock);
+        WAKE_ALL(world_stopped);
+        UNLOCK(world_lock);
+    }
+}
+
+/*
+ * A call out from Larva code to another language's function (a callback), on any thread: until callin, the thread is
+ * stopped for collections (its Larva frames are scanned from here), and may call into Larva again (enter and leave run it
+ * and stop it again). Without threading there is nothing to do.
+ */
+LARVA_API void larva_runtime_callout(void) {
+    LarvaThread *me = current_record();
+    int level = me->outside++;
+    /* The thread that stopped the world (a finalizer it runs during or right after a collection) stays as it is. */
+    if (!threading || collecting > 0 || world_stopper == me || me->state == THREAD_STOPPED)
+        return;
+    if (level < 64)
+        me->stopped_out |= (uint64_t)1 << level;
+    SAVE_REGISTERS(me);
+    me->state = THREAD_STOPPED;
+    if (RUNNING_ADD(-1) == 1 && stop_world) {
+        LOCK(world_lock);
+        WAKE_ALL(world_stopped);
+        UNLOCK(world_lock);
+    }
+}
+
+LARVA_API void larva_runtime_callin(void) {
+    LarvaThread *me = current_record();
+    if (me->outside == 0)
+        return;
+    int level = --me->outside;
+    int stopped = level < 64 && (me->stopped_out >> level & 1);
+    if (level < 64)
+        me->stopped_out &= ~((uint64_t)1 << level);
+    /* The call out stopped the thread (and a leave inside it may have stopped it again): Larva code runs again. */
+    if (!stopped || me->state != THREAD_STOPPED)
+        return;
+    RUNNING_ADD(1);
+    if (stop_world)
+        enter_slow(me);
+    else
+        me->state = THREAD_RUNNING;
+}
+
+/* A thread of another language that will not call in again (it ends): its record is given back. */
+LARVA_API void larva_thread_detach(void) {
+    LarvaThread *me = this_thread;
+    if (!me || !me->attached || me->depth > 0 || me == &main_record)
+        return;  /* the main record stays listed: stopped, with nothing to scan */
+    if (me->state == THREAD_STOPPED)
+        become_running(me);
+    int locked = rt_enter();
+    close_block(&me->heap, &me->block);
+    LOCK(world_lock);
+    for (LarvaThread **at = &thread_list; *at; at = &(*at)->next) {
+        if (*at == me) {
+            *at = me->next;
+            break;
+        }
+    }
+    me->state = THREAD_DONE;
+    RUNNING_ADD(-1);
+    threads_alive--;
+    WAKE_ALL(world_stopped);
+    UNLOCK(world_lock);
+    rt_leave(locked);
+    this_thread = NULL;
+    free(me->pins);
+    larva_aligned_free(me);
+}
+
+/*
+ * The lock static constructors run under ($StaticInit: whichever threads make their first calls at the same time, as
+ * in a library other languages call, one runs them and the others wait). The program keeps whether they ran (a runtime
+ * may run several programs); the lock is the runtime's. Re-entrant for its holder (a constructor that calls an export);
+ * a thread waits for it in the runtime, stopped for collections (the constructors may collect).
+ */
+static LarvaThread *volatile init_owner;
+static int init_depth;
+#ifdef _WIN32
+static SRWLOCK init_lock = SRWLOCK_INIT;
+#else
+static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+LARVA_API void larva_init_lock(void) {
+    LarvaThread *me = current_record();
+    if (init_owner == me) {
+        init_depth++;
+        return;
+    }
+    BLOCKING_ENTER();
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&init_lock);
+#else
+    pthread_mutex_lock(&init_lock);
+#endif
+    blocking_leave();
+    init_owner = me;
+    init_depth = 1;
+}
+
+LARVA_API void larva_init_unlock(void) {
+    if (init_owner != current_record() || --init_depth > 0)
+        return;
+    init_owner = NULL;
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&init_lock);
+#else
+    pthread_mutex_unlock(&init_lock);
+#endif
 }
 
 /* Waits for a thread to finish (`milliseconds`, -1: as long as it takes): 1 when it has (its handle is freed), 0 if not. */
@@ -7340,6 +7733,7 @@ static int larva_filter(EXCEPTION_POINTERS *pointers) {
     uncaught_type = (int64_t)record->ExceptionInformation[1];
     return EXCEPTION_EXECUTE_HANDLER;
 }
+#endif
 
 static void print_stats(void) {
     int64_t live_heap = 0, live_gc = 0;
@@ -7379,6 +7773,7 @@ static void print_stats(void) {
     fprintf(stderr, "larva stats: cards %lld, slots %lld, remembered %lld\n", (long long)cards_scanned, (long long)slots_evacuated, (long long)remembered_scanned);
 }
 
+#ifdef _WIN32
 static int run(EntryFn entry, EntryF64Fn entry_f64, int64_t *arguments, int kind, int64_t *result, double *real) {
     __try {
         if (kind == 4)

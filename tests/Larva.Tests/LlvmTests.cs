@@ -17,6 +17,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Basic_program_runs_natively_like_the_vm()
     {
+        InProcess.RequireWindows();
         var module = BasicProgram.Module();
         using var program = Compile(module);
         using var jit = program.Jit();
@@ -30,6 +31,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Generic_programs_run_specialized()
     {
+        InProcess.RequireWindows();
         using (var program = Compile(GenericsPrograms.ProgramModule()))
         using (var jit = program.Jit())
             Check("generics main() = 8", ((delegate* unmanaged<int>)jit.Address("main"))() == 8);
@@ -42,6 +44,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Memory_modes_free_release_and_close_regions()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using (var program = Compile(GcPrograms.BoxOnlyModule(), GcConfig.Manual))
         using (var jit = program.Jit())
@@ -87,6 +90,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Reference_counting_stores_before_releasing_the_old_value()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using var program = Compile(NativePrograms.RcStoreOrder(), GcConfig.RefCount);
         using var jit = program.Jit();
@@ -98,6 +102,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Arrays_index_free_and_guard_their_bounds()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using (var program = Compile(RuntimeFeaturePrograms.ArrayModule(), GcConfig.Manual))
         using (var jit = program.Jit())
@@ -121,6 +126,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Wide_small_and_float_numbers_compute_exactly()
     {
+        InProcess.RequireWindows();
         using var program = Compile(NumberProgram());
         using var jit = program.Jit();
         Check("i128: (2^100 + 5) >> 64 = 2^36", ((delegate* unmanaged<long>)jit.Address("wide_high"))() == 1L << 36);
@@ -139,6 +145,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Signed_division_wraps_at_min_and_wide_integers_divide()
     {
+        InProcess.RequireWindows();
         var module = DivisionProgram();
         var compiled = Compiler.Compile(module);
         Check("the division program compiles", compiled.Il is not null, string.Join("; ", compiled.TypeErrors.Select(e => e.ToString()).Concat(compiled.Diagnostics.Select(d => d.ToString()))));
@@ -170,6 +177,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Handle_comparisons_keep_no_reference()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using var program = Compile(ComparisonProgram(), GcConfig.RefCount);
         using var jit = program.Jit();
@@ -182,6 +190,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Borrow_sites_pin_once_per_activation()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using var program = Compile(PinLoopProgram());
         using var jit = program.Jit();
@@ -209,6 +218,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void A_linked_program_runs_across_modules()
     {
+        InProcess.RequireWindows();
         var linked = LinkerPrograms.LinkedProgram();
         var result = LlvmBackend.Compile(linked);
         Check("geom + app compile natively", result.Success, result.ToString());
@@ -229,6 +239,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Zero_cost_exceptions_match_the_vm()
     {
+        InProcess.RequireWindows();
         var module = RuntimeFeaturePrograms.ExceptionModule();
         var vm = Vm(module);
         NativeRuntime.Reset();
@@ -273,6 +284,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Exceptions_travel_through_the_handling_frame_not_globals()
     {
+        InProcess.RequireWindows();
         var module = RuntimeFeaturePrograms.ExceptionModule();
         using (var program = Compile(module, optimize: 0))
         {
@@ -296,6 +308,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Tracing_gc_finds_roots_through_stack_maps()
     {
+        InProcess.RequireWindows();
         foreach (int level in new[] { 0, 2 })
         {
             NativeRuntime.Reset();
@@ -348,6 +361,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Bounds_checks_are_eliminated_only_when_proven()
     {
+        InProcess.RequireWindows();
         var n = Copy(new Place(1));
         var m = Copy(new Place(2));
         Expect("for i in 0..n { a[i] } with a: [_; n]", Loop(Int(0, IrType.I64), BinaryOp.Lt, n, n), 1);
@@ -431,6 +445,7 @@ public sealed unsafe class LlvmTests : CheckedTest
     [Fact]
     public void Polly_round_trips_through_opt()
     {
+        InProcess.RequireWindows();
         string? standIn = Repository.FakeOpt;
         Assert.SkipWhen(standIn is null, "Polly round trip: tests/FakeOpt is not built (no stand-in for opt)");
         NativeRuntime.Reset();
@@ -483,7 +498,10 @@ public sealed unsafe class LlvmTests : CheckedTest
         string obj = Path.Combine(directory, "basics.obj");
         optimized.EmitObject(obj);
         var bytes = File.ReadAllBytes(obj);
-        Check("COFF object for x86-64 (machine 0x8664)", bytes.Length > 20 && BitConverter.ToUInt16(bytes, 0) == 0x8664, $"{bytes.Length} bytes");
+        if (OperatingSystem.IsWindows())
+            Check("COFF object for x86-64 (machine 0x8664)", bytes.Length > 20 && BitConverter.ToUInt16(bytes, 0) == 0x8664, $"{bytes.Length} bytes");
+        else if (OperatingSystem.IsLinux())
+            Check("ELF object", bytes.Length > 20 && bytes[0] == 0x7F && bytes[1] == (byte)'E' && bytes[2] == (byte)'L' && bytes[3] == (byte)'F', $"{bytes.Length} bytes");
         optimized.EmitIr(Path.Combine(directory, "basics.ll"));
         Check(".ll written", File.Exists(Path.Combine(directory, "basics.ll")));
     }

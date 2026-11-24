@@ -112,6 +112,8 @@ namespace Larva.Native
                     Scan((byte*)pointer, sizes[pointer]);
             foreach (var handle in pinned.Keys)
                 Consider(handle);
+            foreach (var held in HandleObjects())
+                Consider(held);
 
             void Drain()
             {

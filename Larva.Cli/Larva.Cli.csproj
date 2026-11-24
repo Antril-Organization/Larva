@@ -20,6 +20,7 @@
     <ProjectReference Include="..\Larva.Driver\Larva.Driver.csproj" />
     <ProjectReference Include="..\Larva.Build\Larva.Build.csproj" />
     <ProjectReference Include="..\Larva.Bindings\Larva.Bindings.csproj" />
+    <ProjectReference Include="..\Larva.Polyglot\Larva.Polyglot.csproj" />
     <ProjectReference Include="..\Hive.Core\Hive.Core.csproj" />
     <ProjectReference Include="..\Larva.Hir.Services\Larva.Hir.Services.csproj" />
     <ProjectReference Include="..\Larva.Hir.Lowering\Larva.Hir.Lowering.csproj" />

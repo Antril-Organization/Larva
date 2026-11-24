@@ -1,0 +1,88 @@
+# Every pull request and every push to dev and prod: built and tested. prod accepts changes only through pull requests
+# whose `ci` check passed (its branch protection).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [prod, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Larva
+      # Larva, Antril and Nest side by side, as their builds expect them; each on the branch of the same name when it
+      # has one (a change that spans repositories is tested together), else on prod.
+      - name: Sibling branches
+        id: siblings
+        shell: bash
+        run: |
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          pick() { if git ls-remote --exit-code --heads "https://github.com/Antril-Organization/$1" "$branch" >/dev/null 2>&1; then echo "$branch"; else echo prod; fi; }
+          for repo in Larva Antril Nest; do echo "$(echo $repo | tr A-Z a-z)=$(pick $repo)" >> "$GITHUB_OUTPUT"; done
+      - uses: actions/checkout@v4
+        with:
+          repository: Antril-Organization/Antril
+          ref: ${{ steps.siblings.outputs.antril }}
+          path: Antril
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Antril's language pack, what larva compiles .ant with
+        run: dotnet build Antril/src/Antril -c Debug
+      - name: Tests
+        env:
+          LARVA_LANGUAGES: ${{ github.workspace }}/Antril/artifacts/pack
+        # In the repository's folder: its global.json picks the test platform.
+        working-directory: Larva
+        run: dotnet test --solution Larva.slnx -c Debug
+
+  # The same tests on Linux: larva builds and runs Linux programs there (LLVM, linked by cc). Tests that run Windows code in
+  # their own process (the JIT, the x64 back end, the in-process runtime) skip themselves.
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Larva
+      - name: Sibling branches
+        id: siblings
+        shell: bash
+        run: |
+          branch="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          pick() { if git ls-remote --exit-code --heads "https://github.com/Antril-Organization/$1" "$branch" >/dev/null 2>&1; then echo "$branch"; else echo prod; fi; }
+          for repo in Larva Antril Nest; do echo "$(echo $repo | tr A-Z a-z)=$(pick $repo)" >> "$GITHUB_OUTPUT"; done
+      - uses: actions/checkout@v4
+        with:
+          repository: Antril-Organization/Antril
+          ref: ${{ steps.siblings.outputs.antril }}
+          path: Antril
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # What LLVM's shared library needs (libz3, libxml2) and the C compiler that links Linux programs.
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y build-essential libz3-4 libxml2
+      - name: Antril's language pack, what larva compiles .ant with
+        run: dotnet build Antril/src/Antril -c Debug
+      - name: Tests
+        env:
+          LARVA_LANGUAGES: ${{ github.workspace }}/Antril/artifacts/pack
+        working-directory: Larva
+        run: dotnet test --solution Larva.slnx -c Debug

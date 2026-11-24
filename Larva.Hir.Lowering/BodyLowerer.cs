@@ -235,15 +235,23 @@ namespace Larva.Hir.Lowering
                 locals[l] = closures is { } c && (c.Scan.Captured[l] || c.Scan.Owner[l] > 0) ? -1
                     : b.Local(Lower(body.Locals[l].Type), body.Locals[l].Name, mutable: true);
             }
+            var statements = body.Block.Statements;
             if (plan.Synthetic is null && lowerer.StaticInitFunction >= 0
                 && (lowerer.Assembly.EntryPoint == H.MemberToken.Def(plan.Type, plan.Method) || (method.Flags & H.MethodFlags.Export) != 0))
             {
+                // A call in from another language (Larva.Polyglot's shims) enters the runtime first: nothing may run (or
+                // allocate) on its thread before that, the static constructors included.
+                if (EntersFirst(statements))
+                {
+                    Statement(statements[0]);
+                    statements = statements[1..];
+                }
                 // The program's entry runs every static constructor first.
                 Emit(lowerer.StaticInitFunction, [], new Place(Temp(IrType.Unit)));
             }
             if (IsIterator)
                 EndIfDisposing();
-            Block(body.Block);
+            Block(statements.Length == body.Block.Statements.Length ? body.Block : new H.BlockStmt(statements));
             if (open && IsIterator)
                 EndIterator();
             else if (open && IsAsync)
@@ -501,6 +509,11 @@ namespace Larva.Hir.Lowering
         }
 
         // ── Statements ─────────────────────────────────────
+
+        /// <summary>Whether a body starts by calling the runtime service <c>runtime.enter</c> (an extern method).</summary>
+        private bool EntersFirst(H.Stmt[] statements) =>
+            statements is [H.ExprStmt { Expression: H.CallExpr { Method: { IsDefinition: true } called } }, ..]
+            && lowerer.Assembly.Method(called) is { } target && (target.Flags & H.MethodFlags.Extern) != 0 && target.ExternName == "runtime.enter";
 
         private void Block(H.BlockStmt block)
         {
