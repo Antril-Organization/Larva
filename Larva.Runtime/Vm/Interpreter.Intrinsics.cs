@@ -12,6 +12,8 @@ namespace Larva.Runtime.Vm
                 return;
             if (id >= 63 && id <= 87 && RunThreadIntrinsic(frame, id))
                 return;
+            if (id >= 97 && id <= 107 && RunHandleIntrinsic(frame, id))
+                return;
             var output = options.Output ?? Console.Out;
             var stack = frame.Stack;
             switch (id)

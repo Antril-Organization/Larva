@@ -14,12 +14,14 @@
   <Project Path="Larva.Setup/Larva.Setup.csproj" />
   <Project Path="Larva.Build/Larva.Build.csproj" />
   <Project Path="Larva.Bindings/Larva.Bindings.csproj" />
+  <Project Path="Larva.Polyglot/Larva.Polyglot.csproj" />
   <Project Path="Hive.Core/Hive.Core.csproj" />
   <Folder Name="/tests/">
     <Project Path="tests/Larva.Tests/Larva.Tests.csproj" />
     <Project Path="tests/Larva.Hir.Tests/Larva.Hir.Tests.csproj" />
     <Project Path="tests/Larva.Build.Tests/Larva.Build.Tests.csproj" />
     <Project Path="tests/Larva.Bindings.Tests/Larva.Bindings.Tests.csproj" />
+    <Project Path="tests/Larva.Polyglot.Tests/Larva.Polyglot.Tests.csproj" />
     <Project Path="tests/Larva.Cli.Tests/Larva.Cli.Tests.csproj" />
     <Project Path="tests/FakeOpt/FakeOpt.csproj" />
   </Folder>

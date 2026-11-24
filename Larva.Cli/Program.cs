@@ -23,6 +23,8 @@ const string Usage = """
            larva hive <key|pack|publish|install|add|restore|verify|info|list|trust> ...   packages (larva hive: the list)
            larva tool <install|uninstall|update|restore|list|run> ...   tools from Hive (larva tool: the list); run as larva <command>
            larva bind <lib.dll|lib.so> <api.bind> [-o <Name.dll>] [--source Name.ext] [--core <dir>]   (--list <lib>: its exports)
+           larva polyglot names <Lib.dll> [--lang c,csharp,python,java,typescript] [<filter>]   a library's names in other languages
+           larva polyglot build [<Lib.dll>|<project.queen>] --lang c,csharp [-o <folder>]   the library for C and C# (a folder each)
            larva types  [--lang <language>|hir] [--lib X.dll]... [source file]... [namespace]
            larva show   [--lang <language>|hir] [--no-bodies] [--public] [--lib X.dll]... [source file]... <Type>...
            larva search [--lang <language>|hir] [--lib X.dll]... [source file]... <query>
@@ -69,6 +71,8 @@ if (args.Length >= 1 && args[0] is "types" or "show" or "search")
     return TypeCommands.Run(args[0], args[1..]);
 if (args.Length >= 1 && args[0] == "bind")
     return BindCommand.Run(args[1..]);
+if (args.Length >= 1 && args[0] == "polyglot")
+    return PolyglotCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "hive")
     return HiveCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "config")

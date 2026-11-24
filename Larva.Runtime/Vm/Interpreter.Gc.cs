@@ -247,6 +247,8 @@ namespace Larva.Runtime.Vm
                     MarkValue(exception);
             }
 
+            foreach (var held in HandleObjects())
+                Mark(held);
             foreach (var allocation in objects)
             {
                 if (allocation.Pins > 0 && !allocation.Marked)

@@ -86,6 +86,7 @@ namespace Larva.Native
             StressGc = false;
             LastPanic = null;
             ResetThreads();
+            ResetHandles();
         }
 
         /// <summary>
@@ -246,6 +247,7 @@ namespace Larva.Native
         private static Dictionary<string, nint> WithThreads(Dictionary<string, nint> symbols)
         {
             AddThreadSymbols(symbols);
+            AddHandleSymbols(symbols);
             AddWideFloatSymbols(symbols);
             return symbols;
         }
