@@ -90,6 +90,24 @@ internal static class TypeCommands
             }
             assemblies.Add(LanguagePack.Reference(library));
         }
+        // Larva's other libraries (System.Bindings, System.Data) that the sources name or the libraries were built
+        // against, as `larva build` links them.
+        var standard = SourceBuild.UsedLibraries(sources);
+        foreach (var library in libraries.Where(Larva.Build.QueenProject.IsAssembly))
+        {
+            try
+            {
+                standard.AddRange(Larva.Hir.Encoding.LvaFormat.Read(File.ReadAllBytes(library)).References.Select(r => r.Name).Where(SourceBuild.StandardLibraries.Contains));
+            }
+            catch (Exception e) when (e is IOException or Larva.Hir.Encoding.HirFormatException)
+            {
+            }
+        }
+        foreach (string name in SourceBuild.StandardLibraries.Where(standard.Contains))
+        {
+            if (BindProfile.StandardLibrary(name, coreBytes, out string? standardPath, quiet: true) is { } standardBytes)
+                assemblies.Add(standardPath is not null ? LanguagePack.Reference(standardPath) : LanguagePack.Reference(standardBytes));
+        }
         if (sourceLanguage is not null)
         {
             var program = SourceBuild.Compile(sourceLanguage, sources, "Program", assemblies);

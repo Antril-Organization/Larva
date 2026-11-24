@@ -214,10 +214,18 @@ internal static class BindProfile
     /// System.Bindings: the compiled library next to larva (an installation), or the sources of
     /// <c>Library/System.Bindings</c> above it (a working copy), compiled once against System.Core and cached.
     /// </summary>
-    internal static byte[]? BindingsLibrary(byte[] coreBytes, out string? path, bool quiet = false)
+    internal static byte[]? BindingsLibrary(byte[] coreBytes, out string? path, bool quiet = false) =>
+        StandardLibrary("System.Bindings", coreBytes, out path, quiet);
+
+    /// <summary>
+    /// A library of Larva's own beside System.Core (System.Bindings, System.Data): <c>Name.dll</c> next to larva (an
+    /// installation), or the sources of <c>Library/Name</c> above it (a working copy), compiled once against System.Core
+    /// and cached.
+    /// </summary>
+    internal static byte[]? StandardLibrary(string name, byte[] coreBytes, out string? path, bool quiet = false)
     {
         path = null;
-        string installed = Path.Combine(AppContext.BaseDirectory, "System.Bindings.dll");
+        string installed = Path.Combine(AppContext.BaseDirectory, name + ".dll");
         if (File.Exists(installed))
         {
             path = installed;
@@ -226,14 +234,14 @@ internal static class BindProfile
         string? folder = null;
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null && folder is null; dir = dir.Parent)
         {
-            string candidate = Path.Combine(dir.FullName, "Library", "System.Bindings");
+            string candidate = Path.Combine(dir.FullName, "Library", name);
             if (Directory.Exists(candidate))
                 folder = candidate;
         }
         if (folder is null)
         {
             if (!quiet)
-                Console.Error.WriteLine("larva: System.Bindings not found (System.Bindings.dll next to larva); reinstall Larva");
+                Console.Error.WriteLine($"larva: {name} not found ({name}.dll next to larva); reinstall Larva");
             return null;
         }
         var files = Directory.GetFiles(folder).Where(LanguageRegistry.IsSource).Order(StringComparer.Ordinal).ToArray();
@@ -252,13 +260,13 @@ internal static class BindProfile
             hash.AppendData(File.ReadAllBytes(file));
         }
         string key = Convert.ToHexString(hash.GetHashAndReset())[..16];
-        string cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Larva", "cache", $"System.Bindings-{key}.lva");
+        string cache = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Larva", "cache", $"{name}-{key}.lva");
         if (File.Exists(cache))
         {
             path = cache;
             return File.ReadAllBytes(cache);
         }
-        var compiled = SourceBuild.Compile(language, files, "System.Bindings", [SourceBuild.CoreReference(coreBytes, null)], library: true, quiet: quiet);
+        var compiled = SourceBuild.Compile(language, files, name, [SourceBuild.CoreReference(coreBytes, null)], library: true, quiet: quiet);
         if (compiled?.Assembly is not { } bytes)
             return null;
         Directory.CreateDirectory(Path.GetDirectoryName(cache)!);

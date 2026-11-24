@@ -36,6 +36,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $sources = (Get-ChildItem "$root/Library/System.Bindings/*.ant").FullName
 & "$stage/larva.exe" lib -o "$stage/System.Bindings.dll" @sources  # what binding profiles derive from (larva bind --profile)
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$sources = (Get-ChildItem "$root/Library/System.Data/*.ant").FullName
+& "$stage/larva.exe" lib -o "$stage/System.Data.dll" @sources  # databases: connections, commands, rows (SQLite)
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 foreach ($template in Get-ChildItem -Directory "$root/Templates") {
     & "$stage/larva.exe" new --pack $template.FullName -o "$stage/Templates"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -47,6 +50,7 @@ larva.exe          the toolchain: larva new, larva build, larva lsp (the editor'
                    (packages), larva tool (tools installed from Hive, run as larva <command>), larva types
 System.Core.dll    the standard library programs are built with (compiled)
 System.Bindings.dll  what binding profiles are written against (larva bind --profile Profile.<ext> [library] [headers])
+System.Data.dll    databases: connections, commands and rows (SQLite through sqlite3.dll)
 Languages\         the languages larva compiles: one folder each, with its frontend and its manifest
                    (language.json: author, version, the SHA-256 of its files, its signature); larva languages lists them
 icons\             the icons of larva's files (.lva, .lvo, .lvm, .bind, .queen, .hive)
