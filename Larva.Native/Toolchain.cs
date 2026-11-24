@@ -120,15 +120,8 @@ namespace Larva.Native
                 }, partial);
                 if (!ok)
                     return (null, log);
-                try
-                {
-                    File.Move(partial, target, overwrite: true);
-                }
-                catch (IOException)
-                {
-                    if (!File.Exists(target))
-                        return (null, $"cannot keep ntdll's import library in {CacheFolder}");
-                }
+                if (!Keep(partial, target))
+                    return (null, $"cannot keep ntdll's import library in {CacheFolder}");
             }
             return (["kernel32.lib", "ws2_32.lib", target], "");
         }
@@ -195,17 +188,34 @@ namespace Larva.Native
             }, partial);
             if (!ok)
                 return (null, log);
+            if (!Keep(partial, target))
+                return (null, $"cannot keep the compiled runtime in {CacheFolder}");
+            return (target, log);
+        }
+
+        /// <summary>
+        /// A file made under a name of its own (<paramref name="partial"/>) put in its place in the cache. Builds running at
+        /// once may make the same file: the first one keeps it, the others find it there (Windows refuses to replace a file
+        /// another process has open: access denied) and drop their copy. Whether <paramref name="target"/> is there.
+        /// </summary>
+        private static bool Keep(string partial, string target)
+        {
             try
             {
                 File.Move(partial, target, overwrite: true);
+                return true;
             }
-            catch (IOException)
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
             {
-                // Another build put it there first: the same bytes.
-                if (!File.Exists(target))
-                    return (null, $"cannot keep the compiled runtime in {CacheFolder}");
+                try
+                {
+                    File.Delete(partial);
+                }
+                catch (Exception again) when (again is IOException or UnauthorizedAccessException)
+                {
+                }
+                return File.Exists(target);
             }
-            return (target, log);
         }
 
         private Dictionary<string, string>? developer;
@@ -246,9 +256,9 @@ namespace Larva.Native
                     Directory.CreateDirectory(CacheFolder);
                     string partial = file + $".{Guid.NewGuid():N}.partial";
                     File.WriteAllText(partial, text);
-                    File.Move(partial, file, overwrite: true);
+                    Keep(partial, file);
                 }
-                catch (IOException)
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     // Kept by another build, or not at all: this one has it.
                 }
