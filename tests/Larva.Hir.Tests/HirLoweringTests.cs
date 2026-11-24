@@ -88,6 +88,7 @@ public sealed unsafe class HirLoweringTests : CheckedTest
     [Fact]
     public void Phase2_program_gives_the_same_results_on_LVM_x64_and_LLVM()
     {
+        InProcess.RequireWindows();
         var lowered = HirLowerer.Lower(HirPrograms.Phase2().Assembly);
         Check("the program lowers", lowered.Success, string.Join("; ", lowered.Errors));
         Require();
@@ -159,13 +160,16 @@ public sealed unsafe class HirLoweringTests : CheckedTest
         long x64Build = watch.ElapsedMilliseconds;
         Check("the LVM and x64 builds take it", vm.Success && x64.Success, string.Join("; ", vm.TypeErrors.Take(3)) + x64.Error);
         Log($"{methods} methods ({lowered.Module!.Functions.Length} IR functions): lowering {oneThread} ms on one thread, {parallel} ms on {Environment.ProcessorCount}; then LVM build {vmBuild} ms, x64 build {x64Build} ms");
-        Check($"lowering {methods} methods takes under 1 s", parallel < 1000, $"{parallel} ms");
+        // Wall time, in a Debug build: 2 s leaves room for a smaller or busier machine (a 4-core CI runner) and still catches
+        // lowering going back to the seconds it once took.
+        Check($"lowering {methods} methods takes under 2 s", parallel < 2000, $"{parallel} ms");
     }
 
     /// <summary>The benchmarks on LLVM -O3, x64 and the LVM, against the same programs on .NET.</summary>
     [Fact]
     public void Benchmarks_give_the_same_results_on_every_backend()
     {
+        InProcess.RequireWindows();
         var lowered = LoweredBench.Value;
         Check("the benchmark program lowers", lowered.Success, string.Join("; ", lowered.Errors));
         if (!lowered.Success)

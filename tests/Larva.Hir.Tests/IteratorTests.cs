@@ -16,6 +16,7 @@ public sealed unsafe class IteratorTests : CheckedTest
     [Fact]
     public void Yield_break_and_Dispose_run_the_finally_blocks_around_the_pause()
     {
+        InProcess.RequireWindows();
         var lowered = HirLowerer.Lower(Program().Assembly);
         Check("the program lowers", lowered.Success, string.Join("; ", lowered.Errors));
         Require();
@@ -58,6 +59,7 @@ public sealed unsafe class IteratorTests : CheckedTest
     [Fact]
     public void Only_locals_live_across_a_yield_go_into_the_frame()
     {
+        InProcess.RequireWindows();
         var p = new HirProgram("Counting");
         var iteratorDef = new TypeDef { Namespace = "System", Name = "Iterator", Kind = TypeKind.Class, Flags = TypeFlags.Abstract };
         var iterator = p.Assembly.Add(iteratorDef);

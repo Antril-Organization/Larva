@@ -17,7 +17,11 @@ public sealed class BuildCommandTests
             // Back end and optimization level come from the defaults (the command line still wins).
             larva.Ok("config", "backend", "x64");
             larva.Ok("config", "optimization", "1");
-            Assert.Contains("x64 back end", larva.Ok("build", "-o", "p.exe", "Program.ant"));
+            // (The x64 back end makes Windows code: elsewhere the configured back end is refused, saying so.)
+            if (OperatingSystem.IsWindows())
+                Assert.Contains("x64 back end", larva.Ok("build", "-o", "p.exe", "Program.ant"));
+            else
+                Assert.Contains("built with LLVM", larva.Fails("build", "-o", "p.exe", "Program.ant"));
             Assert.Contains("O1", larva.Ok("build", "--backend", "llvm", "-o", "p.exe", "Program.ant"));
             larva.Ok("config", "--unset", "backend");
             larva.Ok("config", "--unset", "optimization");

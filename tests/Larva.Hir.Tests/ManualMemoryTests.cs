@@ -16,6 +16,7 @@ public sealed unsafe class ManualMemoryTests : CheckedTest
     [Fact]
     public void References_compare_by_address_under_manual_memory()
     {
+        InProcess.RequireWindows();
         var lowered = HirLowerer.Lower(Program().Assembly, new LoweringOptions { Gc = GcConfig.Manual });
         Check("the program lowers", lowered.Success, string.Join("; ", lowered.Errors));
         Require();

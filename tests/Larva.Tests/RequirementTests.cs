@@ -217,6 +217,7 @@ public sealed unsafe class RequirementTests : CheckedTest
     [Fact]
     public void Program_runs_on_llvm_and_x64()
     {
+        InProcess.RequireWindows();
         var module = ProgramModule();
         long llvm = long.MinValue, x64 = long.MinValue;
         var llvmResult = Larva.Llvm.LlvmBackend.Compile(module);
@@ -323,6 +324,7 @@ public sealed unsafe class RequirementTests : CheckedTest
     [Fact]
     public void Constant_indexes_survive_specialization()
     {
+        InProcess.RequireWindows();
         var module = IndexedProgram();
         var errors = TypeChecker.Check(module, GcConfig.Default);
         Check("the program type-checks", errors.Count == 0, string.Join("; ", errors));

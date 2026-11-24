@@ -38,12 +38,22 @@ namespace Larva.Driver
     /// </summary>
     public static class PosixBuilder
     {
+        /// <summary>Why the C compiler cannot link for <paramref name="target"/> (another processor than its own), or null.</summary>
+        private static string? Unlinkable(PosixToolchain toolchain, NativeTarget target)
+        {
+            string processor = target.Triple.Split('-')[0] is "arm64" ? "aarch64" : target.Triple.Split('-')[0];
+            return toolchain.LinksFor(processor) ? null
+                : $"{target.Name}: the C compiler here makes {toolchain.Machine} code; build on an {processor} machine (or one whose `cc` targets it)";
+        }
+
         public static (bool Success, string Message) BuildExecutable(LinkResult linked, string output, NativeTarget target, ExecutableOptions? options = null)
         {
             options ??= new ExecutableOptions();
             var (toolchain, problem) = PosixToolchain.Find(target.Posix!.Value);
             if (toolchain is null)
                 return (false, problem!);
+            if (Unlinkable(toolchain, target) is { } other)
+                return (false, other);
             LinkResult program;
             try
             {

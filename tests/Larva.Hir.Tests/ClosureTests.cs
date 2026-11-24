@@ -25,6 +25,7 @@ public sealed unsafe class ClosureTests : CheckedTest
     [Fact]
     public void Closures_keep_a_frame_per_call_and_per_pass_and_reach_this_in_an_iterator()
     {
+        InProcess.RequireWindows();
         var lowered = HirLowerer.Lower(Program().Assembly);
         Check("the program lowers", lowered.Success, string.Join("; ", lowered.Errors));
         Require();

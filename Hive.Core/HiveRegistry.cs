@@ -70,13 +70,26 @@ namespace Hive
         {
             text = text.Trim();
             if (text.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
-                return new HiveFolderProvider(Path.GetFullPath(Path.Combine(baseFolder, text[5..].TrimStart('/'))));
+                return new HiveFolderProvider(Path.GetFullPath(Path.Combine(baseFolder, FilePath(text[5..]))));
             if (text.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || text.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 return new HiveHttpProvider(new Uri(text.TrimEnd('/') + "/"));
             string local = Path.GetFullPath(Path.Combine(baseFolder, text));
             if (Directory.Exists(local) || text.StartsWith('.') || Path.IsPathRooted(text))
                 return new HiveFolderProvider(local);
             return new HiveHttpProvider(new Uri("https://" + text.TrimEnd('/') + "/"));
+        }
+
+        /// <summary>
+        /// The folder after <c>file:</c>: a path (<c>file:../registry</c>, <c>file:/srv/hive</c>, <c>file:C:/hive</c>) or a
+        /// file URL's (<c>file:///srv/hive</c>, <c>file:///C:/hive</c>). A POSIX path keeps its leading slash.
+        /// </summary>
+        public static string FilePath(string text)
+        {
+            if (text.StartsWith("//", StringComparison.Ordinal))
+                text = text[2..]; // file:// and an empty host
+            if (text.Length >= 3 && text[0] == '/' && char.IsAsciiLetter(text[1]) && text[2] == ':')
+                text = text[1..]; // /C:/hive
+            return text;
         }
 
         protected static string FolderOf(PackageReference package) => $"{package.Author}/{package.Name}";

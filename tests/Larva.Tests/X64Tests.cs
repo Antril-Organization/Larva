@@ -18,6 +18,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Basic_and_generic_programs_run_like_the_vm()
     {
+        InProcess.RequireWindows();
         var module = BasicProgram.Module();
         using var image = Load(module);
         var sum = (delegate* unmanaged<int, int>)image.Address("sum");
@@ -35,6 +36,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Memory_modes_free_release_and_close_regions()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using (var image = Load(GcPrograms.BoxOnlyModule(), GcConfig.Manual))
         {
@@ -79,6 +81,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Reference_counting_stores_before_releasing_the_old_value()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using var image = Load(NativePrograms.RcStoreOrder(), GcConfig.RefCount);
         int seen = ((delegate* unmanaged<int>)image.Address("rc_store_order"))();
@@ -89,6 +92,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Arrays_index_free_and_eliminate_proven_bounds_checks()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         var program = Compile(RuntimeFeaturePrograms.ArrayModule(), GcConfig.Manual);
         using (var image = program.Load())
@@ -112,6 +116,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Win64_calling_convention_corner_cases()
     {
+        InProcess.RequireWindows();
         using var image = Load(AbiProgram());
         Check("12-byte struct: returned through a hidden pointer, passed by reference: main3() = 1·1 + 2·2 + 3·3 = 14",
             ((delegate* unmanaged<int>)image.Address("main3"))() == 14);
@@ -134,6 +139,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Tracing_gc_finds_rbp_relative_stack_roots()
     {
+        InProcess.RequireWindows();
         NativeRuntime.Reset();
         using var image = Load(NativePrograms.TracingProgram());
         NativeRuntime.StressGc = true;
@@ -153,6 +159,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void A_linked_program_runs_across_modules()
     {
+        InProcess.RequireWindows();
         var result = X64Backend.Compile(LinkerPrograms.LinkedProgram());
         Check("geom + app compile", result.Success, result.ToString());
         if (!result.Success)
@@ -165,6 +172,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Seh_exceptions_with_scope_tables_match_the_vm()
     {
+        InProcess.RequireWindows();
         var module = RuntimeFeaturePrograms.ExceptionModule();
         var vm = Vm(module);
         NativeRuntime.Reset();
@@ -214,6 +222,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Every_primitive_compiles()
     {
+        InProcess.RequireWindows();
         var f = new FunctionBuilder("wide", IrType.I256);
         f.Assign(FunctionBuilder.ReturnPlace, Int(1, IrType.I256)).Return();
         var wide = X64Backend.Compile(new IrModule([], [f.Build()]));
@@ -228,6 +237,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Float_remainder_is_fmod()
     {
+        InProcess.RequireWindows();
         var f64 = new FunctionBuilder("rem_f64", IrType.F64);
         int a = f64.Argument(IrType.F64, "a"), b = f64.Argument(IrType.F64, "b");
         f64.Assign(FunctionBuilder.ReturnPlace, Rvalue.Binary(BinaryOp.Rem, Copy(a), Copy(b))).Return();
@@ -257,6 +267,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Float_to_integer_conversions_saturate()
     {
+        InProcess.RequireWindows();
         var targets = new[] { IrType.I8, IrType.I16, IrType.I32, IrType.I64, IrType.U8, IrType.U16, IrType.U32, IrType.U64 };
         var functions = new List<IrFunction>();
         foreach (var target in targets)
@@ -310,6 +321,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Coff_objects_are_read_and_disassembled_by_llvm()
     {
+        InProcess.RequireWindows();
         var module = BasicProgram.Module();
         var program = Compile(GcPrograms.ManagedModule(), GcConfig.Default);
         var bytes = program.ToObject();
@@ -342,6 +354,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Large_frames_probe_the_stack()
     {
+        InProcess.RequireWindows();
         var helper = new FunctionBuilder("helper", IrType.I32);
         helper.Assign(FunctionBuilder.ReturnPlace, Int(7)).Return();
         var big = new FunctionBuilder("big", IrType.I32);
@@ -373,6 +386,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Larva_native_x64_compiles_object_files()
     {
+        InProcess.RequireWindows();
         string directory = TestEnvironment.TempFolder("x64-native");
         var (geom, app) = LinkerPrograms.SaveObjects(directory);
         string output = Path.Combine(directory, "program-x64.obj");
@@ -573,6 +587,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Comparisons_branch_on_their_flags()
     {
+        InProcess.RequireWindows();
         var ops = new[] { BinaryOp.Eq, BinaryOp.Ne, BinaryOp.Lt, BinaryOp.Le, BinaryOp.Gt, BinaryOp.Ge };
         var types = new[] { IrType.I8, IrType.U8, IrType.I32, IrType.U32, IrType.I64, IrType.U64, IrType.F64 };
         var functions = new List<IrFunction>();
@@ -654,6 +669,7 @@ public sealed unsafe class X64Tests : CheckedTest
     [Fact]
     public void Immediate_operands_give_the_vms_results()
     {
+        InProcess.RequireWindows();
         var ops = new[] { BinaryOp.Add, BinaryOp.Sub, BinaryOp.Mul, BinaryOp.And, BinaryOp.Or, BinaryOp.Shl, BinaryOp.Shr, BinaryOp.Div, BinaryOp.Rem };
         var types = new[] { IrType.I8, IrType.U8, IrType.I32, IrType.U32, IrType.I64 };
         var functions = new List<IrFunction>();
