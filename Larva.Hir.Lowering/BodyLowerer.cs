@@ -2727,6 +2727,13 @@ namespace Larva.Hir.Lowering
                 if (which < 0)
                     continue;
                 var arguments = Operands(call.Receiver is { } receiver ? [receiver, .. call.Arguments] : call.Arguments);
+                if (callee.IsStatic)
+                {
+                    // A static member's first parameter: a null `?*T` (InterfaceRequirement).
+                    int self = Temp(requirement.Parameters[0]);
+                    b.Assign(self, Rvalue.Zero(requirement.Parameters[0]));
+                    arguments = [Operand.Copy(self), .. arguments];
+                }
                 int next = NewBlock();
                 b.CallRequired(index, which, [.. arguments], target, next, Handlers());
                 At(next);

@@ -467,7 +467,9 @@ namespace Larva.IR.Analysis
                     {
                         CheckOperand(wrap.Value, at);
                         var inner = function.TypeOf(wrap.Value, module);
-                        if (inner is not (GcType or BoxType or ReferenceType or PointerType))
+                        // A type parameter that is always a handle (its constraint says so) can be null too.
+                        if (inner is not (GcType or BoxType or ReferenceType or PointerType)
+                            && !(inner is GenericParamType && Constraints.Satisfies(inner, TypeConstraint.Object, new TypeContext(module, function.Generics))))
                             errors.Add(new(function.Name, at, TypeErrorKind.TypeMismatch, $"only handles and references can be null, not `{IrPrinter.FormatType(inner, module, function.Generics)}`"));
                         else if (function.TypeOf(assign.Target, module) != new OptionalType(inner))
                             errors.Add(new(function.Name, at, TypeErrorKind.TypeMismatch, $"`wrap` produces `?{IrPrinter.FormatType(inner, module, function.Generics)}`"));
