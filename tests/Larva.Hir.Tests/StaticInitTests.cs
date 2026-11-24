@@ -16,6 +16,7 @@ public sealed unsafe class StaticInitTests : CheckedTest
     [Fact]
     public void A_type_used_only_as_a_type_argument_gets_its_static_constructor_run()
     {
+        InProcess.RequireWindows();
         var lowered = HirLowerer.Lower(Program().Assembly, new LoweringOptions { StaticConstructorsFromEntry = true });
         Check("the program lowers", lowered.Success, string.Join("; ", lowered.Errors));
         Require();

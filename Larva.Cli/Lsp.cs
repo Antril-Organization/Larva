@@ -485,25 +485,30 @@ internal sealed class LspServer
             return null;
         coreKey = "core|" + (corePath ?? "data");
         coreBytes = bytes;
-        // System.Bindings too: a binding profile is analyzed against what it derives from.
-        bindingsBytes = BindProfile.BindingsLibrary(bytes, out string? bindingsPath, quiet: true);
-        bindings = bindingsBytes is not null
-            ? bindingsPath is not null ? LanguagePack.Reference(bindingsPath) : LanguagePack.Reference(bindingsBytes)
-            : null;
+        // Larva's other libraries too (System.Bindings: a binding profile is analyzed against what it derives from; System.Data).
+        standard.Clear();
+        standardBytes.Clear();
+        foreach (string library in SourceBuild.StandardLibraries)
+        {
+            if (BindProfile.StandardLibrary(library, bytes, out string? libraryPath, quiet: true) is not { } libraryBytes)
+                continue;
+            standardBytes.Add(libraryBytes);
+            standard.Add(libraryPath is not null ? LanguagePack.Reference(libraryPath) : LanguagePack.Reference(libraryBytes));
+        }
         return core = SourceBuild.CoreReference(bytes, corePath);
     }
 
     /// <summary>System.Core itself, as read with <see cref="core"/>: linked into the background borrow check (read again only on a reload).</summary>
     private byte[]? coreBytes;
 
-    /// <summary>System.Bindings (when there is one), given to every analysis with System.Core.</summary>
-    private JsonObject? bindings;
+    /// <summary>System.Bindings and System.Data (those there are), given to every analysis with System.Core.</summary>
+    private readonly List<JsonObject> standard = [];
 
-    /// <summary>System.Bindings itself: linked into the background borrow check with System.Core, as a build links it.</summary>
-    private byte[]? bindingsBytes;
+    /// <summary>Those libraries themselves: linked into the background borrow check with System.Core, as a build links them.</summary>
+    private readonly List<byte[]> standardBytes = [];
 
     private JsonArray Libraries(JsonObject coreReference) =>
-        bindings is null ? [coreReference.DeepClone()] : [coreReference.DeepClone(), bindings.DeepClone()];
+        [coreReference.DeepClone(), .. standard.Select(r => r.DeepClone())];
 
     private static string? FindQueen(string? folder)
     {
@@ -802,8 +807,7 @@ internal sealed class LspServer
         var libraries = new List<byte[]>();
         if (coreBytes is not null)
             libraries.Add(coreBytes);
-        if (bindingsBytes is not null)
-            libraries.Add(bindingsBytes);
+        libraries.AddRange(standardBytes);
         Task.Run(async () =>
         {
             await Task.Delay(400);

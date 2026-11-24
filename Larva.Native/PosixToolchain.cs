@@ -34,7 +34,10 @@ namespace Larva.Native
                 var (code, output) = Run(true, "cc", ["--version"]);
                 if (code == 0)
                     return (new PosixToolchain(system, true), null);
-                return (null, output.Contains("cc", StringComparison.Ordinal) && code == 127
+                // A distribution without cc: the shell says `cc: not found` (127), WSL's relay `execvpe(cc) failed` (1).
+                bool distribution = code == 127 && output.Contains("cc", StringComparison.Ordinal)
+                    || output.Contains("execvpe(cc)", StringComparison.Ordinal);
+                return (null, distribution
                     ? "WSL has no C compiler: run `sudo apt install build-essential` in it"
                     : "Linux programs are built with WSL and a distribution (`wsl --install -d Ubuntu`, then `sudo apt install build-essential`)");
             }
@@ -93,6 +96,17 @@ namespace Larva.Native
 
         private string[] SystemLibraries => System == PosixSystem.Linux ? ["-lpthread", "-lm"] : [];
 
+        /// <summary>The processor the C compiler makes code for (<c>cc -dumpmachine</c>: x86_64-linux-gnu, aarch64-…), or null.</summary>
+        public string? Machine => machine ??= Run(viaWsl, "cc", ["-dumpmachine"]) is (0, var output) ? output.Trim() : null;
+        private string? machine;
+
+        /// <summary>
+        /// Whether the C compiler links for <paramref name="processor"/> (<c>x86_64</c>, <c>aarch64</c>): it links for its
+        /// own processor only (no cross toolchain); null when it says nothing, which is let through.
+        /// </summary>
+        public bool LinksFor(string processor) => Machine is not { } made || made.StartsWith(processor, StringComparison.Ordinal)
+            || processor == "aarch64" && made.StartsWith("arm64", StringComparison.Ordinal);
+
         private string[] SharedFlags(string name) => System == PosixSystem.MacOS
             ? ["-dynamiclib", "-undefined", "dynamic_lookup", $"-Wl,-install_name,@rpath/{name}"]
             : ["-shared", "-fPIC"];
@@ -118,7 +132,11 @@ namespace Larva.Native
 
         private static (int Code, string Output) Run(bool wsl, string program, IEnumerable<string> arguments, IEnumerable<(string Name, string Value)>? environment = null)
         {
-            var start = new ProcessStartInfo(wsl ? "wsl.exe" : program) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            var start = new ProcessStartInfo(wsl ? "wsl.exe" : program)
+            {
+                RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false,
+                StandardOutputEncoding = global::System.Text.Encoding.UTF8, StandardErrorEncoding = global::System.Text.Encoding.UTF8, // what Linux programs write
+            };
             if (wsl)
             {
                 start.ArgumentList.Add("-e");

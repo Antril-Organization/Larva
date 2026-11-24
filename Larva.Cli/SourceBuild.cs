@@ -109,6 +109,18 @@ internal static class SourceBuild
             references.Add(CoreReference(coreBytes, corePath));
         }
         references.AddRange(libraries.Select(l => LanguagePack.Reference(Path.GetFullPath(l))));
+        // Larva's other libraries (System.Bindings, System.Data) when a source names them, as `larva build` links them.
+        if (name != "System.Core" && !StandardLibraries.Contains(name) && UsedLibraries(inputs) is { Count: > 0 } used)
+        {
+            if (CoreLibrary(core, noCache: false, out _, out _) is not { } coreForLibraries)
+                return 1;
+            foreach (string library in used)
+            {
+                if (BindProfile.StandardLibrary(library, coreForLibraries, out string? libraryPath) is not { } libraryBytes)
+                    return 1;
+                references.Add(libraryPath is not null ? LanguagePack.Reference(libraryPath) : LanguagePack.Reference(libraryBytes));
+            }
+        }
         var result = Compile(language, inputs, name, references, library: true, options: options);
         timings.Mark("frontend");
         if (result?.Assembly is not { } bytes)
@@ -170,17 +182,54 @@ internal static class SourceBuild
         return new Compiled(result?["assembly"]?.GetValue<string>() is { } data ? Convert.FromBase64String(data) : null, result?["types"]?.GetValue<int>() ?? 0);
     }
 
-    /// <summary>Whether a source names System.Bindings (read as text: no language is asked).</summary>
-    private static bool UsesBindings(string source)
+    /// <summary>The static function without parameters <paramref name="name"/> (<c>Namespace.Type.Function</c>) names, or null.</summary>
+    private static H.MemberToken? EntryNamed(H.HirAssembly assembly, string name)
     {
-        try
+        int dot = name.LastIndexOf('.');
+        if (dot <= 0)
+            return null;
+        string typeName = name[..dot], method = name[(dot + 1)..];
+        for (int t = 0; t < assembly.Types.Count; t++)
         {
-            return File.ReadAllText(source).Contains("System.Bindings", StringComparison.Ordinal);
+            var type = assembly.Types[t];
+            if (type.FullName != typeName || type.Generics.Count > 0)
+                continue;
+            for (int m = 0; m < type.Methods.Count; m++)
+            {
+                var candidate = type.Methods[m];
+                if (candidate.Name == method && candidate.IsStatic && candidate.Parameters.Count == 0 && candidate.Generics.Count == 0)
+                    return H.MemberToken.Def(t, m);
+            }
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        return null;
+    }
+
+    /// <summary>Larva's libraries beside System.Core that a build links when a source names them.</summary>
+    internal static readonly string[] StandardLibraries = ["System.Bindings", "System.Data"];
+
+    /// <summary>The <see cref="StandardLibraries"/> the sources name (each file read once, as text: no language is asked).</summary>
+    internal static List<string> UsedLibraries(IEnumerable<string> sources)
+    {
+        var used = new List<string>();
+        foreach (string source in sources)
         {
-            return false;
+            string text;
+            try
+            {
+                text = File.ReadAllText(source);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+            foreach (string library in StandardLibraries)
+                if (!used.Contains(library) && text.Contains(library, StringComparison.Ordinal))
+                    used.Add(library);
+            if (used.Count == StandardLibraries.Length)
+                break;
         }
+        // In the order they depend on each other (the list's).
+        return [.. StandardLibraries.Where(used.Contains)];
     }
 
     public static int Build(string[] args)
@@ -189,6 +238,9 @@ internal static class SourceBuild
         string backend = "llvm";
         int optimization = 3;
         bool showTimings = false, noCache = false, dll = false, check = false, tool = false;
+        // `--entry Namespace.Type.Function`: the program starts there instead of at Main (a static function without
+        // parameters; what tools build to run a project's code their own way).
+        string? entryChosen = null;
         bool backendGiven = false, targetGiven = false, optimizationGiven = false;
         BorrowCheckMode? borrowGiven = null;
         // The processor (LLVM): `--cpu`, else the project's BUILD `cpu`, else this machine's default (`larva config cpu`).
@@ -206,6 +258,7 @@ internal static class SourceBuild
                 case "--no-cache": noCache = true; break;
                 case "--dll": dll = true; break;
                 case "--check": check = true; break;
+                case "--entry" when i + 1 < args.Length: entryChosen = args[++i]; break;
                 case "--cpu" when i + 1 < args.Length: cpu = args[++i]; break;
                 case "--borrowcheck" when i + 1 < args.Length:
                     if (BorrowMode(args[++i]) is not { } givenMode)
@@ -232,6 +285,8 @@ internal static class SourceBuild
         // What goes next to the build: the native libraries of DEPS (`lib:`), and FILES (`copy:`, each at its place).
         var nextToBuild = new List<(string Source, string Target)>();
         var rootGc = GcConfig.Default;
+        // `gc: custom`: the class the entry installs as the program's collector (`gc.collector`).
+        string? collector = null;
         var externals = new List<Larva.Build.QueenProject>();
         // Compiled libraries (`.dll` or `.lva`: from `larva bind` or `larva lib`): referenced by the frontend and linked, not compiled.
         var assemblies = new List<string>();
@@ -261,13 +316,15 @@ internal static class SourceBuild
             if (projectCompilation is null)
             {
                 ApplySettings(project);
+                if (project.CustomGc)
+                    collector = project.GcCollector;
                 if (project.Kind == Larva.Build.ProjectKind.Library)
                     dll = true;
                 tool = project.Kind == Larva.Build.ProjectKind.Tool;
                 if (output is null && !check)
                 {
                     string chosen = project.Output is { } written ? Path.GetFullPath(Path.Combine(project.Folder, written)) : project.DefaultOutput(native: true);
-                    output = target != "native" ? Path.ChangeExtension(chosen, ".js") : dll ? Path.ChangeExtension(chosen, ".dll") : chosen;
+                    output = target is "wasm" or "wasm-llvm" ? Path.ChangeExtension(chosen, ".js") : dll ? Path.ChangeExtension(chosen, ".dll") : chosen;
                     Directory.CreateDirectory(Path.GetDirectoryName(output)!);
                 }
             }
@@ -294,6 +351,8 @@ internal static class SourceBuild
                 backend = settings.Backend == Larva.Build.ProjectBackend.X64 ? "x64" : "llvm";
             if (!targetGiven && settings.Sets("target") && settings.Target == Larva.Build.ProjectTarget.Wasm)
                 target = backend == "x64" ? "wasm" : "wasm-llvm";
+            else if (!targetGiven && settings.Platform is { } platform)
+                target = platform;
             if (!optimizationGiven && settings.Sets("optimization"))
                 optimization = settings.Optimization;
             rootGc = settings.Gc;
@@ -318,11 +377,31 @@ internal static class SourceBuild
             output ??= Path.ChangeExtension(inputs.FirstOrDefault() ?? "program", ".exe");
         // No source, only compiled libraries: the program is the one of them that has an entry (a tool installed from Hive).
         bool compiledOnly = inputs.Count == 0 && assemblies.Count > 0;
-        if (output is null || inputs.Count == 0 && !compiledOnly || backend is not ("llvm" or "x64") || target is not ("native" or "wasm" or "wasm-llvm"))
+        if (output is null || inputs.Count == 0 && !compiledOnly || backend is not ("llvm" or "x64")
+            || target is not ("native" or "wasm" or "wasm-llvm") && NativeTarget.Named(target) is null)
         {
-            Console.Error.WriteLine("usage: larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen|Library.dll>...]");
+            Console.Error.WriteLine("usage: larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--entry Namespace.Type.Function] [--target native|wasm|wasm-llvm|windows-x64|linux-x64|linux-arm64|macos-x64|macos-arm64] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen|Library.dll>...]");
             return 2;
         }
+        // Native code for Linux or macOS (this machine's, or another's from Windows through WSL): LLVM only.
+        NativeTarget? posix = target switch
+        {
+            "native" => HostTarget() is { Posix: not null } host ? host : null,
+            _ => NativeTarget.Named(target) is { Posix: not null } named ? named : null,
+        };
+        if (posix is not null && backend == "x64")
+        {
+            Console.Error.WriteLine($"larva: the x64 back end makes Windows code; {posix.Name} is built with LLVM (--backend llvm)");
+            return 2;
+        }
+        if (posix is not null && dll)
+        {
+            Console.Error.WriteLine($"larva: a library for C is built for Windows only yet; {posix.Name} builds programs");
+            return 2;
+        }
+        // `-o` into a folder that is not there yet: it is made (as a project's bin/ is).
+        if (!check)
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
         LanguagePack? language = null;
         if (!compiledOnly && (language = Language(inputs)) is null)
             return 1;
@@ -347,6 +426,9 @@ internal static class SourceBuild
         }
         var assemblyBytes = new List<byte[]>();
         var assemblyNames = new List<string>();
+        var neededLibraries = new HashSet<string>(StringComparer.Ordinal);
+        // Each input assembly's bytes by its name (what translations of quoted functions are kept by).
+        var inputBytes = new Dictionary<string, byte[]>(StringComparer.Ordinal) { [CoreAssemblyName] = coreBytes };
         foreach (string assembly in assemblies.Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (!File.Exists(assembly))
@@ -358,7 +440,12 @@ internal static class SourceBuild
             // Checked here (its metadata only; bodies stay unread), before the frontend gets a damaged file to trip over.
             try
             {
-                LvaFormat.Read(bytes);
+                // The standard libraries it was compiled against come with it (Nest.dll uses System.Data).
+                var read = LvaFormat.Read(bytes);
+                inputBytes[read.Name] = bytes;
+                foreach (var reference in read.References)
+                    if (StandardLibraries.Contains(reference.Name))
+                        neededLibraries.Add(reference.Name);
             }
             catch (HirFormatException e)
             {
@@ -370,13 +457,15 @@ internal static class SourceBuild
             references.Add(LanguagePack.Reference(assembly));
             timings.Mark(Path.GetFileName(assembly));
         }
-        // System.Bindings, when a source uses it (a binding profile kept with the project it binds for).
-        if (inputs.Any(UsesBindings))
+        // System.Bindings (a binding profile kept with the project it binds for), System.Data: when a source uses them.
+        var usedLibraries = UsedLibraries(inputs);
+        foreach (string library in StandardLibraries.Where(l => neededLibraries.Contains(l) || usedLibraries.Contains(l)))
         {
-            if (BindProfile.BindingsLibrary(coreBytes, out string? bindingsPath) is not { } bindingsBytes)
+            if (BindProfile.StandardLibrary(library, coreBytes, out string? libraryPath) is not { } libraryBytes)
                 return 1;
-            assemblyBytes.Add(bindingsBytes);
-            references.Add(bindingsPath is not null ? LanguagePack.Reference(bindingsPath) : LanguagePack.Reference(bindingsBytes));
+            assemblyBytes.Add(libraryBytes);
+            inputBytes[library] = libraryBytes;
+            references.Add(libraryPath is not null ? LanguagePack.Reference(libraryPath) : LanguagePack.Reference(libraryBytes));
         }
         byte[][] programBytes = [];
         if (!compiledOnly)
@@ -386,6 +475,7 @@ internal static class SourceBuild
             if (program?.Assembly is not { } compiledProgram)
                 return 1;
             programBytes = [compiledProgram];
+            inputBytes[name] = compiledProgram;
         }
         // Compiled only: the linked program is named apart from its libraries (a tool `nest` from the library `Nest`).
         string linkName = compiledOnly ? "$program." + name : name;
@@ -406,6 +496,36 @@ internal static class SourceBuild
             foreach (var error in linked.Errors)
                 Console.Error.WriteLine($"larva: {error}");
             return 1;
+        }
+        // Quoted functions passed to parameters that name a translator ([CompileWith]): translated now (a library's own
+        // code reads them), their errors the build's.
+        var builtLibraries = new HashSet<string>(StringComparer.Ordinal) { CoreAssemblyName, corePath ?? CoreAssemblyName };
+        builtLibraries.UnionWith(StandardLibraries);
+        if (!QuoteTranslation.Run(linked.Assembly!, builtLibraries, inputBytes, timings.Mark))
+            return 1;
+        // The entry: Main, or the one --entry names. A Main that takes the command line gets an entry that reads it, and a
+        // Main without numbers to read is a program (any words on its command line; its integer is the exit code).
+        H.MemberToken? entryToken = linked.Assembly!.EntryPoint;
+        if (entryChosen is not null)
+        {
+            if (EntryNamed(linked.Assembly, entryChosen) is not { } named)
+            {
+                Console.Error.WriteLine($"larva: --entry {entryChosen}: no static function of that name without parameters (Namespace.Type.Function)");
+                return 1;
+            }
+            entryToken = named;
+        }
+        bool programEntry = false;
+        if (entryToken is { } declared && !dll)
+        {
+            if (Larva.Hir.Lowering.ProgramEntry.Prepare(linked.Assembly, declared, out string? entryError, collector) is not { } prepared)
+            {
+                Console.Error.WriteLine($"larva: {entryError}");
+                return 1;
+            }
+            entryToken = prepared.Entry;
+            programEntry = prepared.Program;
+            linked.Assembly.EntryPoint = prepared.Entry;
         }
         var lowered = HirLowerer.Lower(linked.Assembly!, new LoweringOptions
         {
@@ -443,7 +563,6 @@ internal static class SourceBuild
             Console.WriteLine($"no errors ({inputs.Count} file{(inputs.Count == 1 ? "" : "s")}; {timings})");
             return 0;
         }
-        H.MemberToken? entryToken = linked.Assembly!.EntryPoint;
         if (entryToken is null && !dll)
         {
             Console.Error.WriteLine("larva: the program has no Main (a library for C: --dll, with [Export] functions)");
@@ -451,11 +570,11 @@ internal static class SourceBuild
         }
         var compilation = (projectCompilation ?? new CompilationOptions { BorrowCheck = borrowGiven ?? Larva.Build.LarvaDefaults.BorrowCheck() }) with { Gc = rootGc };
         var module = lowered.Module!;
-        // A tool (and a program built from compiled libraries only, which is how tools are installed) is a program:
-        // its entry reads the command line as text and its result is the process's exit code.
-        if ((tool || compiledOnly) && !dll && entryToken is { } programEntry)
+        // A tool (and a program built from compiled libraries only, which is how tools are installed), and a Main without
+        // numbers to read, is a program: its entry reads the command line as text and its result is the exit code.
+        if ((tool || compiledOnly || programEntry) && !dll && entryToken is { } programToken)
         {
-            string programFunction = lowered.FunctionName(programEntry);
+            string programFunction = lowered.FunctionName(programToken);
             module = module with
             {
                 Functions = [.. module.Functions.Select(f => f.Name == programFunction && !f.Attributes.Any(a => a.Name == Larva.IR.Intrinsics.ProgramAttribute)
@@ -481,7 +600,7 @@ internal static class SourceBuild
                 Console.Error.WriteLine($"larva: {error}");
             return 1;
         }
-        if (target != "native")
+        if (target is "wasm" or "wasm-llvm")
         {
             // WebAssembly: NAME.wasm, NAME.js (its runtime; `node NAME.js` runs it) and NAME.html.
             var (files, wasmMessage) = WasmBuilder.Build(ir, output, new ExecutableOptions { OptimizationLevel = optimization, Compilation = compilation }, llvm: target == "wasm-llvm");
@@ -504,8 +623,9 @@ internal static class SourceBuild
             Compilation = compilation,
             Cpu = cpu,
         };
-        var (success, message) = dll ? ExecutableBuilder.BuildLibrary(ir, output, executableOptions) : ExecutableBuilder.Build(ir, output, executableOptions);
-        timings.Mark($"native ({backend})");
+        var (success, message) = posix is not null ? PosixBuilder.BuildExecutable(ir, output, posix, executableOptions)
+            : dll ? ExecutableBuilder.BuildLibrary(ir, output, executableOptions) : ExecutableBuilder.Build(ir, output, executableOptions);
+        timings.Mark($"native ({(posix is null ? backend : posix.Name)})");
         if (!success)
         {
             Console.Error.WriteLine($"larva: {message}");
@@ -516,6 +636,16 @@ internal static class SourceBuild
         if (showTimings)
             Console.WriteLine($"timings: {timings}");
         return 0;
+    }
+
+    /// <summary>The platform larva runs on (null on a processor it does not build for).</summary>
+    private static NativeTarget? HostTarget()
+    {
+        var arm = System.Runtime.InteropServices.RuntimeInformation.OSArchitecture == System.Runtime.InteropServices.Architecture.Arm64;
+        return OperatingSystem.IsWindows() ? NativeTarget.Windows
+            : OperatingSystem.IsLinux() ? (arm ? NativeTarget.LinuxArm64 : NativeTarget.LinuxX64)
+            : OperatingSystem.IsMacOS() ? (arm ? NativeTarget.MacArm64 : NativeTarget.MacX64)
+            : null;
     }
 
     /// <summary>The project's native libraries and files copied next to <paramref name="output"/> (when they changed).</summary>

@@ -22,6 +22,7 @@ public sealed unsafe class AotTests : CheckedTest
     [Fact]
     public void C_runtime_defines_every_symbol_and_walks_stack_maps()
     {
+        InProcess.RequireWindows();
         string source = Toolchain.RuntimeSource();
         // Functions are defined with a body; runtime data (the safepoint flag and its pointer) as a variable.
         var missing = NativeRuntime.Symbols.Keys.Where(name => !Regex.IsMatch(source, $@"\b{name}\s*\([^;]*\)\s*\{{")
@@ -35,6 +36,7 @@ public sealed unsafe class AotTests : CheckedTest
     [Fact]
     public void Entry_wrappers_are_added_and_larva_symbols_prefixed()
     {
+        InProcess.RequireWindows();
         var linked = ExecutableEntry.AddWrappers(LinkerPrograms.LinkedProgram());
         Check("wrappers added as roots", linked.Merged!.Functions.TakeLast(3).Select(f => f.Name).SequenceEqual(["larva_entry", "larva_entry_f64", "larva_entry_info"])
             && linked.Roots.Count >= 4);

@@ -132,8 +132,8 @@ Other chunks cover source selection (`SOURCES`), embedded resources (`RESOURCES`
 | Platform | Status |
 | --- | --- |
 | Windows x64 | Supported: the installer (wizard or silent), native builds with the MSVC linker, WebAssembly and the VM. |
-| Linux x64 | Preview: `install.sh` installs for your user. Native linking is in progress, and this platform is not fully tested yet. |
-| macOS arm64 | Preview: same as Linux. |
+| Linux x64 | Supported: `install.sh` installs for your user; native programs are built with LLVM and linked by `cc`, and the tests run on Linux in CI. From Windows, `larva build --target linux-x64` builds Linux programs through WSL. larva's LLVM needs `libz3-4` and `libxml2` (`libxml2.so.2`). |
+| macOS arm64 | Preview: `install.sh` installs for your user, and macOS programs go through the same builder as Linux, but this platform is not tested yet. |
 
 Optional tools:
 - **MSVC Build Tools** (C++ workload) link native executables on Windows.

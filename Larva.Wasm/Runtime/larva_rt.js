@@ -260,12 +260,16 @@ export async function run(options = {}) {
     const roots = () => c64
         ? [[Number(exp.__stack_pointer.value), Number(exp.__stack_high.value)], [Number(exp.__stack_high.value), Number(exp.__data_end.value)]]
         : [[exp.sp.value, exp.stack_top.value], [exp.globals_start.value, exp.globals_end.value]];
+    const handleObjects = [], handleGenerations = [], handleFree = [];
+    let handleLive = 0;
+    const handleMisuse = h => { throw new Error(`larva: handle ${h.toString(16)} is not one the runtime gave, or was freed`); };
     function collect() {
         takeLog();
         collections++;
         for (const [from, to] of roots()) scan(from, to - from);
         for (const at of cells) scan(at, sizes[at >>> 4]);
         for (const at of pins.keys()) consider(at);
+        for (const at of handleObjects) if (at) consider(at);
         drain();
         // Unreachable objects with a finalizer survive this time (with what they reach); their finalizers run after.
         const dying = [];
@@ -535,6 +539,41 @@ export async function run(options = {}) {
             // No processes in WebAssembly.
             larva_proc_start: () => -1n,
             larva_proc_wait: () => -1n,
+            // Handles (objects another language holds): a slot's index + 1 and its generation; each slot is a root.
+            larva_handle_new: at => {
+                at = N(at);
+                if (!at) return 0n;
+                const i = handleFree.length ? handleFree.pop() : handleObjects.length;
+                handleObjects[i] = at;
+                handleGenerations[i] ??= 0;
+                handleLive++;
+                return BigInt(handleGenerations[i]) << 32n | BigInt(i + 1);
+            },
+            larva_handle_get: h => {
+                const i = Number(h & 0xffffffffn) - 1;
+                if (i < 0) return P(0);
+                if (!handleObjects[i] || handleGenerations[i] !== Number(h >> 32n)) handleMisuse(h);
+                return P(handleObjects[i]);
+            },
+            larva_handle_free: h => {
+                const i = Number(h & 0xffffffffn) - 1;
+                if (i < 0) return;
+                if (!handleObjects[i] || handleGenerations[i] !== Number(h >> 32n)) handleMisuse(h);
+                handleObjects[i] = 0;
+                handleGenerations[i]++;
+                handleFree.push(i);
+                handleLive--;
+            },
+            larva_handle_count: () => BigInt(handleLive),
+            // One thread: entering and leaving have nothing to do.
+            larva_runtime_enter: () => {},
+            larva_runtime_leave: () => {},
+            larva_thread_detach: () => {},
+            // The static constructors' lock (one thread: no one waits).
+            larva_init_lock: () => {},
+            larva_init_unlock: () => {},
+            larva_runtime_callout: () => {},
+            larva_runtime_callin: () => {},
             // A typed object or array (the LLVM back end): the type map's first words are its size and element stride.
             larva_gc_alloc: (type, size) => P(gcAlloc(N(size))),
             // An object ending with an array in place (flags bit 8) keeps the length in the word before the elements.

@@ -191,6 +191,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void Tracing_and_manual_domains_mix()
     {
+        InProcess.RequireWindows();
         var tracingManual = Linker.Link([Object(GcLib()), Object(ManualApp(), GcConfig.Manual)], new LinkOptions { MixedDomains = true });
         Check("Tracing + Manual links (a Manual module holds `gc` objects of the program's domain)", tracingManual.Success, string.Join(" | ", tracingManual.Errors));
         if (tracingManual.Success)
@@ -204,6 +205,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void Object_headers_carry_their_domain()
     {
+        InProcess.RequireWindows();
         var domains = Linker.Link([Object(GcLib()), Object(RcLib(), GcConfig.RefCount), Object(DomainApp())], new LinkOptions { MixedDomains = true });
         Check("Default + RefCount + app links", domains.Success, string.Join(" | ", domains.Errors));
         if (domains.Success)
@@ -216,6 +218,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void Tracing_code_counts_the_refcounted_cells_it_holds()
     {
+        InProcess.RequireWindows();
         var tracingRc = Linker.Link([Object(RcFin(), GcConfig.RefCount), Object(TracingRcApp())], new LinkOptions { MixedDomains = true });
         Check("Tracing + RefCount links", tracingRc.Success, string.Join(" | ", tracingRc.Errors));
         if (tracingRc.Success)
@@ -229,6 +232,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void Arena_cells_cross_only_from_outside_regions()
     {
+        InProcess.RequireWindows();
         var arena = Linker.Link([Object(ArenaApp()), Object(ArenaLib(leak: false), GcConfig.Arena)], new LinkOptions { MixedDomains = true });
         Check("Tracing + Arena links", arena.Success, string.Join(" | ", arena.Errors));
         if (arena.Success)
@@ -246,6 +250,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void Freeing_manual_memory_releases_the_counted_cells_it_held()
     {
+        InProcess.RequireWindows();
         var manualFree = Linker.Link([Object(RcFin(), GcConfig.RefCount), Object(ManualFree(), GcConfig.Manual)], new LinkOptions { MixedDomains = true });
         Check("Manual + RefCount links", manualFree.Success, string.Join(" | ", manualFree.Errors));
         if (manualFree.Success)
@@ -267,6 +272,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void A_refcount_program_runs_a_tracing_library_collector()
     {
+        InProcess.RequireWindows();
         var rcRoot = Linker.Link([Object(RcApp(), GcConfig.RefCount), Object(GcLib())],
             new LinkOptions { MixedDomains = true, Compilation = new CompilationOptions { Gc = GcConfig.RefCount } });
         Check("RefCount root + tracing library links", rcRoot.Success, string.Join(" | ", rcRoot.Errors));
@@ -287,6 +293,7 @@ public sealed unsafe class LinkerTests : CheckedTest
     [Fact]
     public void Static_data_is_renumbered_per_object_and_read_only()
     {
+        InProcess.RequireWindows();
         var table = IrType.Ref(IrType.ArrayOf(IrType.I32));
 
         var pick = new FunctionBuilder("pick", IrType.I32) { Linkage = Linkage.Export };

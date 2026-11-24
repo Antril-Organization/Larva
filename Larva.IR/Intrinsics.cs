@@ -167,6 +167,29 @@ namespace Larva.IR
             // gives its exit code, closing the handle.
             new(95, "proc.start", [Str, Str], IrType.I64, "larva_proc_start"),
             new(96, "proc.wait", [IrType.I64], IrType.I64, "larva_proc_wait"),
+            // Handles (Larva.Polyglot): an object another language holds is a u64, a root until it is freed. handle.new of
+            // a gc object (cast to a pointer; null gives 0), handle.get its object again (a handle that was freed stops the
+            // program), handle.free gives it back; handle.count how many are held.
+            new(97, "handle.new", [IrType.PtrMut(IrType.U8)], IrType.U64, "larva_handle_new"),
+            new(98, "handle.get", [IrType.U64], IrType.PtrMut(IrType.U8), "larva_handle_get"),
+            new(99, "handle.free", [IrType.U64], IrType.Unit, "larva_handle_free"),
+            new(100, "handle.count", [], IrType.I64, "larva_handle_count"),
+            // Calls in from another language: runtime.enter when one starts (the thread's first attaches it), runtime.leave
+            // when it returns or calls out (the thread is stopped for collections until it enters again), thread.detach
+            // when the thread will not call in again.
+            new(101, "runtime.enter", [], IrType.Unit, "larva_runtime_enter"),
+            new(102, "runtime.leave", [], IrType.Unit, "larva_runtime_leave"),
+            new(103, "thread.detach", [], IrType.Unit, "larva_thread_detach"),
+            // The lock a program's static constructors run under ($StaticInit: whichever threads make their first calls at
+            // the same time, one runs them and the others wait). Re-entrant for the thread that holds it; a thread that
+            // waits for it waits in the runtime (a collection does not wait for it).
+            new(104, "init.lock", [], IrType.Unit, "larva_init_lock"),
+            new(105, "init.unlock", [], IrType.Unit, "larva_init_unlock"),
+            // A call out to another language's function (a callback) from Larva code, on any thread: runtime.callout
+            // before it (the thread is stopped for collections while it runs the other language's code, which may call in
+            // again), runtime.callin after.
+            new(106, "runtime.callout", [], IrType.Unit, "larva_runtime_callout"),
+            new(107, "runtime.callin", [], IrType.Unit, "larva_runtime_callin"),
         ];
 
         private static readonly Dictionary<string, Info> byName = All.ToDictionary(i => i.Name);

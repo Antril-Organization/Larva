@@ -82,9 +82,14 @@ namespace Larva.Native
             var (system, systemLog) = SystemLibraries();
             if (system is null)
                 return (false, systemLog);
-            List<string> arguments = ["/nologo", "/DLL", "/ENTRY:DllMain", "/CETCOMPAT:NO", .. SmallImage, $"/OUT:{Path.GetFullPath(output)}",
-                .. objects.Select(Path.GetFullPath), runtime, .. system, .. exports.Select(e => $"/EXPORT:{e}")];
-            return RunCommands(_ => [new Command("link", arguments)], output);
+            // The exports in a response file: a library for other languages exports thousands (too long for a command line).
+            return RunCommands(directory =>
+            {
+                string response = Path.Combine(directory, "exports.rsp");
+                File.WriteAllText(response, Exports(exports));
+                return [new Command("link", ["/nologo", "/DLL", "/ENTRY:DllMain", "/CETCOMPAT:NO", .. SmallImage, $"/OUT:{Path.GetFullPath(output)}",
+                    .. objects.Select(Path.GetFullPath), runtime, .. system, $"@{response}"])];
+            }, output);
         }
 
         /// <summary>
@@ -383,6 +388,14 @@ namespace Larva.Native
                     .. objects.Concat(libraries).Append(runtimeLibrary).Select(Path.GetFullPath), startObject, "kernel32.lib", "ntdll.lib", "libcmt.lib"]);
                 return [new Command("cl", ["/nologo", "/O1", "/GS-", "/c", $"/Fo{startObject}", start]), new Command("link", link)];
             }, output);
+
+        /// <summary>
+        /// A C program (with the C library) from <paramref name="source"/>, linked against <paramref name="libraries"/>
+        /// (import libraries of Larva DLLs): a host that loads Larva code the way another language's program does.
+        /// </summary>
+        public (bool Success, string Log) CompileHost(string source, string output, IReadOnlyList<string> libraries) =>
+            RunCommands(directory => [new Command("cl", ["/nologo", "/O2", "/W3", "/MT", Path.GetFullPath(source), $"/Fe{Path.GetFullPath(output)}",
+                $"/Fo{directory}{Path.DirectorySeparatorChar}", .. libraries.Select(Path.GetFullPath)])], output);
 
         /// <summary>A response file of <c>/EXPORT</c> options, each quoted whole so any symbol (spaces, <c>@</c>, <c>=</c>) passes as is.</summary>
         private static string Exports(IReadOnlyList<string> exports) => string.Concat(exports.Select(e => $"\"/EXPORT:{e}\"\n"));

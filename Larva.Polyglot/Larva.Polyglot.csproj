@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Libraries for other languages: a Larva library's API with each language's names and habits (docs/design/polyglot.md). -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Larva.Polyglot.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Larva.Hir\Larva.Hir.csproj" />
+    <ProjectReference Include="..\Larva.Hir.Services\Larva.Hir.Services.csproj" />
+  </ItemGroup>
+
+</Project>

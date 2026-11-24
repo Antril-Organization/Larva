@@ -1,0 +1,303 @@
+// SQLite through its C library (sqlite3.dll; a project names it in DEPS: `lib: native/sqlite3.dll`). Handles are kept as
+// numbers; text crosses as UTF-8 (SQLite's own), copied once each way.
+
+import System;
+import System.Runtime.InteropServices;
+
+into namespace System.Data.Sqlite
+{
+	/// The C functions used, as sqlite3.h declares them (handles as i64).
+	internal static class Native
+	{
+		public:
+			/// SQLITE_TRANSIENT: SQLite copies the bound text or bytes before the call returns.
+			const i64 Transient = -1;
+
+			const i32 Ok = 0;
+			const i32 Row = 100;
+			const i32 Done = 101;
+
+			const i32 OpenReadOnly = 1;
+			const i32 OpenReadWrite = 2;
+			const i32 OpenCreate = 4;
+			const i32 OpenUri = 64;
+
+			[Import("sqlite3.dll")] unsafe static sqlite3_open_v2(str filename, i64* db, i32 flags, str? vfs) : i32;
+			[Import("sqlite3.dll")] static sqlite3_close_v2(i64 db) : i32;
+			[Import("sqlite3.dll")] unsafe static sqlite3_errmsg(i64 db) : u8*;
+			[Import("sqlite3.dll")] unsafe static sqlite3_errstr(i32 code) : u8*;
+			[Import("sqlite3.dll")] static sqlite3_extended_errcode(i64 db) : i32;
+			[Import("sqlite3.dll")] static sqlite3_exec(i64 db, str sql, i64 callback, i64 argument, i64 errors) : i32;
+			[Import("sqlite3.dll")] static sqlite3_changes64(i64 db) : i64;
+			[Import("sqlite3.dll")] static sqlite3_last_insert_rowid(i64 db) : i64;
+			[Import("sqlite3.dll")] static sqlite3_busy_timeout(i64 db, i32 milliseconds) : i32;
+			[Import("sqlite3.dll")] unsafe static sqlite3_prepare_v2(i64 db, str sql, i32 bytes, i64* statement, i64 tail) : i32;
+			[Import("sqlite3.dll")] static sqlite3_finalize(i64 statement) : i32;
+			[Import("sqlite3.dll")] static sqlite3_step(i64 statement) : i32;
+			[Import("sqlite3.dll")] static sqlite3_reset(i64 statement) : i32;
+			[Import("sqlite3.dll")] static sqlite3_clear_bindings(i64 statement) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_parameter_count(i64 statement) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_parameter_index(i64 statement, str name) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_int64(i64 statement, i32 index, i64 value) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_double(i64 statement, i32 index, f64 value) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_text(i64 statement, i32 index, str value, i32 bytes, i64 destructor) : i32;
+			[Import("sqlite3.dll")] unsafe static sqlite3_bind_blob(i64 statement, i32 index, u8* value, i32 bytes, i64 destructor) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_zeroblob(i64 statement, i32 index, i32 bytes) : i32;
+			[Import("sqlite3.dll")] static sqlite3_bind_null(i64 statement, i32 index) : i32;
+			[Import("sqlite3.dll")] static sqlite3_column_count(i64 statement) : i32;
+			[Import("sqlite3.dll")] unsafe static sqlite3_column_name(i64 statement, i32 column) : u8*;
+			[Import("sqlite3.dll")] static sqlite3_column_type(i64 statement, i32 column) : i32;
+			[Import("sqlite3.dll")] static sqlite3_column_int64(i64 statement, i32 column) : i64;
+			[Import("sqlite3.dll")] static sqlite3_column_double(i64 statement, i32 column) : f64;
+			[Import("sqlite3.dll")] unsafe static sqlite3_column_text(i64 statement, i32 column) : u8*;
+			[Import("sqlite3.dll")] unsafe static sqlite3_column_blob(i64 statement, i32 column) : u8*;
+			[Import("sqlite3.dll")] static sqlite3_column_bytes(i64 statement, i32 column) : i32;
+			[Import("sqlite3.dll")] unsafe static sqlite3_libversion() : u8*;
+
+			/// `length` bytes at `at` as a new array (one copy).
+			unsafe static Bytes(u8* at, i32 length) : u8[]
+			{
+				u8[] bytes = new u8[length];
+				if (length > 0)
+					Memory.Copy(&bytes[0], at, length);
+				return bytes;
+			}
+
+			/// The null-terminated UTF-8 text at `at` ("" for null).
+			unsafe static Text(u8* at) : str
+			{
+				if (at == null)
+					return "";
+				i32 length = 0;
+				loop (at[length] != 0)
+					length++;
+				return new String<u8>(Bytes(at, length));
+			}
+	}
+
+	/// A connection to a SQLite database: a file, or `:memory:`.
+	public final class SqliteConnection : Connection
+	{
+		i64 db;
+
+		new(i64 db) { this.db = db; }
+
+		/// The connection's last error, thrown.
+		Fail(i32 code)
+		{
+			str message = "";
+			unsafe
+			{
+				message = Native.Text(Native.sqlite3_errmsg(db));
+			}
+			throw new DataError(message, Native.sqlite3_extended_errcode(db));
+		}
+
+		public:
+			/// Opens (or creates) the database at `path` (`:memory:`: a new one in memory).
+			static Open(str path) : SqliteConnection => Open(path, false);
+
+			/// Opens the database at `path`; `readOnly`: it is read, never written, and never created.
+			static Open(str path, bool readOnly) : SqliteConnection
+			{
+				i64 handle = 0;
+				i32 flags = readOnly ? Native.OpenReadOnly : Native.OpenReadWrite | Native.OpenCreate;
+				i32 code;
+				unsafe
+				{
+					code = Native.sqlite3_open_v2(path, &handle, flags | Native.OpenUri, null);
+				}
+				if (code != Native.Ok)
+				{
+					str message = "";
+					unsafe
+					{
+						message = handle != 0 ? Native.Text(Native.sqlite3_errmsg(handle)) : Native.Text(Native.sqlite3_errstr(code));
+					}
+					if (handle != 0)
+						Native.sqlite3_close_v2(handle);
+					throw new DataError($"cannot open {path}: {message}", code);
+				}
+				return new SqliteConnection(handle);
+			}
+
+			/// A new database in memory (gone when it is closed).
+			static InMemory() : SqliteConnection => Open(":memory:", false);
+
+			/// The version of the SQLite library (`3.45.1`).
+			static Version() : str
+			{
+				unsafe
+				{
+					return Native.Text(Native.sqlite3_libversion());
+				}
+			}
+
+			override Execute(str sql) : i64
+			{
+				if (db == 0)
+					throw new InvalidOperationError("the connection is closed");
+				i32 code = Native.sqlite3_exec(db, sql, 0, 0, 0);
+				if (code != Native.Ok)
+					Fail(code);
+				return Native.sqlite3_changes64(db);
+			}
+
+			override Prepare(str sql) : Command
+			{
+				if (db == 0)
+					throw new InvalidOperationError("the connection is closed");
+				i64 statement = 0;
+				i32 code;
+				unsafe
+				{
+					code = Native.sqlite3_prepare_v2(db, sql, -1, &statement, 0);
+				}
+				if (code != Native.Ok)
+					Fail(code);
+				if (statement == 0)
+					throw new DataError("the SQL has no statement", 21);
+				return new SqliteCommand(this, statement);
+			}
+
+			override LastInsertId() : i64 => Native.sqlite3_last_insert_rowid(db);
+
+			/// How many rows the last statement changed.
+			Changes() : i64 => Native.sqlite3_changes64(db);
+
+			/// How long a statement waits for a database another connection holds, before it fails (SQLITE_BUSY).
+			BusyTimeout(i32 milliseconds) { Native.sqlite3_busy_timeout(db, milliseconds); }
+
+			override IsOpen() : bool => db != 0;
+
+			override Close()
+			{
+				if (db != 0)
+					Native.sqlite3_close_v2(db);
+				db = 0;
+			}
+
+			/// The connection's error for `code`, thrown (its commands report through it).
+			ThrowError(i32 code) { Fail(code); }
+
+			destroy() { Close(); }
+	}
+
+	/// A statement of a SQLite connection.
+	public final class SqliteCommand : Command
+	{
+		SqliteConnection connection;
+		i64 statement;
+
+		Check(i32 code)
+		{
+			if (code != Native.Ok)
+				connection.ThrowError(code);
+		}
+
+		Live() : i64
+		{
+			if (statement == 0)
+				throw new InvalidOperationError("the command is closed");
+			return statement;
+		}
+
+		public:
+			new(SqliteConnection connection, i64 statement)
+			{
+				this.connection = connection;
+				this.statement = statement;
+			}
+
+			override Bind(i32 index, i64 value) { Check(Native.sqlite3_bind_int64(Live(), index, value)); }
+			override Bind(i32 index, f64 value) { Check(Native.sqlite3_bind_double(Live(), index, value)); }
+			override Bind(i32 index, str value) { Check(Native.sqlite3_bind_text(Live(), index, value, -1, Native.Transient)); }
+
+			override Bind(i32 index, u8[] value)
+			{
+				if (value.Length == 0)
+				{
+					Check(Native.sqlite3_bind_zeroblob(Live(), index, 0));
+					return;
+				}
+				unsafe
+				{
+					Check(Native.sqlite3_bind_blob(Live(), index, &value[0], value.Length, Native.Transient));
+				}
+			}
+
+			override BindNull(i32 index) { Check(Native.sqlite3_bind_null(Live(), index)); }
+
+			override ParameterIndex(str name) : i32 => Native.sqlite3_bind_parameter_index(Live(), name);
+			override ParameterCount() : i32 => Native.sqlite3_bind_parameter_count(Live());
+			override ClearBindings() { Native.sqlite3_clear_bindings(Live()); }
+
+			override Step() : bool
+			{
+				i32 code = Native.sqlite3_step(Live());
+				if (code == Native.Row)
+					return true;
+				if (code == Native.Done)
+					return false;
+				Native.sqlite3_reset(statement);
+				connection.ThrowError(code);
+				return false;
+			}
+
+			override Reset() { Native.sqlite3_reset(Live()); }
+
+			override Run() : i64
+			{
+				loop (Step())
+				{
+				}
+				Native.sqlite3_reset(statement);
+				return connection.Changes();
+			}
+
+			override ColumnCount() : i32 => Native.sqlite3_column_count(Live());
+
+			override ColumnName(i32 column) : str
+			{
+				unsafe
+				{
+					return Native.Text(Native.sqlite3_column_name(Live(), column));
+				}
+			}
+
+			override ColumnType(i32 column) : ColumnType => (ColumnType)Native.sqlite3_column_type(Live(), column);
+
+			override GetI64(i32 column) : i64 => Native.sqlite3_column_int64(Live(), column);
+			override GetF64(i32 column) : f64 => Native.sqlite3_column_double(Live(), column);
+
+			override GetText(i32 column) : str
+			{
+				i64 at = Live();
+				unsafe
+				{
+					// Text first, then its length (in that order, as SQLite asks: the text may be converted).
+					u8* text = Native.sqlite3_column_text(at, column);
+					return text == null ? "" : new String<u8>(Native.Bytes(text, Native.sqlite3_column_bytes(at, column)));
+				}
+			}
+
+			override GetBytes(i32 column) : u8[]
+			{
+				i64 at = Live();
+				unsafe
+				{
+					u8* bytes = Native.sqlite3_column_blob(at, column);
+					return bytes == null ? new u8[0] : Native.Bytes(bytes, Native.sqlite3_column_bytes(at, column));
+				}
+			}
+
+			override Close()
+			{
+				if (statement != 0)
+					Native.sqlite3_finalize(statement);
+				statement = 0;
+			}
+
+			destroy() { Close(); }
+	}
+}

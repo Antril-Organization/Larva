@@ -17,12 +17,14 @@ using Larva.X64;
 const string Usage = """
     usage: larva new  [<template> [<Name>] [--lang <language>] [-o <folder>]]   a project from a template (none: the list)
            larva run  [<project.queen|folder>] [--rebuild] [build options] [-- <arguments>...]   the project you are in, built if it changed, run
-           larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen>...]   (none: the project you are in)
+           larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--entry Namespace.Type.Function] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen>...]   (none: the project you are in)
            larva lib  -o <Name.dll> [--borrowcheck enforce|warn|off] [--core <dir>] <source file>...   (against System.Core)
            larva config [<key> [<value>] | --unset <key>]    this machine's defaults (BUILD keys, hive.provider, languages.provider, languages.trust)
            larva hive <key|pack|publish|install|add|restore|verify|info|list|trust> ...   packages (larva hive: the list)
            larva tool <install|uninstall|update|restore|list|run> ...   tools from Hive (larva tool: the list); run as larva <command>
            larva bind <lib.dll|lib.so> <api.bind> [-o <Name.dll>] [--source Name.ext] [--core <dir>]   (--list <lib>: its exports)
+           larva polyglot names <Lib.dll> [--lang c,csharp,python,java,typescript] [<filter>]   a library's names in other languages
+           larva polyglot build [<Lib.dll>|<project.queen>] --lang c,csharp [-o <folder>]   the library for C and C# (a folder each)
            larva types  [--lang <language>|hir] [--lib X.dll]... [source file]... [namespace]
            larva show   [--lang <language>|hir] [--no-bodies] [--public] [--lib X.dll]... [source file]... <Type>...
            larva search [--lang <language>|hir] [--lib X.dll]... [source file]... <query>
@@ -69,6 +71,8 @@ if (args.Length >= 1 && args[0] is "types" or "show" or "search")
     return TypeCommands.Run(args[0], args[1..]);
 if (args.Length >= 1 && args[0] == "bind")
     return BindCommand.Run(args[1..]);
+if (args.Length >= 1 && args[0] == "polyglot")
+    return PolyglotCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "hive")
     return HiveCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "config")
