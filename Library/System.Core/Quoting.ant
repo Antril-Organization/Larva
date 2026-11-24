@@ -1,0 +1,153 @@
+// Quoted functions: a parameter written `const func<T> : bool test` takes a `Quoted<func<T> : bool>`, made where the
+// function is written: the function itself (to call it), its body as a tree (to read it: a library turns it into SQL), the
+// values of what it uses from around it (each sub-expression that does not name its parameters: a capture), and a number
+// for the place it was written. The tree is made once per place and kept; the captures are evaluated at each call.
+
+into namespace System
+{
+	/// What a node of a quoted function's body is.
+	public enum QuoteKind
+	{
+		/// The function's parameter `Index`.
+		Parameter,
+		/// `Children[0].Name`: a field or property of what the child is.
+		Member,
+		/// Capture `Index`: a value worked out where the function was written (Quoted.Captures).
+		Capture,
+		/// `null`.
+		Null,
+		/// `Children[0] Name Children[1]` (`Name` is the operator: `==`, `&&`, `+`…).
+		Binary,
+		/// `Name Children[0]` (`!`, `-`).
+		Unary,
+		/// `Children[0].Name(Children[1…])`: a method of what the first child is.
+		Call,
+		/// `Name(Children…)`: a function by its name.
+		Function,
+		/// `Children[0] ? Children[1] : Children[2]`.
+		Conditional,
+		/// What a quoted function cannot say (Name: the code as written).
+		Unsupported,
+	}
+
+	/// A node of a quoted function's body.
+	public final class QuoteNode
+	{
+		public:
+			QuoteKind Kind;
+			str Name;
+			i32 Index;
+			QuoteNode[] Children;
+
+			new(i32 kind, str Name, i32 Index, QuoteNode[] Children)
+			{
+				Kind = (QuoteKind)kind;
+				this.Name = Name;
+				this.Index = Index;
+				this.Children = Children;
+			}
+
+			/// The node as code (for messages).
+			override ToString() : str
+			{
+				if (Kind == QuoteKind.Parameter)
+					return Name;
+				if (Kind == QuoteKind.Member)
+					return Children[0].ToString() + "." + Name;
+				if (Kind == QuoteKind.Capture)
+					return Name;
+				if (Kind == QuoteKind.Null)
+					return "null";
+				if (Kind == QuoteKind.Binary)
+					return "(" + Children[0].ToString() + " " + Name + " " + Children[1].ToString() + ")";
+				if (Kind == QuoteKind.Unary)
+					return Name + Children[0].ToString();
+				if (Kind == QuoteKind.Conditional)
+					return "(" + Children[0].ToString() + " ? " + Children[1].ToString() + " : " + Children[2].ToString() + ")";
+				if (Kind == QuoteKind.Call || Kind == QuoteKind.Function)
+				{
+					i32 first = Kind == QuoteKind.Call ? 1 : 0;
+					str text = (first == 1 ? Children[0].ToString() + "." : "") + Name + "(";
+					loop (i32 i = first..Children.Length)
+						text = text + (i > first ? ", " : "") + Children[i].ToString();
+					return text + ")";
+				}
+				return Name;
+			}
+	}
+
+	/// A function as it was written: callable, readable, with what it captured.
+	public final class Quoted<F>
+	{
+		public:
+			/// The function (call it to run it in memory).
+			F Function;
+			/// Its body.
+			QuoteNode Body;
+			/// The values of the Capture nodes, by their Index.
+			any?[] Captures;
+			/// A number for the place it was written (the same at every call from there).
+			i64 Site;
+			/// Where it was written: `file(line,column)` (for messages).
+			str Place;
+			/// What the build made of it with the translator its parameter names (`[CompileWith]`), or null when it was not
+			/// made (a program not built with larva build, the VM).
+			str? Compiled;
+
+			new(F Function, QuoteNode Body, any?[] Captures, i64 Site, str Place, str? Compiled);
+	}
+
+	/// `[CompileWith("Ns.Type.Function")]` on a quoted parameter (`const func`): when a program is built, the function named
+	/// (static, `(QuoteNode tree) : str`, generic over the type parameters of the method's type when it has as many) is run
+	/// with each tree passed there; what it gives becomes the Quoted's `Compiled`, or, when it starts with `!`, an error of the
+	/// build at the function written.
+	public final class CompileWithAttribute : Attribute
+	{
+		readonly str translator;
+
+		public:
+			new(str translator) { this.translator = translator; }
+
+			str Translator { get => translator; }
+	}
+
+	/// Where quoted functions' trees are kept: made the first time their place runs.
+	public static class Quotes
+	{
+		Dictionary<i64, QuoteNode>? trees;
+		StringBuilder? notes;
+
+		public:
+			/// What the build's translation run gives for the place `site` (a line of Save's file).
+			static Note(i64 site, str text)
+			{
+				StringBuilder written = notes ?? new StringBuilder();
+				notes = written;
+				written.Append($"{site}").Append("\t").Append(text.Replace("\\", "\\\\").Replace("\n", "\\n")).Append("\n");
+			}
+
+			/// The notes, written to `path`.
+			static Save(str path)
+			{
+				System.IO.File.WriteAllText(path, notes is StringBuilder written ? written.ToString() : "");
+			}
+
+			/// The tree of the place `site`, made by `make` the first time.
+			static Tree(i64 site, func : QuoteNode make) : QuoteNode
+			{
+				if (trees is Dictionary<i64, QuoteNode> kept)
+				{
+					if (kept.ContainsKey(site))
+						return kept.Get(site);
+					QuoteNode made = make();
+					kept.Set(site, made);
+					return made;
+				}
+				Dictionary<i64, QuoteNode> first = new Dictionary<i64, QuoteNode>();
+				QuoteNode tree = make();
+				first.Set(site, tree);
+				trees = first;
+				return tree;
+			}
+	}
+}
