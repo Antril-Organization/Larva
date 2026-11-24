@@ -182,6 +182,28 @@ internal static class SourceBuild
         return new Compiled(result?["assembly"]?.GetValue<string>() is { } data ? Convert.FromBase64String(data) : null, result?["types"]?.GetValue<int>() ?? 0);
     }
 
+    /// <summary>The static function without parameters <paramref name="name"/> (<c>Namespace.Type.Function</c>) names, or null.</summary>
+    private static H.MemberToken? EntryNamed(H.HirAssembly assembly, string name)
+    {
+        int dot = name.LastIndexOf('.');
+        if (dot <= 0)
+            return null;
+        string typeName = name[..dot], method = name[(dot + 1)..];
+        for (int t = 0; t < assembly.Types.Count; t++)
+        {
+            var type = assembly.Types[t];
+            if (type.FullName != typeName || type.Generics.Count > 0)
+                continue;
+            for (int m = 0; m < type.Methods.Count; m++)
+            {
+                var candidate = type.Methods[m];
+                if (candidate.Name == method && candidate.IsStatic && candidate.Parameters.Count == 0 && candidate.Generics.Count == 0)
+                    return H.MemberToken.Def(t, m);
+            }
+        }
+        return null;
+    }
+
     /// <summary>Larva's libraries beside System.Core that a build links when a source names them.</summary>
     internal static readonly string[] StandardLibraries = ["System.Bindings", "System.Data"];
 
@@ -216,6 +238,9 @@ internal static class SourceBuild
         string backend = "llvm";
         int optimization = 3;
         bool showTimings = false, noCache = false, dll = false, check = false, tool = false;
+        // `--entry Namespace.Type.Function`: the program starts there instead of at Main (a static function without
+        // parameters; what tools build to run a project's code their own way).
+        string? entryChosen = null;
         bool backendGiven = false, targetGiven = false, optimizationGiven = false;
         BorrowCheckMode? borrowGiven = null;
         // The processor (LLVM): `--cpu`, else the project's BUILD `cpu`, else this machine's default (`larva config cpu`).
@@ -233,6 +258,7 @@ internal static class SourceBuild
                 case "--no-cache": noCache = true; break;
                 case "--dll": dll = true; break;
                 case "--check": check = true; break;
+                case "--entry" when i + 1 < args.Length: entryChosen = args[++i]; break;
                 case "--cpu" when i + 1 < args.Length: cpu = args[++i]; break;
                 case "--borrowcheck" when i + 1 < args.Length:
                     if (BorrowMode(args[++i]) is not { } givenMode)
@@ -347,9 +373,12 @@ internal static class SourceBuild
         bool compiledOnly = inputs.Count == 0 && assemblies.Count > 0;
         if (output is null || inputs.Count == 0 && !compiledOnly || backend is not ("llvm" or "x64") || target is not ("native" or "wasm" or "wasm-llvm"))
         {
-            Console.Error.WriteLine("usage: larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen|Library.dll>...]");
+            Console.Error.WriteLine("usage: larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--entry Namespace.Type.Function] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen|Library.dll>...]");
             return 2;
         }
+        // `-o` into a folder that is not there yet: it is made (as a project's bin/ is).
+        if (!check)
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
         LanguagePack? language = null;
         if (!compiledOnly && (language = Language(inputs)) is null)
             return 1;
@@ -476,6 +505,15 @@ internal static class SourceBuild
             return 0;
         }
         H.MemberToken? entryToken = linked.Assembly!.EntryPoint;
+        if (entryChosen is not null)
+        {
+            if (EntryNamed(linked.Assembly, entryChosen) is not { } named)
+            {
+                Console.Error.WriteLine($"larva: --entry {entryChosen}: no static function of that name without parameters (Namespace.Type.Function)");
+                return 1;
+            }
+            entryToken = named;
+        }
         if (entryToken is null && !dll)
         {
             Console.Error.WriteLine("larva: the program has no Main (a library for C: --dll, with [Export] functions)");
