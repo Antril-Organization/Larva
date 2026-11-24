@@ -125,6 +125,41 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
         Check("FILES into: a folder under the build's is fine", project is not null && project.CopiedFiles.Any(f => f.Target == "data/conf/Main.ant"), string.Join("; ", diagnostics));
     }
 
+    /// <summary>Tools: `type: tool` with its command (by default the name in lower case), and a project's TOOLS chunk.</summary>
+    [Fact]
+    public void Tool_projects_and_TOOLS_entries_are_read()
+    {
+        string root = Path.Combine(projects.Root, "Tools");
+        Directory.CreateDirectory(root);
+        QueenProject? Load(string name, string text, List<QueenDiagnostic> diagnostics)
+        {
+            string file = Path.Combine(root, name + ".queen");
+            File.WriteAllText(file, text);
+            return QueenProject.Load(file, null, diagnostics);
+        }
+        var diagnostics = new List<QueenDiagnostic>();
+        var nest = Load("Nest", "queen 1.0;\nchunk PROJ:\n name: Nest,\n type: tool,\n command: nest-db,\n version: v1.0\n", diagnostics);
+        Check("a tool and its command", nest is { Kind: ProjectKind.Tool, Command: "nest-db" } && diagnostics.Count == 0, string.Join("; ", diagnostics));
+        Check("a tool builds an executable", nest is not null && nest.DefaultOutput(native: true).EndsWith(OperatingSystem.IsWindows() ? "Nest.exe" : "Nest", StringComparison.Ordinal));
+        var plain = Load("Plain", "queen 1.0;\nchunk PROJ:\n name: Plain,\n type: tool\n", diagnostics);
+        Check("the command by default: the name in lower case", plain?.Command == "plain");
+
+        diagnostics.Clear();
+        Load("BadCommand", "queen 1.0;\nchunk PROJ:\n name: B,\n type: tool,\n command: \"Not A Word\"\n", diagnostics);
+        Check("a command is a word: QN124", diagnostics.Any(d => d.Code == "QN124"), string.Join("; ", diagnostics));
+        diagnostics.Clear();
+        var exe = Load("ExeCommand", "queen 1.0;\nchunk PROJ:\n name: E,\n command: e\n", diagnostics);
+        Check("`command` outside a tool: QN126 (a warning), ignored", exe is { Command: null } && diagnostics.Any(d => d.Code == "QN126" && !d.IsError), string.Join("; ", diagnostics));
+
+        diagnostics.Clear();
+        var app = Load("App", "queen 1.0;\nchunk PROJ:\n name: App\nchunk TOOLS:\n tool: Acme/Nest@^1.2,\n tool: Acme/Lint\n", diagnostics);
+        Check("TOOLS: each `tool:` entry, with its version", app is not null && app.Tools.Select(t => t.ToString()).SequenceEqual(["Acme/Nest@^1.2", "Acme/Lint"]) && diagnostics.Count == 0,
+            string.Join("; ", diagnostics) + " " + string.Join(", ", app?.Tools ?? []));
+        diagnostics.Clear();
+        Load("BadTool", "queen 1.0;\nchunk PROJ:\n name: T\nchunk TOOLS:\n tool: nope,\n other: Acme/X\n", diagnostics);
+        Check("TOOLS: a bad reference is QN104, an unknown key QN121", diagnostics.Any(d => d.Code == "QN104") && diagnostics.Any(d => d.Code == "QN121"), string.Join("; ", diagnostics));
+    }
+
     /// <summary>
     /// FILES patterns share one walk of each folder: a pattern below one walked reads that walk; hidden folders, build
     /// output and packages are not entered, unless a pattern names the packages; a folder named itself is copied whole.

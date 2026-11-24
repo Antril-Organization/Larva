@@ -21,6 +21,7 @@ const string Usage = """
            larva lib  -o <Name.dll> [--borrowcheck enforce|warn|off] [--core <dir>] <source file>...   (against System.Core)
            larva config [<key> [<value>] | --unset <key>]    this machine's defaults (BUILD keys, hive.provider, languages.provider, languages.trust)
            larva hive <key|pack|publish|install|add|restore|verify|info|list|trust> ...   packages (larva hive: the list)
+           larva tool <install|uninstall|update|restore|list|run> ...   tools from Hive (larva tool: the list); run as larva <command>
            larva bind <lib.dll|lib.so> <api.bind> [-o <Name.dll>] [--source Name.ext] [--core <dir>]   (--list <lib>: its exports)
            larva types  [--lang <language>|hir] [--lib X.dll]... [source file]... [namespace]
            larva show   [--lang <language>|hir] [--no-bodies] [--public] [--lib X.dll]... [source file]... <Type>...
@@ -74,6 +75,11 @@ if (args.Length >= 1 && args[0] == "config")
     return ConfigCommand.Run(args[1..]);
 if (args is ["build", ..])
     return SourceBuild.Build(args[1..]);
+if (args.Length >= 1 && args[0] == "tool")
+    return ToolCommand.Run(args[1..]);
+// A word that is not one of larva's commands: an installed tool's (`larva nest migrate`).
+if (ToolCommand.TryRun(args) is { } toolResult)
+    return toolResult;
 
 if (args.Length < 2 || args[0] is not ("run" or "dis" or "link" or "native" or "build" or "lib"))
 {

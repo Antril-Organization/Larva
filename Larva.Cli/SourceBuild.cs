@@ -188,7 +188,7 @@ internal static class SourceBuild
         string? output = null, core = null;
         string backend = "llvm";
         int optimization = 3;
-        bool showTimings = false, noCache = false, dll = false, check = false;
+        bool showTimings = false, noCache = false, dll = false, check = false, tool = false;
         bool backendGiven = false, targetGiven = false, optimizationGiven = false;
         BorrowCheckMode? borrowGiven = null;
         // The processor (LLVM): `--cpu`, else the project's BUILD `cpu`, else this machine's default (`larva config cpu`).
@@ -263,6 +263,7 @@ internal static class SourceBuild
                 ApplySettings(project);
                 if (project.Kind == Larva.Build.ProjectKind.Library)
                     dll = true;
+                tool = project.Kind == Larva.Build.ProjectKind.Tool;
                 if (output is null && !check)
                 {
                     string chosen = project.Output is { } written ? Path.GetFullPath(Path.Combine(project.Folder, written)) : project.DefaultOutput(native: true);
@@ -315,12 +316,15 @@ internal static class SourceBuild
         }
         if (check)
             output ??= Path.ChangeExtension(inputs.FirstOrDefault() ?? "program", ".exe");
-        if (output is null || inputs.Count == 0 || backend is not ("llvm" or "x64") || target is not ("native" or "wasm" or "wasm-llvm"))
+        // No source, only compiled libraries: the program is the one of them that has an entry (a tool installed from Hive).
+        bool compiledOnly = inputs.Count == 0 && assemblies.Count > 0;
+        if (output is null || inputs.Count == 0 && !compiledOnly || backend is not ("llvm" or "x64") || target is not ("native" or "wasm" or "wasm-llvm"))
         {
             Console.Error.WriteLine("usage: larva build [-o <app.exe|lib.dll|app.js>] [--check] [--dll] [--target native|wasm|wasm-llvm] [--backend llvm|x64] [-O0..3] [--borrowcheck enforce|warn|off] [--cpu generic|native|<name>] [--core <dir>] [--timings] [--no-cache] [<source file|project.queen|Library.dll>...]");
             return 2;
         }
-        if (Language(inputs) is not { } language)
+        LanguagePack? language = null;
+        if (!compiledOnly && (language = Language(inputs)) is null)
             return 1;
         var timings = new Timings();
         if (CoreLibrary(core, noCache, out bool cached, out string? corePath) is not { } coreBytes)
@@ -374,15 +378,22 @@ internal static class SourceBuild
             assemblyBytes.Add(bindingsBytes);
             references.Add(bindingsPath is not null ? LanguagePack.Reference(bindingsPath) : LanguagePack.Reference(bindingsBytes));
         }
-        var program = Compile(language, inputs, name, references, resources, externals.Select(e => e.Name), options: frontendOptions);
-        timings.Mark("frontend");
-        if (program?.Assembly is not { } programBytes)
-            return 1;
+        byte[][] programBytes = [];
+        if (!compiledOnly)
+        {
+            var program = Compile(language!, inputs, name, references, resources, externals.Select(e => e.Name), options: frontendOptions);
+            timings.Mark("frontend");
+            if (program?.Assembly is not { } compiledProgram)
+                return 1;
+            programBytes = [compiledProgram];
+        }
+        // Compiled only: the linked program is named apart from its libraries (a tool `nest` from the library `Nest`).
+        string linkName = compiledOnly ? "$program." + name : name;
         HirLinkResult linked;
         try
         {
-            linked = HirLinker.Link(name, [coreBytes, .. externalBytes, .. assemblyBytes, programBytes],
-                [corePath ?? "System.Core", .. externals.Select(e => e.Name), .. assemblyNames, name]);
+            linked = HirLinker.Link(linkName, [coreBytes, .. externalBytes, .. assemblyBytes, .. programBytes],
+                [corePath ?? "System.Core", .. externals.Select(e => e.Name), .. assemblyNames, .. (compiledOnly ? Array.Empty<string>() : new[] { name })]);
         }
         catch (HirFormatException e)
         {
@@ -439,7 +450,20 @@ internal static class SourceBuild
             return 1;
         }
         var compilation = (projectCompilation ?? new CompilationOptions { BorrowCheck = borrowGiven ?? Larva.Build.LarvaDefaults.BorrowCheck() }) with { Gc = rootGc };
-        var objectFile = Compiler.CompileObject(lowered.Module!, compilation);
+        var module = lowered.Module!;
+        // A tool (and a program built from compiled libraries only, which is how tools are installed) is a program:
+        // its entry reads the command line as text and its result is the process's exit code.
+        if ((tool || compiledOnly) && !dll && entryToken is { } programEntry)
+        {
+            string programFunction = lowered.FunctionName(programEntry);
+            module = module with
+            {
+                Functions = [.. module.Functions.Select(f => f.Name == programFunction && !f.Attributes.Any(a => a.Name == Larva.IR.Intrinsics.ProgramAttribute)
+                    ? f with { Attributes = [.. f.Attributes, new Larva.IR.IrAttribute(Larva.IR.Intrinsics.ProgramAttribute, [])] }
+                    : f)],
+            };
+        }
+        var objectFile = Compiler.CompileObject(module, compilation);
         timings.Mark("IR checks");
         if (!objectFile.Success)
         {

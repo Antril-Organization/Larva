@@ -31,6 +31,9 @@ namespace Hive
         /// <summary>The GC mode its Larva objects were checked for: a program in another mode needs a source package.</summary>
         public string? Gc { get; init; }
 
+        /// <summary>A tool's command (<c>larva tool install</c> makes it <c>larva &lt;command&gt;</c>); null for a library.</summary>
+        public string? Command { get; init; }
+
         public HiveDependency[] Dependencies { get; init; } = [];
         public HiveFile[] Files { get; init; } = [];
 
@@ -77,6 +80,8 @@ namespace Hive
                 throw new HiveException($"`{manifest.Package}` is not a package name (Author/Name)");
             if (VersionRange.Parse(manifest.Version) is not { Operator: VersionOperator.Exact })
                 throw new HiveException($"`{manifest.Version}` is not a version");
+            if (manifest.Command is { } command && !QueenProject.IsCommandName(command))
+                throw new HiveException($"`{command}` is not a tool command (lower-case letters, digits and `-`)");
             foreach (var file in manifest.Files)
             {
                 if (!HiveArchive.SafePath(file.Path))

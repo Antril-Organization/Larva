@@ -44,7 +44,7 @@ foreach ($template in Get-ChildItem -Directory "$root/Templates") {
 Larva $version
 
 larva.exe          the toolchain: larva new, larva build, larva lsp (the editor's language server), larva bind, larva hive
-                   (packages), larva types
+                   (packages), larva tool (tools installed from Hive, run as larva <command>), larva types
 System.Core.dll    the standard library programs are built with (compiled)
 System.Bindings.dll  what binding profiles are written against (larva bind --profile Profile.<ext> [library] [headers])
 Languages\         the languages larva compiles: one folder each, with its frontend and its manifest
