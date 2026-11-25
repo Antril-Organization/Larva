@@ -26,6 +26,12 @@ namespace Larva.Build
     {
         public const string Extension = ".queen";
 
+        /// <summary>A project's file: <c>project.queen</c> at the top of its folder (the name chooses its profile).</summary>
+        public const string ProjectFile = "project" + Extension;
+
+        /// <summary>The profile the file was read with (<c>project</c>, or one that extends it).</summary>
+        public Profiles.QueenProfile? Profile { get; init; }
+
         /// <summary>The source files' extensions: those of the languages installed (larva sets them from their manifests).</summary>
         public static IReadOnlyList<string> SourceExtensions { get; set; } = [];
 
@@ -56,7 +62,7 @@ namespace Larva.Build
         public string? Platform { get; private set; }
 
         /// <summary>Native platforms a project can name in <c>target</c>.</summary>
-        public static readonly string[] Platforms = QueenSchema.Platforms;
+        public static readonly string[] Platforms = ["windows-x64", "linux-x64", "linux-arm64", "macos-x64", "macos-arm64"];
         public int Optimization { get; private set; } = 2;
 
         /// <summary>The processor for the LLVM back end (BUILD <c>cpu</c>): null is <c>generic</c>; <c>native</c> is this machine's.</summary>
@@ -183,15 +189,44 @@ namespace Larva.Build
             return result;
         }
 
-        /// <summary>The <c>.queen</c> file a path names: the file itself, or the one file in a folder.</summary>
+        /// <summary>
+        /// The project file a path names: the <c>.queen</c> file itself (its name is checked when it is loaded: QN140), or
+        /// the project file of a folder (<c>project.queen</c>, or a package's <c>package.queen</c>). Null when there is none.
+        /// </summary>
         public static string? Find(string path)
         {
             if (System.IO.File.Exists(path) && path.EndsWith(Extension, StringComparison.OrdinalIgnoreCase))
                 return Path.GetFullPath(path);
-            if (Directory.Exists(path))
+            return Directory.Exists(path) ? InFolder(path) : null;
+        }
+
+        /// <summary>The project file directly in <paramref name="folder"/> (<c>project.queen</c>, else <c>package.queen</c>…), or null.</summary>
+        public static string? InFolder(string folder)
+        {
+            foreach (string name in Profiles.ProfileCatalog.ProjectFileNames)
             {
-                var files = Directory.GetFiles(path, "*" + Extension);
-                return files.Length == 1 ? Path.GetFullPath(files[0]) : null;
+                string file = Path.Combine(folder, name);
+                if (System.IO.File.Exists(file))
+                    return Path.GetFullPath(file);
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// The project a file or folder belongs to: the nearest project file from <paramref name="start"/> up. The search
+        /// stops at the top of the repository (a folder with <c>.git</c>) and at <paramref name="stops"/> (an editor's
+        /// workspace folders): a project file above them is not this code's.
+        /// </summary>
+        public static string? Nearest(string start, IReadOnlyCollection<string>? stops = null)
+        {
+            string? folder = Directory.Exists(start) ? Path.GetFullPath(start) : Path.GetDirectoryName(Path.GetFullPath(start));
+            for (; folder is not null; folder = Path.GetDirectoryName(folder))
+            {
+                if (InFolder(folder) is { } found)
+                    return found;
+                if (Directory.Exists(Path.Combine(folder, ".git")) || System.IO.File.Exists(Path.Combine(folder, ".git"))
+                    || stops?.Any(s => string.Equals(Path.GetFullPath(s).TrimEnd('\\', '/'), folder.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)) == true)
+                    return null;
             }
             return null;
         }
@@ -339,10 +374,18 @@ namespace Larva.Build
                 return null;
             }
             int errorsBefore = diagnostics.Count(d => d.IsError);
+            // The file's name says its profile: a project is `project.queen` (or a file whose profile extends it, a Hive
+            // package's `package.queen`).
+            if (Profiles.ProfileCatalog.ForFile(path) is not { } profile || !profile.Is("project"))
+            {
+                diagnostics.Add(new QueenDiagnostic("QN140", $"`{Path.GetFileName(path)}` is not a project file: a project is `{ProjectFile}` (rename it; `PROJ name` keeps the project's name)", path, 1, 1));
+                return null;
+            }
             if (QueenParser.Parse(text, path, diagnostics) is not { } document)
                 return null;
-            var project = new QueenProject { File = path, Document = document };
+            var project = new QueenProject { File = path, Document = document, Profile = profile };
             project.Evaluate(evaluator, diagnostics);
+            Profiles.QueenValidator.Validate(document, profile, diagnostics);
             project.Read(diagnostics);
             if (diagnostics.Count(d => d.IsError) > errorsBefore)
                 return null;
@@ -491,42 +534,30 @@ namespace Larva.Build
 
         // ── Known chunks ───────────────────────────────────────
 
-        private static readonly string[] ProjKeys = QueenSchema.KeyNames(QueenSchema.Proj);
-        private static readonly string[] BuildKeys = QueenSchema.KeyNames(QueenSchema.Build);
-
+        /// <summary>
+        /// The project's settings, from its chunks. What may be written, the values each key takes and what is required
+        /// were checked against the file's profile (<see cref="Profiles.QueenValidator"/>): a value it rejected falls back
+        /// to its default here, with nothing more reported. What needs the disk or other projects is checked here.
+        /// </summary>
         private void Read(List<QueenDiagnostic> diagnostics)
         {
             var proj = Document.Named("PROJ").FirstOrDefault();
+            // The name: PROJ's, else the project's folder's.
+            Name = proj?["name"] is { Value: QueenIdentifier or QueenText or QueenVersion or QueenNumber } name && name.Value.Display.Length > 0
+                ? name.Value.Display : Path.GetFileName(Folder);
             if (proj is null)
-            {
-                diagnostics.Add(new QueenDiagnostic("QN120", "a project has a `chunk PROJ:` with at least its `name`", File, 1, 1));
                 return;
-            }
-            foreach (var entry in proj.Entries.Where(e => !ProjKeys.Contains(e.Key)))
-                Report(diagnostics, "QN121", $"`{entry.Key}` is not a PROJ key ({string.Join(", ", ProjKeys)})", entry.Value, error: false);
-            if (proj["name"] is { Value: QueenIdentifier or QueenText } name && name.Value.Display.Length > 0)
-                Name = name.Value.Display;
-            else
-                diagnostics.Add(new QueenDiagnostic("QN122", "PROJ needs a `name` (a name or text)", File, proj.Line, proj.Column));
             if (proj["type"] is { } type)
             {
                 Kind = type.Value.Display switch
                 {
-                    "exe" => ProjectKind.Exe,
                     "library" => ProjectKind.Library,
                     "tool" => ProjectKind.Tool,
-                    _ => Bad(type.Value, "`type` is `exe`, `library` or `tool`", ProjectKind.Exe),
+                    _ => ProjectKind.Exe,
                 };
             }
-            if (proj["command"] is { } command)
-            {
-                if (Kind != ProjectKind.Tool)
-                    Report(diagnostics, "QN126", "`command` is for `type: tool` projects", command.Value, error: false);
-                else if (IsCommandName(command.Value.Display))
-                    Command = command.Value.Display;
-                else
-                    Bad<string?>(command.Value, "`command` is a word of lower-case letters, digits and `-` (`nest`, `db-tool`)", null);
-            }
+            if (proj["command"] is { } command && Kind == ProjectKind.Tool && IsCommandName(command.Value.Display))
+                Command = command.Value.Display;
             if (Kind == ProjectKind.Tool && Command is null && Name.Length > 0)
                 Command = Name.ToLowerInvariant();
             if (proj["version"] is { } version)
@@ -535,7 +566,7 @@ namespace Larva.Build
                 {
                     QueenVersion v => v.Terms,
                     QueenNumber n when QueenParser.ParseTerms(n.Raw) is { } terms => terms,
-                    _ => Bad<uint[]?>(version.Value, "`version` is a version: `v1.0`, `v2.3.11`", null),
+                    _ => null,
                 };
             }
             Author = proj["author"]?.Value.Display;
@@ -642,8 +673,7 @@ namespace Larva.Build
                             };
                             break;
                         default:
-                            Report(diagnostics, "QN123", $"`{entry.Key}` is not a BUILD key ({string.Join(", ", BuildKeys)})", value, error: false);
-                            break;
+                            break; // the profile reported it (QN121)
                     }
                 }
             }
@@ -697,8 +727,7 @@ namespace Larva.Build
                         hive = hive with { Private = value is QueenBool { Value: true } };
                         break;
                     default:
-                        Report(diagnostics, "QN121", $"`{entry.Key}` is not a HIVE key ({string.Join(", ", QueenSchema.KeyNames(QueenSchema.Hive))})", value, error: false);
-                        break;
+                        break; // the profile reported it (QN121)
                 }
             }
             if (hive.Providers.Length == 0)
@@ -706,10 +735,7 @@ namespace Larva.Build
             foreach (var entry in Document.Named("TOOLS").SelectMany(c => c.Entries))
             {
                 if (entry.Key != "tool")
-                {
-                    Report(diagnostics, "QN121", "`" + entry.Key + "` is not a TOOLS key (tool)", entry.Value, error: false);
-                    continue;
-                }
+                    continue; // the profile reported it (QN121)
                 foreach (var value in entry.Value is QueenList listed ? listed.Items : [entry.Value])
                 {
                     if (PackageReference.Parse(value.Display, value.Line, value.Column) is { } tool)
@@ -720,16 +746,11 @@ namespace Larva.Build
             }
             Hive = hive;
 
-            if (CustomGc && GcCollector is null && Document.Named("BUILD").FirstOrDefault() is { } buildChunk)
-                diagnostics.Add(new QueenDiagnostic("QN125", "`gc: custom` names its collector: `gc.collector: Namespace.Class`", File, buildChunk.Line, buildChunk.Column));
             if (!stdlibSet)
                 Stdlib = Environment.GetEnvironmentVariable("LARVA_STDLIB") is { } fromEnvironment ? Path.GetFullPath(fromEnvironment) : null;
 
-            T Bad<T>(QueenValue value, string message, T fallback)
-            {
-                Report(diagnostics, "QN124", $"{message}, not `{value.Display}`", value);
-                return fallback;
-            }
+            // A value the profile rejected (QN124, or this machine's defaults, which `larva config` checked): the default.
+            static T Bad<T>(QueenValue value, string message, T fallback) => fallback;
         }
 
         private bool stdlibSet;
@@ -747,8 +768,6 @@ namespace Larva.Build
 
         private void FindSources(List<QueenDiagnostic> diagnostics)
         {
-            foreach (var entry in Document.Named("SOURCES").SelectMany(c => c.Entries).Where(e => e.Key is not ("include" or "exclude" or "scan")))
-                Report(diagnostics, "QN121", $"`{entry.Key}` is not a SOURCES key (include, exclude, scan)", entry.Value, error: false);
             Ignore.AddRange(Values("SOURCES", "exclude").Select(v => v.Display));
             bool scan = Values("SOURCES", "scan").LastOrDefault() is not QueenBool { Value: false };
             var patterns = Ignore.Select(p => p.Replace('\\', '/').Trim('/')).Where(p => p.Length > 0).ToList();
@@ -781,7 +800,7 @@ namespace Larva.Build
                     return;
                 }
                 // A nested project (a subfolder with its own project file) is not part of this one.
-                if (!top && entries.Any(e => !e.Folder && e.Path.EndsWith(Extension, StringComparison.OrdinalIgnoreCase)))
+                if (!top && entries.Any(e => !e.Folder && Profiles.ProfileCatalog.IsProjectFile(e.Path)))
                     return;
                 foreach (var (file, _, _) in entries.Where(e => !e.Folder && IsSource(e.Path)).OrderBy(e => e.Path, StringComparer.Ordinal))
                 {
@@ -803,8 +822,6 @@ namespace Larva.Build
         /// <summary><c>FILES</c> (copied next to the build) and <c>RESOURCES</c> (built in), expanded to files.</summary>
         private void ReadFiles(List<QueenDiagnostic> diagnostics)
         {
-            foreach (var entry in Document.Named("FILES").SelectMany(c => c.Entries).Where(e => e.Key is not ("copy" or "into")))
-                Report(diagnostics, "QN121", $"`{entry.Key}` is not a FILES key (copy, into)", entry.Value, error: false);
             string given = Values("FILES", "into").LastOrDefault()?.Display.Replace('\\', '/') ?? "";
             string into = given.Trim('/');
             if (into.Split('/').Contains("..") || given.StartsWith('/') || Path.IsPathRooted(given) || into.Contains(':'))

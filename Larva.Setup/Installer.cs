@@ -314,6 +314,7 @@ internal static class Installer
             (".lvm", "Larva.Module", "Larva module", Path.Combine(icons, "file-lvm.ico")),
             (".bind", "Larva.Binding", "Larva binding description", Path.Combine(icons, "file-bind.ico")),
             (".queen", "Larva.Project", "Larva project", Path.Combine(icons, "file-queen.ico")),
+            (".tqueen", "Larva.ProfileTemplate", "Larva queen profile", Path.Combine(icons, "file-queen.ico")),
             (".hive", "Larva.Package", "Hive package", Path.Combine(icons, "file-hive.ico")),
         };
         string languages = Path.Combine(folder, "Languages");

@@ -121,21 +121,15 @@ internal static class RunCommand
         }
     }
 
-    /// <summary>The project's <c>.queen</c>: the one given (or in the folder given), else the nearest from here up.</summary>
+    /// <summary>
+    /// The project's file: the one given (or the `project.queen` of the folder given), else the nearest `project.queen`
+    /// from here up, not above the top of the repository.
+    /// </summary>
     internal static string? Find(string? where)
     {
         if (where is not null)
-        {
-            if (File.Exists(where) && where.EndsWith(".queen", StringComparison.OrdinalIgnoreCase))
-                return Path.GetFullPath(where);
-            return Directory.Exists(where) ? Directory.EnumerateFiles(where, "*.queen").Order(StringComparer.Ordinal).Select(Path.GetFullPath).FirstOrDefault() : null;
-        }
-        for (string? folder = Directory.GetCurrentDirectory(); folder is not null; folder = Path.GetDirectoryName(folder))
-        {
-            if (Directory.EnumerateFiles(folder, "*.queen").Order(StringComparer.Ordinal).FirstOrDefault() is { } found)
-                return Path.GetFullPath(found);
-        }
-        return null;
+            return Larva.Build.QueenProject.Find(where);
+        return Larva.Build.QueenProject.Nearest(Directory.GetCurrentDirectory());
     }
 
     /// <summary>The file next to the output that records what it was built with (<see cref="Fingerprint"/>).</summary>

@@ -1,0 +1,118 @@
+tqueen 1.0;
+
+// A Larva project: `project.queen` at the top of its folder. Larva reads it with this profile (what may be written,
+// the values each key takes, what is required) and then does what it says.
+
+profile project: "A Larva project: what it builds, how it is compiled and what it uses."
+
+// Other chunks are kept as written, for tools.
+open chunks
+
+/// The project: its name, kind and version.
+chunk PROJ required:
+   /// The project's name (the name of its executable or library). By default, its folder's name.
+   name: TEXT = $folder  example "MyApp"
+   /// What the project builds: a program, a library, or a tool (a program installed into larva: `larva tool install`, run as `larva <command>`).
+   type: [exe, library, tool] = exe
+   /// With `type: tool`: the command it is run by (`larva <command>`; by default the name in lower case).
+   command: REGEX("^[a-z][a-z0-9-]{0,63}$")  only when type == tool  example "nest"
+   /// The project's version.
+   version: VERSION  example "v1.0"
+   /// Who wrote it.
+   author: TEXT  example "My Organization"
+   /// What it is (no commas: a comma ends the entry).
+   description: TEXT
+
+/// How the project is compiled: back end, memory management and the language features it allows.
+chunk BUILD:
+   /// How memory is managed: `default` (tracing collector), `manual` (`delete`), `refcount`, `arena`, or `custom` (a collector the project writes, see `gc.collector`).
+   gc: [default, tracing, manual, refcount, arena, custom] = default
+   /// With `gc: custom`: the class that implements `System.IGarbageCollector`.
+   gc.collector: NAME  required when gc == custom  only when gc == custom  example "MyApp.Memory.Collector"
+   /// What runs or compiles the program: the VM, LLVM or the x64 back end.
+   backend: [vm, llvm, x64] = vm
+   /// Where it runs: this machine (`native`), WebAssembly, or a platform.
+   target: [native, wasm, windows-x64, linux-x64, linux-arm64, macos-x64, macos-arm64] = native
+   /// Optimization level, 0 to 3.
+   optimization: INT(0..3) = 2
+   /// The processor the LLVM back end compiles for: `generic` (any of the platform: portable), `native` (this machine's, with all it has: AVX2 and more; the program may not run on an older processor), or an LLVM name (`x86-64-v3`, `znver3`…).
+   cpu: [generic, native, x86-64-v2, x86-64-v3, x86-64-v4] | REGEX("^[A-Za-z0-9._-]+$") = generic
+   /// The standard library: a folder, or `none`.
+   stdlib: [none] | PATH  example "../StandardLibrary"
+   /// Where the build goes.
+   output: PATH  example "bin/MyApp.exe"
+   /// Files or folders left out of the build.
+   ignore: LIST(GLOB)  example "[tests, drafts]"
+   /// How much types describe of themselves at run time.
+   reflection: [none, layout, full] = layout
+   /// The borrow checker: errors (`enforce`), warnings (`warn`) or nothing (`off`).
+   borrowcheck: [enforce, warn, off] = enforce
+   /// Whether the project's code may use `unsafe` (pointers): `allow` or `deny`.
+   unsafe: [allow, deny] = allow
+   /// How generic code is compiled: shared, or one copy per type (`specialize`).
+   generics: [shared, specialize] = shared
+   /// The access of declarations that say none.
+   access.default: [public, private, internal, friendly, inherited, file]
+
+/// What this project uses: packages, projects, compiled Larva objects and native libraries (each key any number of times). `Name: path` names a project, compiled objects or a library too.
+chunk DEPS open PATH:
+   /// A Hive package: `Author/Name`, or with a version: `Author/Name@1.2` (exactly), `@^1.2` (compatible), `@>=1.2`. Installed with `larva hive install`.
+   package: TEXT  many  example "Acme/Json@^1.0"
+   /// A project compiled with this one: its folder, or its `project.queen`.
+   proj: PATH  many  example "../Shared"
+   /// A project, compiled objects or a library (as `Name: path`).
+   local: PATH  many  example "../Shared"
+   /// A compiled Larva object (`.lvo`), or a folder of them: linked, not compiled again.
+   larvaobj: PATH  many  example "libs/Geometry.lvo"
+   /// A compiled Larva library (`.dll`, or a bare `.lva`, such as the bindings `larva bind` writes): compiled against and linked, with no source.
+   assembly: PATH  many  example "bindings/SDL3.dll"
+   /// A native library (`.dll`, `.so`, `.dylib`, `.wasm`) the code imports from: copied next to the build and found at run time.
+   lib: PATH  many  example "native/zlib.dll"
+
+/// Which source files are the project's (by default, every one of an installed language under its folder).
+chunk SOURCES:
+   /// More source files: a file, a folder or a pattern (`*` within a folder, `**` across folders), also outside the project's folder.
+   include: LIST(GLOB)  many  example "../Shared/**"
+   /// Files or folders left out (like BUILD `ignore`).
+   exclude: LIST(GLOB)  many  example "drafts/**"
+   /// Whether the project's own folder is searched for source files (`false`: only what `include` names).
+   scan: BOOL = true
+
+/// Files copied next to the build (configuration, assets): paths keep their place under the project.
+chunk FILES:
+   /// A file, a folder or a pattern to copy (any number of times).
+   copy: LIST(GLOB)  many  example "assets/**"
+   /// The folder, under the build's, where the copies go (default: the build's own).
+   into: PATH  example "data"
+
+/// Files built into the program, read with `System.Resources.Read(name)`. `name: file` builds one file in under that name.
+chunk RESOURCES open PATH:
+   /// A file, a folder or a pattern built in, each named by its path under the project (`images/logo.png`).
+   embed: LIST(GLOB)  many  example "images/**"
+
+/// Packaging with Hive: where packages come from and how this project is published.
+chunk HIVE:
+   /// The package registry: an address (`antril.org/hive`, `https://…`) or a folder (a local registry).
+   provider: LIST(TEXT)  many  example "antril.org/hive"
+   /// The name this project is published as: `Author/Name` (by default PROJ's `author` and `name`).
+   package: TEXT  example "Acme/Json"
+   /// The license it is published under (an SPDX name).
+   license: TEXT  example "MIT"
+   /// What a package carries: compiled Larva objects only (`compiled`, the lightest) or its sources too (`source`).
+   publish: [compiled, source] = compiled
+   /// The private key that signs published packages (a file made by `hive key`).
+   sign: PATH  example "keys/hive.key"
+   /// How packages are checked when installed: signatures and hashes required (`strict`), hashes only (`hashes`).
+   verify: [strict, hashes] = strict
+   /// Where installed packages are kept (by default the user's Hive cache).
+   cache: PATH  example ".hive"
+   /// `true`: the project is never published.
+   private: BOOL = false
+
+/// The tools this project uses (any number of times): Hive packages of `type: tool`, run as `larva <command>` in the project's folder. `larva tool install` adds them; `larva tool restore` installs them.
+chunk TOOLS:
+   /// A tool: `Author/Name`, or with a version: `Author/Name@1.2`, `@^1.2`.
+   tool: LIST(TEXT)  many  example "Antril-Organization/Nest.Tool@^1.0"
+
+rules:
+   warning when PROJ.type == tool and HIVE.publish == source: "a tool is published compiled: `publish: source` is for libraries"

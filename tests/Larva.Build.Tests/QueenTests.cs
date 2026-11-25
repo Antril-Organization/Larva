@@ -72,8 +72,10 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
 
     private void Expect(string name, string text, string code)
     {
+        // The format, then the `project` profile (a key set twice that is not `many` is the profile's to say: QN011).
         var diagnostics = new List<QueenDiagnostic>();
-        QueenParser.Parse(text, "test.queen", diagnostics);
+        if (QueenParser.Parse(text, "project.queen", diagnostics) is { } document)
+            Profiles.QueenValidator.Validate(document, Profiles.ProfileCatalog.Get("project")!, diagnostics);
         Check($"{name}: {code}", diagnostics.Any(d => d.Code == code), string.Join("; ", diagnostics));
     }
 
@@ -103,7 +105,7 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
     public void DEPS_takes_several_local_dependencies_and_packages()
     {
         var manyDiagnostics = new List<QueenDiagnostic>();
-        var many = QueenProject.Load(Path.Combine(projects.Root, "Many/Many.queen"), null, manyDiagnostics);
+        var many = QueenProject.Load(Path.Combine(projects.Root, "Many/project.queen"), null, manyDiagnostics);
         Check("DEPS: two `local` dependencies and a `package` (skipped with a warning without Hive)", many is { Dependencies.Count: 2, Packages: [{ Id: "Tester/Json", Version.Version: [2, 1] }] }
             && manyDiagnostics.Any(d => d.Code == "QN105" && !d.IsError), string.Join("; ", manyDiagnostics));
         Check("BUILD access.default: public", many?.DefaultAccess == "public");
@@ -113,15 +115,15 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
     public void Project_errors_have_their_codes()
     {
         string root = projects.Root;
-        ExpectLoad("projects cannot depend on each other in a cycle", Path.Combine(root, "Cycle/A/A.queen"), "QN100");
-        ExpectLoad("known keys check their values", Path.Combine(root, "Bad/Bad.queen"), "QN124");
-        ExpectLoad("a project has a PROJ chunk", Path.Combine(root, "NoName/NoName.queen"), "QN120");
-        ExpectLoad("dependencies are libraries", Path.Combine(root, "ExeDep/ExeDep.queen"), "QN103");
-        ExpectLoad("FILES into: cannot climb out with ..", Path.Combine(root, "IntoUp/IntoUp.queen"), "QN131");
-        ExpectLoad("FILES into: cannot be a drive path", Path.Combine(root, "IntoDrive/IntoDrive.queen"), "QN131");
-        ExpectLoad("FILES into: cannot be a rooted path", Path.Combine(root, "IntoRoot/IntoRoot.queen"), "QN131");
+        ExpectLoad("projects cannot depend on each other in a cycle", Path.Combine(root, "Cycle/A/project.queen"), "QN100");
+        ExpectLoad("known keys check their values", Path.Combine(root, "Bad/project.queen"), "QN124");
+        ExpectLoad("a project has a PROJ chunk", Path.Combine(root, "NoName/project.queen"), "QN120");
+        ExpectLoad("dependencies are libraries", Path.Combine(root, "ExeDep/project.queen"), "QN103");
+        ExpectLoad("FILES into: cannot climb out with ..", Path.Combine(root, "IntoUp/project.queen"), "QN131");
+        ExpectLoad("FILES into: cannot be a drive path", Path.Combine(root, "IntoDrive/project.queen"), "QN131");
+        ExpectLoad("FILES into: cannot be a rooted path", Path.Combine(root, "IntoRoot/project.queen"), "QN131");
         var diagnostics = new List<QueenDiagnostic>();
-        var project = QueenProject.Load(Path.Combine(root, "IntoOk/IntoOk.queen"), null, diagnostics);
+        var project = QueenProject.Load(Path.Combine(root, "IntoOk/project.queen"), null, diagnostics);
         Check("FILES into: a folder under the build's is fine", project is not null && project.CopiedFiles.Any(f => f.Target == "data/conf/Main.ant"), string.Join("; ", diagnostics));
     }
 
@@ -133,7 +135,8 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
         Directory.CreateDirectory(root);
         QueenProject? Load(string name, string text, List<QueenDiagnostic> diagnostics)
         {
-            string file = Path.Combine(root, name + ".queen");
+            string file = Path.Combine(root, name, "project.queen");
+            Directory.CreateDirectory(Path.GetDirectoryName(file)!);
             File.WriteAllText(file, text);
             return QueenProject.Load(file, null, diagnostics);
         }
@@ -177,10 +180,10 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
         foreach (var file in new[] { "a.txt", "docs/b.txt", "docs/deep/c.txt", ".hidden/d.txt", "bin/e.txt", "obj/f.txt",
                      "node_modules/pkg/g.txt", "docs/node_modules/h.txt", "docs/.cache/i.txt", "assets/j.txt", "assets/sub/k.txt", "assets/.l.txt" })
             Write(file);
-        File.WriteAllText(Path.Combine(root, "Patterns.queen"),
+        File.WriteAllText(Path.Combine(root, "project.queen"),
             "queen 1.0;\nchunk PROJ:\n   name: Patterns\nchunk BUILD:\n   stdlib: none\nchunk FILES:\n   copy: [**/*.txt, docs/**/*.txt, docs/*.txt, node_modules/**/*.txt, assets, .hidden/*.txt]\n");
         var diagnostics = new List<QueenDiagnostic>();
-        var project = QueenProject.Load(Path.Combine(root, "Patterns.queen"), null, diagnostics);
+        var project = QueenProject.Load(Path.Combine(root, "project.queen"), null, diagnostics);
         var copied = project?.CopiedFiles.Select(f => f.Target).Order(StringComparer.Ordinal).ToList() ?? [];
         string[] expected = [".hidden/d.txt", "a.txt", "assets/j.txt", "assets/sub/k.txt", "docs/b.txt", "docs/deep/c.txt", "node_modules/pkg/g.txt"];
         Check("each pattern's files, once", copied.SequenceEqual(expected), string.Join(", ", copied) + " | " + string.Join("; ", diagnostics));
@@ -189,6 +192,42 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
             QueenProject.Expand(root, "docs/**/*.txt").Select(f => Path.GetRelativePath(root, f).Replace('\\', '/')).SequenceEqual(["docs/b.txt", "docs/deep/c.txt"]));
         Check("packages are searched by a pattern that names them",
             QueenProject.Expand(root, "**/node_modules/*.txt").Select(f => Path.GetRelativePath(root, f).Replace('\\', '/')).SequenceEqual(["docs/node_modules/h.txt"]));
+    }
+
+    /// <summary>
+    /// A project is `project.queen`: another name is QN140; the name defaults to the folder's; a project is found from a
+    /// file or folder up, not above the repository's top (`.git`) or an editor's workspace folder.
+    /// </summary>
+    [Fact]
+    public void A_project_is_project_queen_found_up_to_the_repository()
+    {
+        string root = Path.Combine(projects.Root, "Named");
+        Directory.CreateDirectory(Path.Combine(root, "Old"));
+        File.WriteAllText(Path.Combine(root, "Old", "Old.queen"), "queen 1.0;\nchunk PROJ:\n name: Old\n");
+        var diagnostics = new List<QueenDiagnostic>();
+        Check("a project file named otherwise: QN140, and nothing loads", QueenProject.Load(Path.Combine(root, "Old", "Old.queen"), null, diagnostics) is null
+            && diagnostics.Any(d => d.Code == "QN140" && d.Message.Contains("project.queen", StringComparison.Ordinal)), string.Join("; ", diagnostics));
+        Check("a folder whose file is named otherwise has no project", QueenProject.Find(Path.Combine(root, "Old")) is null);
+
+        string shop = Path.Combine(root, "Shop");
+        Directory.CreateDirectory(Path.Combine(shop, "src", "deep"));
+        File.WriteAllText(Path.Combine(shop, "project.queen"), "queen 1.0;\nchunk PROJ:\n type: library\nchunk BUILD:\n stdlib: none\n");
+        diagnostics.Clear();
+        var project = QueenProject.Load(QueenProject.Find(shop)!, null, diagnostics);
+        Check("PROJ without `name`: the folder's name", project is { Name: "Shop", Kind: ProjectKind.Library }, string.Join("; ", diagnostics));
+        Check("found from a folder inside it", QueenProject.Nearest(Path.Combine(shop, "src", "deep")) == Path.Combine(shop, "project.queen"));
+
+        // Above the repository's top, or a workspace folder, a project file is not this code's.
+        string repository = Path.Combine(root, "Repo");
+        Directory.CreateDirectory(Path.Combine(repository, ".git"));
+        Directory.CreateDirectory(Path.Combine(repository, "loose"));
+        File.WriteAllText(Path.Combine(root, "project.queen"), "queen 1.0;\nchunk PROJ:\n name: Above\n");
+        Check("not above a folder with .git", QueenProject.Nearest(Path.Combine(repository, "loose")) is null);
+        string workspace = Path.Combine(root, "Workspace", "code");
+        Directory.CreateDirectory(workspace);
+        Check("not above a workspace folder", QueenProject.Nearest(workspace, [Path.Combine(root, "Workspace")]) is null);
+        Check("without a stop, the nearest one up", QueenProject.Nearest(workspace) == Path.Combine(root, "project.queen"));
+        File.Delete(Path.Combine(root, "project.queen"));
     }
 
     private void ExpectLoad(string name, string path, string code)
@@ -205,9 +244,9 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
 
         public ProjectsFixture()
         {
-            Write("MathLib/MathLib.queen", "queen 1.0;\nchunk PROJ:\n   name: MathLib,\n   type: library,\n   version: v0.3.1\n");
+            Write("MathLib/project.queen", "queen 1.0;\nchunk PROJ:\n   name: MathLib,\n   type: library,\n   version: v0.3.1\n");
             Write("MathLib/Geometry/Area.ant", "into namespace MathLib\n{\n    public Square(i32 side) : i32 { return side * side; }\n}\n");
-            Write("App/App.queen", """
+            Write("App/project.queen", """
                 queen 1.0;
                 chunk PROJ:
                    name: App,
@@ -228,22 +267,22 @@ public sealed class QueenTests(QueenTests.ProjectsFixture projects) : CheckedTes
             Write("App/Drafts/Broken.ant", "this is not antril");
             Write("App/Tests/Bad.ant", "nor this");
             Write("App/Tests/Deep/Kept.ant", "KeptHelper() : i32 { return 1; }\n");
-            Write("App/Nested/Nested.queen", "queen 1.0;\nchunk PROJ:\n   name: Nested\n");
+            Write("App/Nested/project.queen", "queen 1.0;\nchunk PROJ:\n   name: Nested\n");
             Write("App/Nested/Other.ant", "not part of App");
 
-            Write("Other/Other.queen", "queen 1.0;\nchunk PROJ:\n   name: Other,\n   type: library\n");
+            Write("Other/project.queen", "queen 1.0;\nchunk PROJ:\n   name: Other,\n   type: library\n");
             Write("Other/Other.ant", "into namespace Other { public Three() : i32 { return 3; } }\n");
-            Write("Many/Many.queen", "queen 1.0;\nchunk PROJ:\n   name: Many\nchunk BUILD:\n   stdlib: none,\n   access.default: public\nchunk DEPS:\n   local: ../MathLib\n   local: ../Other\n   package: Tester/Json@2.1\n");
+            Write("Many/project.queen", "queen 1.0;\nchunk PROJ:\n   name: Many\nchunk BUILD:\n   stdlib: none,\n   access.default: public\nchunk DEPS:\n   local: ../MathLib\n   local: ../Other\n   package: Tester/Json@2.1\n");
             Write("Many/Main.ant", "import MathLib;\nimport Other;\nclass Open { i32 x; new() { x = 4; } }\nMain() : i32 { return Square(3) + Three() + new Open().x; }\n");
 
-            Write("Cycle/A/A.queen", "queen 1.0;\nchunk PROJ:\n   name: A,\n   type: library\nchunk DEPS:\n   B: ../B\n");
-            Write("Cycle/B/B.queen", "queen 1.0;\nchunk PROJ:\n   name: B,\n   type: library\nchunk DEPS:\n   A: ../A\n");
-            Write("Bad/Bad.queen", "queen 1.0;\nchunk PROJ:\n   name: Bad,\n   type: plugin\nchunk BUILD:\n   gc: magic\n");
-            Write("NoName/NoName.queen", "queen 1.0;\nchunk BUILD:\n   gc: arena\n");
-            Write("ExeDep/ExeDep.queen", "queen 1.0;\nchunk PROJ:\n   name: ExeDep\nchunk DEPS:\n   App: ../App\n");
+            Write("Cycle/A/project.queen", "queen 1.0;\nchunk PROJ:\n   name: A,\n   type: library\nchunk DEPS:\n   B: ../B\n");
+            Write("Cycle/B/project.queen", "queen 1.0;\nchunk PROJ:\n   name: B,\n   type: library\nchunk DEPS:\n   A: ../A\n");
+            Write("Bad/project.queen", "queen 1.0;\nchunk PROJ:\n   name: Bad,\n   type: plugin\nchunk BUILD:\n   gc: magic\n");
+            Write("NoName/project.queen", "queen 1.0;\nchunk BUILD:\n   gc: arena\n");
+            Write("ExeDep/project.queen", "queen 1.0;\nchunk PROJ:\n   name: ExeDep\nchunk DEPS:\n   App: ../App\n");
             foreach (var (name, into) in new[] { ("IntoUp", "../../out"), ("IntoDrive", "C:/Windows/Temp"), ("IntoRoot", "/etc"), ("IntoOk", "data/conf") })
             {
-                Write($"{name}/{name}.queen", $"queen 1.0;\nchunk PROJ:\n   name: {name}\nchunk BUILD:\n   stdlib: none\nchunk FILES:\n   copy: Main.ant,\n   into: \"{into}\"\n");
+                Write($"{name}/project.queen", $"queen 1.0;\nchunk PROJ:\n   name: {name}\nchunk BUILD:\n   stdlib: none\nchunk FILES:\n   copy: Main.ant,\n   into: \"{into}\"\n");
                 Write($"{name}/Main.ant", "Main() : i32 => 0;\n");
             }
         }

@@ -1,0 +1,6 @@
+tqueen 1.0;
+
+// A Hive package's own project: `package.queen` at the top of the package (Hive writes it when it packs a project, and
+// reads it when it installs one). It says what a project does.
+
+profile package extends project: "A Hive package: the project Hive packs and installs."
