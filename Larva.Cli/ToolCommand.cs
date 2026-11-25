@@ -25,7 +25,7 @@ internal static class ToolCommand
     private static readonly HashSet<string> BuiltIn = new(StringComparer.Ordinal)
     {
         "new", "run", "build", "lib", "config", "hive", "bind", "types", "show", "search", "languages", "lsp", "tool",
-        "dis", "link", "native", "version", "help",
+        "dis", "link", "native", "version", "help", "queen", "polyglot",
     };
 
     public static int Run(string[] args)
@@ -108,11 +108,11 @@ internal static class ToolCommand
         : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Larva", "tools");
 
     /// <summary>The user's tools: one line each, <c>command Author/Name version requirement</c> (requirement <c>*</c>: any).</summary>
-    private static string GlobalList => Path.Combine(Store, "tools.txt");
+    internal static string GlobalList => Path.Combine(Store, "tools.txt");
 
-    private sealed record GlobalTool(string Command, PackageReference Package, string Version);
+    internal sealed record GlobalTool(string Command, PackageReference Package, string Version);
 
-    private static List<GlobalTool> LoadGlobal()
+    internal static List<GlobalTool> LoadGlobal()
     {
         var tools = new List<GlobalTool>();
         if (!File.Exists(GlobalList))

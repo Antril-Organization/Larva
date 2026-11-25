@@ -125,6 +125,8 @@ internal static class SourceBuild
         timings.Mark("frontend");
         if (result?.Assembly is not { } bytes)
             return 1;
+        // `-o` into a folder that is not there yet: it is made (as `larva build` does).
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
         File.WriteAllBytes(output, output.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? LvaContainer.ToDll(bytes) : bytes);
         timings.Mark("write");
         Console.WriteLine($"{output}: {result.Types} types ({timings})");

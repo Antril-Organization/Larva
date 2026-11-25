@@ -676,9 +676,9 @@ internal sealed class LspServer
         {
             // The profile is named after its folder; the profile it extends is the catalog's.
             string name = Path.GetFileName(Path.GetDirectoryName(Path.GetFullPath(path))) ?? "";
-            Larva.Build.Profiles.ProfileParser.Parse(text, path, name, problems, Larva.Build.Profiles.ProfileCatalog.Get);
+            Larva.Build.Profiles.ProfileParser.Parse(text, path, name, problems, other => Larva.Build.Profiles.ProfileCatalog.Get(other, Path.GetDirectoryName(Path.GetFullPath(path))));
         }
-        else if (Larva.Build.Profiles.ProfileCatalog.ForFile(path) is { } profile && !profile.Is("project"))
+        else if (!Larva.Build.Profiles.ProfileCatalog.IsProjectFile(path) && Larva.Build.Profiles.ProfileCatalog.ForFile(path) is { } profile)
         {
             // A file of another profile: checked against it.
             if (Larva.Build.QueenParser.Parse(text, path, problems) is { } document)

@@ -22,6 +22,7 @@ const string Usage = """
            larva config [<key> [<value>] | --unset <key>]    this machine's defaults (BUILD keys, hive.provider, languages.provider, languages.trust)
            larva hive <key|pack|publish|install|add|restore|verify|info|list|trust> ...   packages (larva hive: the list)
            larva tool <install|uninstall|update|restore|list|run> ...   tools from Hive (larva tool: the list); run as larva <command>
+           larva queen read <file.queen>                       the file checked against its profile, as JSON (its values with the defaults, its problems)
            larva bind <lib.dll|lib.so> <api.bind> [-o <Name.dll>] [--source Name.ext] [--core <dir>]   (--list <lib>: its exports)
            larva polyglot names <Lib.dll> [--lang c,csharp,python,java,typescript] [<filter>]   a library's names in other languages
            larva polyglot build [<Lib.dll>|<project.queen>] --lang c,csharp [-o <folder>]   the library for C and C# (a folder each)
@@ -56,11 +57,15 @@ AppDomain.CurrentDomain.UnhandledException += (_, e) =>
 };
 // A project's sources are the files of the languages installed (their manifests say which extensions).
 Larva.Build.QueenProject.SourceExtensions = LanguageRegistry.Extensions;
+// Queen files see the profiles their project's tools (and the user's) bring.
+ToolProfiles.Register();
 // A pack that could not be read is skipped, and said: a language missing silently is harder to understand.
 foreach (string problem in LanguageRegistry.Problems)
     Console.Error.WriteLine($"larva: warning: a language pack was skipped: {problem}");
 if (args.Length >= 1 && args[0] == "new")
     return NewCommand.Run(args[1..]);
+if (args.Length >= 1 && args[0] == "queen")
+    return QueenCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "run" && RunCommand.Handles(args))
     return RunCommand.Run(args[1..]);
 if (args.Length >= 1 && args[0] == "languages")

@@ -123,6 +123,44 @@ public sealed class ProfileTests : CheckedTest
         Check("its own chunks and its base's, and what it is", market.Chunk("SHOP") is not null && market.Chunk("STALLS") is not null && market.Is("shop") && market.Rules.Count() == 1);
     }
 
+    /// <summary>
+    /// Where a file is decides which profiles it sees: its tools' (given by larva), its repository's `.larva/profiles`
+    /// (not above `.git`); larva's own names cannot be replaced by either; a tool's profile does not make projects.
+    /// </summary>
+    [Fact]
+    public void A_file_sees_its_tools_and_its_repositorys_profiles()
+    {
+        string root = TestEnvironment.TempFolder("profiles-places");
+        string repository = Path.Combine(root, "repo"), app = Path.Combine(repository, "app"), store = Path.Combine(root, "tool-profiles");
+        Directory.CreateDirectory(Path.Combine(repository, ".git"));
+        Directory.CreateDirectory(app);
+        void Template(string folder, string name, string text)
+        {
+            Directory.CreateDirectory(Path.Combine(folder, name));
+            File.WriteAllText(Path.Combine(folder, name, ProfileCatalog.TemplateFile), text);
+        }
+        Template(Path.Combine(repository, ".larva", "profiles"), "local", "tqueen 1.0;\nprofile local: \"x\"\nchunk A:\n   k: INT\n");
+        Template(Path.Combine(root, ".larva", "profiles"), "above", "tqueen 1.0;\nprofile above: \"x\"\nchunk A:\n   k: INT\n");
+        Template(store, "toolish", "tqueen 1.0;\nprofile toolish extends project: \"x\"\nchunk EXTRA:\n   k: INT\n");
+        Template(store, "project", "tqueen 1.0;\nprofile project: \"not larva's\"\nchunk ONLY:\n   k: INT\n");
+        var previous = ProfileCatalog.ToolFolders;
+        ProfileCatalog.ToolFolders = near => near.StartsWith(repository, StringComparison.OrdinalIgnoreCase) ? [store] : [];
+        try
+        {
+            Check("a repository's own profile, from a folder inside it", ProfileCatalog.ForFile(Path.Combine(app, "local.queen"))?.Name == "local");
+            Check("not one above the repository's top", ProfileCatalog.ForFile(Path.Combine(app, "above.queen")) is null);
+            Check("a tool's profile, where its tools are", ProfileCatalog.ForFile(Path.Combine(app, "toolish.queen")) is { } toolish && toolish.Chunk("EXTRA") is not null && toolish.Is("project"));
+            Check("not elsewhere", ProfileCatalog.ForFile(Path.Combine(root, "toolish.queen")) is null);
+            Check("larva's own `project` is not replaced by a tool's", ProfileCatalog.ForFile(Path.Combine(app, "project.queen")) is { } project && project.Chunk("ONLY") is null && project.Chunk("PROJ") is not null);
+            Check("a tool's profile that extends `project` does not make its files projects", !ProfileCatalog.IsProjectFile(Path.Combine(app, "toolish.queen")));
+            Check("the names a place sees", ProfileCatalog.Names(app).Contains("local") && ProfileCatalog.Names(app).Contains("toolish") && !ProfileCatalog.Names(root).Contains("toolish"));
+        }
+        finally
+        {
+            ProfileCatalog.ToolFolders = previous;
+        }
+    }
+
     [Fact]
     public void Larva_profiles_are_built_in()
     {
