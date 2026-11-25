@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Queen profile template",
+  "scopeName": "source.tqueen",
+  "patterns": [
+    { "name": "comment.line.documentation.tqueen", "match": "^\\s*///.*$" },
+    { "name": "comment.line.double-slash.tqueen", "match": "(?<![:\\w])//.*$" },
+    {
+      "match": "^\\s*(tqueen)\\s+([\\d.]+)\\s*(;)",
+      "captures": {
+        "1": { "name": "keyword.other.tqueen" },
+        "2": { "name": "constant.numeric.tqueen" },
+        "3": { "name": "punctuation.terminator.tqueen" }
+      }
+    },
+    {
+      "match": "^\\s*(profile)\\s+([\\w-]+)(?:\\s+(extends)\\s+([\\w-]+))?",
+      "captures": {
+        "1": { "name": "keyword.other.tqueen" },
+        "2": { "name": "entity.name.type.tqueen" },
+        "3": { "name": "keyword.other.tqueen" },
+        "4": { "name": "entity.name.type.tqueen" }
+      }
+    },
+    {
+      "match": "^\\s*(chunk)\\s+([A-Z][A-Z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.tqueen" },
+        "2": { "name": "entity.name.section.tqueen" }
+      }
+    },
+    {
+      "match": "^\\s*(rules)\\s*(:)",
+      "captures": {
+        "1": { "name": "keyword.other.tqueen" },
+        "2": { "name": "punctuation.separator.tqueen" }
+      }
+    },
+    {
+      "match": "^\\s*([a-z_][\\w.]*)\\s*(:)",
+      "captures": {
+        "1": { "name": "variable.other.property.tqueen" },
+        "2": { "name": "punctuation.separator.key-value.tqueen" }
+      }
+    },
+    { "name": "string.quoted.double.tqueen", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.tqueen", "match": "\\\\." }] },
+    { "name": "support.type.tqueen", "match": "\\b(TEXT|IDENTIFIER|NAME|INT|NUMBER|BOOL|VERSION|PATH|RPATH|APATH|FILE|FOLDER|GLOB|URL|REGEX|LIST)\\b" },
+    { "name": "keyword.other.tqueen", "match": "\\b(open|chunks|required|many|only|when|deprecated|example|error|warning|and|or|not|in|exists|profile)\\b" },
+    { "name": "variable.language.tqueen", "match": "\\$\\w+" },
+    { "name": "keyword.operator.tqueen", "match": "==|!=|\\||=|\\.\\." },
+    { "name": "constant.numeric.tqueen", "match": "(?<![\\w.])-?\\d+\\b" }
+  ]
+}

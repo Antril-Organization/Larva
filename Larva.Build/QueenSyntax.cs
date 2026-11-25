@@ -267,11 +267,8 @@ namespace Larva.Build
                 Advance();
                 SkipTrivia(newlines: false);
                 var value = Value(inList: false);
-                // Dependencies, sources, copied files and resources can be given any number of times.
-                if (chunk[key] is not null && !Repeatable(chunk.Name, key))
-                    Error("QN011", $"`{key}` is set twice in chunk `{chunk.Name}`", keyLine, keyColumn);
-                else
-                    chunk.Entries.Add(new QueenEntry(key, value, keyLine, keyColumn));
+                // Every entry is kept: the file's profile says which keys may be given more than once (QN011 otherwise).
+                chunk.Entries.Add(new QueenEntry(key, value, keyLine, keyColumn));
                 SkipTrivia(newlines: false);
                 if (Current == ',')
                     Advance();
@@ -428,18 +425,6 @@ namespace Larva.Build
         /// What unquoted text is: <c>true</c>/<c>false</c>, a number, a version (<c>v</c> and <c>u32</c> terms), a name
         /// (letters, digits, <c>_</c>, dots between names), or else text.
         /// </summary>
-        /// <summary>Keys a chunk may give more than once: every DEPS entry, and lists of files.</summary>
-        public static bool Repeatable(string chunk, string key) => chunk switch
-        {
-            "DEPS" => true,
-            "SOURCES" => key is "include" or "exclude",
-            "FILES" => key == "copy",
-            "RESOURCES" => key == "embed",
-            "HIVE" => key == "provider",
-            "TOOLS" => key == "tool",
-            _ => key is "local" or "package",
-        };
-
         public static QueenValue Classify(string raw, int line, int column)
         {
             if (raw is "true" or "false")

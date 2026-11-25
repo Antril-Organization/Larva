@@ -188,7 +188,7 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
         File.WriteAllText(Path.Combine(folder, "assets", "app.cfg"), "c");
         File.WriteAllText(Path.Combine(folder, "native", "zlib.dll"), "z");
         string cache = Path.Combine(root, "cache");
-        File.WriteAllText(Path.Combine(folder, "P.queen"), $"""
+        File.WriteAllText(Path.Combine(folder, "project.queen"), $"""
             queen 1.0;
 
             chunk PROJ:
@@ -222,7 +222,7 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
                verify: hashes
             """);
         var diagnostics = new List<QueenDiagnostic>();
-        var project = QueenProject.Load(Path.Combine(folder, "P.queen"), null, diagnostics, HiveResolver.Create());
+        var project = QueenProject.Load(Path.Combine(folder, "project.queen"), null, diagnostics, HiveResolver.Create());
         Check("a project with every new chunk loads", project is not null && !diagnostics.Any(d => d.IsError), string.Join("; ", diagnostics));
         if (project is null)
             return;
@@ -236,12 +236,12 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
             project.Dependencies.Select(d => d.Name).OrderBy(n => n, StringComparer.Ordinal).SequenceEqual(["A", "B"]), string.Join(", ", project.Dependencies.Select(d => d.Name)));
         Check("HIVE: providers, cache and verify are read", project.Hive is { RequireSignatures: false, Providers: ["../registry"] } && project.Hive.Cache == Path.GetFullPath(cache));
 
-        File.WriteAllText(Path.Combine(folder, "P.queen"), File.ReadAllText(Path.Combine(folder, "P.queen")).Replace("package: T/A,", "package: T/Missing,"));
+        File.WriteAllText(Path.Combine(folder, "project.queen"), File.ReadAllText(Path.Combine(folder, "project.queen")).Replace("package: T/A,", "package: T/Missing,"));
         diagnostics.Clear();
-        QueenProject.Load(Path.Combine(folder, "P.queen"), null, diagnostics, HiveResolver.Create());
+        QueenProject.Load(Path.Combine(folder, "project.queen"), null, diagnostics, HiveResolver.Create());
         Check("a package that is not installed is an error that says how to install it", diagnostics.Any(d => d.Code == "QN108" && d.Message.Contains("hive install", StringComparison.Ordinal)), string.Join("; ", diagnostics));
         diagnostics.Clear();
-        QueenProject.Load(Path.Combine(folder, "P.queen"), null, diagnostics);
+        QueenProject.Load(Path.Combine(folder, "project.queen"), null, diagnostics);
         Check("without Hive, packages are skipped with a warning", diagnostics.Any(d => d.Code == "QN105" && !d.IsError) && !diagnostics.Any(d => d.IsError));
 
         // Packing: a library with compiled objects, a native library and resources makes a package whose project
@@ -252,7 +252,7 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
         File.WriteAllText(Path.Combine(library, "data", "unit.txt"), "u");
         File.WriteAllText(Path.Combine(library, "Geo.ant"), "into namespace Geo { public Area() : i32 => 1; }");
         File.WriteAllText(Path.Combine(library, "bin", "Geo.lvo"), "not really an object");
-        File.WriteAllText(Path.Combine(library, "Geo.queen"), """
+        File.WriteAllText(Path.Combine(library, "project.queen"), """
             queen 1.0;
 
             chunk PROJ:
@@ -272,7 +272,7 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
                package: Tester/Geo,
                license: MIT
             """);
-        var geo = QueenProject.Load(Path.Combine(library, "Geo.queen"), null, diagnostics)!;
+        var geo = QueenProject.Load(Path.Combine(library, "project.queen"), null, diagnostics)!;
         string packed = Path.Combine(root, "Geo.hive");
         var manifest = HivePacker.Pack(geo, Path.Combine(library, "bin"), packed, "default", null);
         var files = manifest.Files.Select(f => f.Path).ToHashSet();
@@ -384,7 +384,7 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
         string folder = Path.Combine(root, "pinned");
         Directory.CreateDirectory(folder);
         File.WriteAllText(Path.Combine(folder, "Main.ant"), "Main() : i32 => 0;");
-        File.WriteAllText(Path.Combine(folder, "Pinned.queen"), $"""
+        File.WriteAllText(Path.Combine(folder, "project.queen"), $"""
             queen 1.0;
 
             chunk PROJ:
@@ -403,13 +403,13 @@ public sealed class HiveTests(HiveTests.HiveFixture hive) : CheckedTest, IClassF
             """);
         locked.Save(folder);
         var diagnostics = new List<QueenDiagnostic>();
-        var project = QueenProject.Load(Path.Combine(folder, "Pinned.queen"), null, diagnostics, HiveResolver.Create());
+        var project = QueenProject.Load(Path.Combine(folder, "project.queen"), null, diagnostics, HiveResolver.Create());
         Check("the pinned version is used when the cache holds the pinned file", project is not null && !diagnostics.Any(d => d.IsError) && project.Dependencies.Any(d => d.Name == "B"), string.Join("; ", diagnostics));
 
         var tampered = locked with { Packages = [.. locked.Packages.Select(p => p.Package == "T/B" ? p with { Sha256 = new string('a', 64) } : p)] };
         tampered.Save(folder);
         diagnostics.Clear();
-        QueenProject.Load(Path.Combine(folder, "Pinned.queen"), null, diagnostics, HiveResolver.Create());
+        QueenProject.Load(Path.Combine(folder, "project.queen"), null, diagnostics, HiveResolver.Create());
         Check("a cached version that is not the file the lock pins is refused, pointing at `hive restore`",
             diagnostics.Any(d => d.Code == "QN108" && d.IsError && d.Message.Contains("not the file hive.lock pins", StringComparison.Ordinal) && d.Message.Contains("hive restore", StringComparison.Ordinal)),
             string.Join("; ", diagnostics));

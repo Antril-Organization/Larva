@@ -18,4 +18,11 @@
     <ProjectReference Include="..\Larva.IR\Larva.IR.csproj" />
   </ItemGroup>
 
+  <!-- Larva's own queen profiles (Profiles/<name>/template.tqueen), built in: resource "Profiles/<name>/template.tqueen". -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\Profiles\*\template.tqueen">
+      <LogicalName>Profiles/$([System.String]::Copy('%(RecursiveDir)').Replace('\', '/'))%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
 </Project>

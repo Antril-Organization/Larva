@@ -104,7 +104,10 @@ namespace Hive
 
             string versionText = VersionRange.Format(version);
             var dependencies = project.Packages.Select(p => new HiveDependency(p.Id, p.Version?.ToString() ?? "")).ToArray();
-            string queen = Path.Combine(Path.GetTempPath(), $"hive-{Guid.NewGuid():N}.queen");
+            // Written apart under its own name (`package.queen`: its profile), then packed.
+            string scratch = Path.Combine(Path.GetTempPath(), $"hive-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(scratch);
+            string queen = Path.Combine(scratch, ProjectFile);
             bool hasObjects = (!sources && lvos.Count > 0) || project.AllLibraries().Any(l => !QueenProject.IsAssembly(l));
             File.WriteAllText(queen, ProjectText(name, versionText, project.Kind == ProjectKind.Tool ? project.Command : null, sources, hasObjects, assemblyFiles, natives, dependencies, resources));
             try
@@ -125,7 +128,7 @@ namespace Hive
             }
             finally
             {
-                File.Delete(queen);
+                Directory.Delete(scratch, recursive: true);
             }
         }
 

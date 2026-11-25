@@ -8,10 +8,10 @@ Each language comes in an extension of its own (its syntax, snippets and icons),
 
 - **Errors as you type**: the compiler's own diagnostics for the whole project, a moment after each edit.
 - **Completion, hover, go to definition, signature help, outline, workspace symbols and highlights**, from the language server.
-- **`.queen` projects**: errors (QN…) as you type, completion of chunk names, of the keys of the chunk you are in and of the values a key takes, and hover on keys. A project's dependencies, its `assembly:` libraries (such as bindings) and the GC domains of its `gc:`-different dependencies are what its files are analyzed against.
-- **Icons** for `.queen` (a crown) and `.bind` files.
+- **Queen files** (`project.queen`, `package.queen`, and any profile's file): errors (QN…) as you type, completion of chunk names, of the keys of the chunk you are in and of the values a key takes, and hover on keys, all from the file's profile. Profile templates (`.tqueen`) get their own errors (TQ…) and completion of types and modifiers. A project's dependencies, its `assembly:` libraries (such as bindings) and the GC domains of its `gc:`-different dependencies are what its files are analyzed against.
+- **Icons** for `.queen` and `.tqueen` (a crown) and `.bind` files.
 - **Commands** (run as tasks in a terminal named Larva):
-  - *Larva: New Project from a Template*: `larva new` with one of Larva's templates (`Console-App`, `Library`…), written in the language you pick, in a folder of its own with its `.queen`; then opened.
+  - *Larva: New Project from a Template*: `larva new` with one of Larva's templates (`Console-App`, `Library`…), written in the language you pick, in a folder of its own with its `project.queen`; then opened.
   - *Larva: Run* (Ctrl+F5, or the play button): in a project, `larva run` (built only when something changed, then run); a lone file is built into a temporary folder and run.
   - *Larva: Check*: the errors only (`larva build --check`).
   - *Larva: Build Native Executable*: the project's BUILD `output`, or `NAME.exe` next to a lone file.
@@ -20,7 +20,7 @@ Each language comes in an extension of its own (its syntax, snippets and icons),
   - *Larva: Generate Bindings from the Profile Open*: `larva bind --profile` on the binding profile open in the editor (a class deriving from `System.Bindings.BindingProfile`).
   - *Larva: Show Type (decompiled)* and *Larva: Restart Language Server*.
 
-A file belongs to the nearest `.queen` project above it: the commands build that project. Otherwise the file is built alone.
+A file belongs to the nearest `project.queen` above it (not above the repository's top or the workspace folder): the commands build that project. Otherwise the file is built alone.
 
 ## Settings
 

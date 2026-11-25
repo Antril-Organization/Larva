@@ -22,8 +22,10 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "workspaceContains:**/*.queen",
+    "workspaceContains:**/project.queen",
+    "workspaceContains:**/*.tqueen",
     "onLanguage:queen",
+    "onLanguage:tqueen",
     "onLanguage:larva-bind"
   ],
   "contributes": {
@@ -36,6 +38,21 @@
         ],
         "extensions": [
           ".queen"
+        ],
+        "configuration": "./queen-configuration.json",
+        "icon": {
+          "light": "./images/queen-file.svg",
+          "dark": "./images/queen-file.svg"
+        }
+      },
+      {
+        "id": "tqueen",
+        "aliases": [
+          "Queen profile template",
+          "tqueen"
+        ],
+        "extensions": [
+          ".tqueen"
         ],
         "configuration": "./queen-configuration.json",
         "icon": {
@@ -62,6 +79,11 @@
         "language": "queen",
         "scopeName": "source.queen",
         "path": "./syntaxes/queen.tmLanguage.json"
+      },
+      {
+        "language": "tqueen",
+        "scopeName": "source.tqueen",
+        "path": "./syntaxes/tqueen.tmLanguage.json"
       }
     ],
     "commands": [

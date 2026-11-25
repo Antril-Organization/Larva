@@ -7,7 +7,7 @@
 # Copies larva into <folder> (Linux: ~/.local/share/larva, macOS: ~/Library/Application Support/Larva), puts a `larva`
 # command in ~/.local/bin (and that folder on the PATH of new shells unless --no-path), makes
 # https://www.antril.org/hive-api larva's default package registry (not with --no-hive), and shows larva's files
-# (.lva, .lvo, .lvm, .bind, .queen, .hive and each language's source files) with their icons (not with --no-types).
+# (.lva, .lvo, .lvm, .bind, .queen, .tqueen, .hive and each language's source files) with their icons (not with --no-types).
 # The copy in <folder> (install.sh --uninstall) takes all of it back, and nothing else.
 set -eu
 
@@ -70,6 +70,7 @@ file_types() {
         lvm module "Larva module" "$prefix/icons/file-lvm" \
         bind binding "Larva binding description" "$prefix/icons/file-bind" \
         queen project "Larva project" "$prefix/icons/file-queen" \
+        tqueen profile "Larva queen profile" "$prefix/icons/file-queen" \
         hive package "Hive package" "$prefix/icons/file-hive"
     for manifest in "$prefix"/Languages/*/language.json; do
         [ -f "$manifest" ] || continue

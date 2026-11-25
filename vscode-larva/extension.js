@@ -158,7 +158,7 @@ function startClient(context) {
   const languages = larvaLanguages();
   vscode.commands.executeCommand('setContext', 'larva.languages', languages.map((l) => l.id));
   const executable = { command: larva.command, args: [...larva.args, 'lsp'], transport: TransportKind.stdio };
-  const selector = [{ scheme: 'file', language: 'queen' }];
+  const selector = [{ scheme: 'file', language: 'queen' }, { scheme: 'file', language: 'tqueen' }];
   for (const language of languages) {
     selector.push(
       { scheme: 'file', language: language.id },
@@ -167,7 +167,7 @@ function startClient(context) {
       { scheme: 'larva', language: language.id }
     );
   }
-  const watched = ['queen', ...languages.flatMap((l) => l.extensions.map((e) => e.replace(/^\./, '')))];
+  const watched = ['queen', 'tqueen', ...languages.flatMap((l) => l.extensions.map((e) => e.replace(/^\./, '')))];
   client = new LanguageClient(
     'larva',
     'Larva',
@@ -199,8 +199,9 @@ async function restartClient(context) {
 // ── Commands ───────────────────────────────────────
 
 /**
- * What a command works on: the nearest .queen project (here or above), or the file itself. `name` names what is built,
- * `folder` is the workspace folder it is in (the task's scope), when it is in one.
+ * What a command works on: the nearest project (its `project.queen`, here or above: not above the repository's top or the
+ * workspace folder), or the file itself. `name` names what is built, `folder` is the workspace folder it is in (the
+ * task's scope), when it is in one.
  */
 function target() {
   const editor = vscode.window.activeTextEditor;
@@ -217,12 +218,12 @@ function target() {
     } catch (_) {
       break;
     }
-    const queen = entries.find((f) => f.toLowerCase().endsWith('.queen'));
+    const queen = ['project.queen', 'package.queen'].find((f) => entries.includes(f));
     if (queen) {
       // The project file itself: `larva build` reads its sources, dependencies, `assembly:` libraries and BUILD settings.
-      return { cwd: folder, name: path.basename(queen, path.extname(queen)), files: [path.join(folder, queen)], queen: true, folder: workspace };
+      return { cwd: folder, name: path.basename(folder), files: [path.join(folder, queen)], queen: true, folder: workspace };
     }
-    if (path.dirname(folder) === folder) {
+    if (path.dirname(folder) === folder || entries.includes('.git') || (workspace && path.resolve(folder) === path.resolve(workspace.uri.fsPath))) {
       break;
     }
   }

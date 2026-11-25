@@ -23,12 +23,12 @@ internal sealed class ProjectWorld
         Larva.Ok("languages", "install", "antril@0.8.0");
     }
 
-    /// <summary>A project folder under the world: its <c>.queen</c> and its sources, as given; the <c>.queen</c>'s path.</summary>
+    /// <summary>A project folder under the world: its <c>project.queen</c> and its sources, as given; the <c>project.queen</c>'s path.</summary>
     public string Project(string name, string queen, params (string File, string Text)[] sources)
     {
         string folder = Path.Combine(World.Root, name + "-" + Guid.NewGuid().ToString("N")[..6]);
         Directory.CreateDirectory(folder);
-        string path = Path.Combine(folder, name + ".queen");
+        string path = Path.Combine(folder, "project.queen");
         File.WriteAllText(path, queen);
         foreach (var (file, text) in sources)
             File.WriteAllText(Path.Combine(folder, file), text);

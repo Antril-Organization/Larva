@@ -161,10 +161,6 @@ namespace Larva.Build
         {
             if (!Keys.Contains(key))
                 return $"`{key}` is not a setting with a default ({string.Join(", ", Keys)})";
-            var schema = QueenSchema.Build.Keys.FirstOrDefault(k => k.Name == key);
-            var allowed = schema?.Values ?? [];
-            if (key == "target" && QueenProject.Platforms.Contains(value))
-                return null;
             if (key == HiveProvider)
                 return value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Length > 0 && !value.Any(char.IsWhiteSpace)
                     ? null : "`hive.provider` is one or more registries, separated by commas (`https://www.antril.org/hive-api`)";
@@ -177,9 +173,8 @@ namespace Larva.Build
                 return keys.Length > 0 && keys.All(IsPublicKey)
                     ? null : $"`{LanguagesTrust}` is one or more public keys (ECDSA P-256, base64 SubjectPublicKeyInfo), separated by commas";
             }
-            if (key == "cpu")
-                return value.Length > 0 && value.All(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.') ? null : "`cpu` is `generic`, `native` or an LLVM processor name (`x86-64-v3`)";
-            return allowed.Length == 0 || allowed.Contains(value) ? null : $"`{key}` is {string.Join(", ", allowed.Select(a => $"`{a}`"))}";
+            // A BUILD key: what a project's BUILD chunk takes (the `project` profile's).
+            return Profiles.ProfileCatalog.Get("project") is { } project ? Profiles.QueenValidator.Problem(project, "BUILD", key, value) : null;
         }
 
         /// <summary>Whether <paramref name="text"/> is an ECDSA P-256 public key (base64 SubjectPublicKeyInfo).</summary>

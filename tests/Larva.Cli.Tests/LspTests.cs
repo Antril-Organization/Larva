@@ -21,7 +21,7 @@ public sealed class LspTests
         // finds nothing, the borrow check (compiled, linked with System.Core and System.Bindings, lowered) finds it.
         string app = Path.Combine(world.Root, "app");
         Directory.CreateDirectory(app);
-        File.WriteAllText(Path.Combine(app, "App.queen"), "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   backend: llvm,\n   borrowcheck: enforce,\n   output: out/App.exe\n");
+        File.WriteAllText(Path.Combine(app, "project.queen"), "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   backend: llvm,\n   borrowcheck: enforce,\n   output: out/App.exe\n");
         string source = Path.Combine(app, "Program.ant");
         const string program = "import System;\nvalue Counter { public: i32 n; }\nBoth(&mut Counter a, &mut Counter b) { a.n = 1; b.n = 2; }\nMain()\n{\n    Counter x = new Counter();\n    Both(&mut x, &mut x);\n    Console.WriteLine(x.n);\n}\n";
         File.WriteAllText(source, program);
@@ -60,7 +60,7 @@ public sealed class LspTests
         world.Larva.Ok("languages", "install", "antril", "--provider", world.Registry);
         string app = Path.Combine(world.Root, "app");
         Directory.CreateDirectory(app);
-        File.WriteAllText(Path.Combine(app, "App.queen"), "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   output: out/App.exe\n");
+        File.WriteAllText(Path.Combine(app, "project.queen"), "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   output: out/App.exe\n");
         string source = Path.Combine(app, "Program.ant");
         // Big enough that analyzing every change in turn takes seconds.
         string body = string.Concat(Enumerable.Range(0, 400).Select(j =>
@@ -98,6 +98,50 @@ public sealed class LspTests
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(3), $"the completion is answered in {clock.Elapsed.TotalSeconds:F1} s");
         // The document's diagnostics are published once more (for the last text), not once per change.
         Assert.NotNull(server.Diagnostics(Uri(source)));
+        server.Request("shutdown", null);
+        server.Notify("exit", null);
+    }
+
+    /// <summary>
+    /// Queen files in the editor, by their profile: a project file named otherwise is QN140; `project.queen` is checked
+    /// and completed from the `project` profile; a profile's `.tqueen` reports its own problems (TQ…).
+    /// </summary>
+    [Fact]
+    public void Queen_files_are_checked_and_completed_from_their_profile()
+    {
+        var world = new LanguageWorld("lsp-queen");
+        string app = Path.Combine(world.Root, "app");
+        Directory.CreateDirectory(app);
+        using var server = new Server(world.Larva);
+        server.Request("initialize", new JsonObject { ["processId"] = null, ["rootUri"] = Uri(app), ["capabilities"] = new JsonObject() });
+        server.Notify("initialized", new JsonObject());
+        void Open(string path, string text) => server.Notify("textDocument/didOpen", new JsonObject
+        {
+            ["textDocument"] = new JsonObject { ["uri"] = Uri(path), ["languageId"] = "queen", ["version"] = 1, ["text"] = text },
+        });
+        string Codes(JsonArray? diagnostics) => string.Join(" ", diagnostics?.Select(d => (string?)d!["code"]) ?? []);
+
+        string old = Path.Combine(app, "App.queen");
+        Open(old, "queen 1.0;\nchunk PROJ:\n   name: App\n");
+        Assert.True(Codes(server.Diagnostics(Uri(old))).Contains("QN140"), "a project file named otherwise: QN140\n" + server.Log);
+
+        string project = Path.Combine(app, "project.queen");
+        const string text = "queen 1.0;\nchunk PROJ:\n   name: App\nchunk BUILD:\n   gc: magic,\n   optimization: 9\n";
+        Open(project, text);
+        var problems = server.Diagnostics(Uri(project));
+        Assert.True(problems?.Count(d => (string?)d!["code"] == "QN124") == 2, "project.queen is checked by its profile: " + problems?.ToJsonString());
+        var completion = server.Request("textDocument/completion", new JsonObject
+        {
+            ["textDocument"] = new JsonObject { ["uri"] = Uri(project) },
+            ["position"] = new JsonObject { ["line"] = 4, ["character"] = 7 },
+        });
+        var labels = (completion?["items"] as JsonArray ?? []).Select(i => (string?)i!["label"]).ToList();
+        Assert.True(labels.Contains("refcount") && labels.Contains("custom"), "the values of `gc` from the profile: " + string.Join(", ", labels));
+
+        string template = Path.Combine(world.Root, "profiles", "shop", "template.tqueen");
+        Directory.CreateDirectory(Path.GetDirectoryName(template)!);
+        Open(template, "tqueen 1.0;\nprofile shop: \"A shop\"\nchunk SHOP:\n   size: COLOR\n");
+        Assert.True(Codes(server.Diagnostics(Uri(template))).Contains("TQ024"), "a template's own problems: TQ024 (an unknown type)\n" + server.Log);
         server.Request("shutdown", null);
         server.Notify("exit", null);
     }

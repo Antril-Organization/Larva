@@ -10,7 +10,7 @@ using Larva.Hir.Encoding;
 /// (<c>template.json</c>: <c>name</c>, <c>description</c>, <c>author</c>, <c>version</c>, <c>type</c> exe or library,
 /// <c>namespace</c>, <c>files</c>) and its code as Larva HIR, before any language (<c>template.lva</c>; or, while it is
 /// being written, its sources under <c>src/</c>, compiled by their language). The project's language view writes that
-/// HIR as source, its namespace renamed to the project's name, next to a <c>.queen</c> project file.
+/// HIR as source, its namespace renamed to the project's name, next to its <c>project.queen</c>.
 /// </summary>
 internal static class NewCommand
 {
@@ -209,7 +209,7 @@ internal static class NewCommand
         var sources = BindCommand.Write(language, assembly, [core], fileOf, main, nonPublic: true, header: false);
         if (sources is null)
             return 1;
-        string queen = Path.Combine(folder, name + Larva.Build.QueenProject.Extension);
+        string queen = Path.Combine(folder, Larva.Build.QueenProject.ProjectFile);
         var written = sources.Keys.Select(f => Path.Combine(folder, f)).Append(queen).ToList();
         if (!force && written.FirstOrDefault(File.Exists) is { } existing)
         {

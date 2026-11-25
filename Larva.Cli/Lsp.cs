@@ -280,6 +280,7 @@ internal sealed class LspServer
         switch (method)
         {
             case "initialize":
+                Roots(parameters);
                 Reply(id!, Initialize());
                 return true;
             case "initialized":
@@ -315,11 +316,14 @@ internal sealed class LspServer
             case "textDocument/didSave":
                 // A project file saved in the editor: what it allows (the borrow checker, the default access…) applies now,
                 // whether or not the editor also reports it as a watched file.
-                if (parameters!["textDocument"]?["uri"]?.GetValue<string>() is { } saved && saved.EndsWith(".queen", StringComparison.OrdinalIgnoreCase))
+                if (parameters!["textDocument"]?["uri"]?.GetValue<string>() is { } saved && IsQueen(saved))
                 {
-                    // Saved: the file is what counts (an open document's text is the file's now).
+                    // Saved: the file is what counts (an open document's text is the file's now). A profile's template
+                    // changes what every file of that profile may say.
                     if (documents.ContainsKey(saved) && File.Exists(PathOf(saved)))
                         documents[saved] = File.ReadAllText(PathOf(saved));
+                    if (IsTemplate(saved))
+                        Larva.Build.Profiles.ProfileCatalog.Invalidate();
                     Reload();
                 }
                 return true;
@@ -334,10 +338,10 @@ internal sealed class LspServer
                 return true;
             }
             case "textDocument/completion" when IsQueen(parameters!):
-                Reply(id!, QueenAt(parameters!, (t, l, c) => QueenFiles.Complete(t, l, c)));
+                Reply(id!, QueenAt(parameters!, (p, t, l, c) => QueenFiles.Complete(p, t, l, c)));
                 return true;
             case "textDocument/hover" when IsQueen(parameters!):
-                Reply(id!, QueenAt(parameters!, (t, l, c) => QueenFiles.Hover(t, l, c)));
+                Reply(id!, QueenAt(parameters!, (p, t, l, c) => QueenFiles.Hover(p, t, l, c)));
                 return true;
             case "textDocument/completion":
                 Reply(id!, At(parameters!, "lsp.completion"));
@@ -510,14 +514,26 @@ internal sealed class LspServer
     private JsonArray Libraries(JsonObject coreReference) =>
         [coreReference.DeepClone(), .. standard.Select(r => r.DeepClone())];
 
-    private static string? FindQueen(string? folder)
+    /// <summary>
+    /// The project a file in <paramref name="folder"/> belongs to: the nearest `project.queen` up, not above the top of
+    /// its repository or the editor's workspace folders (a project file above them is not this code's).
+    /// </summary>
+    private string? FindQueen(string? folder) =>
+        folder is not null && Directory.Exists(folder) ? Larva.Build.QueenProject.Nearest(folder, roots) : null;
+
+    /// <summary>The editor's workspace folders (`rootUri` and `workspaceFolders` of `initialize`).</summary>
+    private readonly List<string> roots = [];
+
+    private void Roots(JsonObject? parameters)
     {
-        for (; folder is not null && Directory.Exists(folder); folder = Path.GetDirectoryName(folder))
+        roots.Clear();
+        foreach (var folder in parameters?["workspaceFolders"] as JsonArray ?? [])
         {
-            if (Directory.EnumerateFiles(folder, "*.queen").FirstOrDefault() is { } queen)
-                return queen;
+            if (folder?["uri"]?.GetValue<string>() is { } uri && uri.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+                roots.Add(Path.GetFullPath(PathOf(uri)));
         }
-        return null;
+        if (roots.Count == 0 && parameters?["rootUri"] is JsonValue root && root.TryGetValue(out string? rootUri) && rootUri.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            roots.Add(Path.GetFullPath(PathOf(rootUri)));
     }
 
     private Project? ProjectOf(string path)
@@ -631,26 +647,45 @@ internal sealed class LspServer
     private static string UriOf(string path) => new Uri(Path.GetFullPath(path)).AbsoluteUri;
 
     /// <summary>A project file (`.queen`).</summary>
-    private static bool IsQueen(string uri) => uri.EndsWith(".queen", StringComparison.OrdinalIgnoreCase);
+    private static bool IsQueen(string uri) => uri.EndsWith(".queen", StringComparison.OrdinalIgnoreCase) || IsTemplate(uri);
+
+    /// <summary>A queen profile's template (`.tqueen`).</summary>
+    private static bool IsTemplate(string uri) => uri.EndsWith(".tqueen", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsQueen(JsonObject parameters) => IsQueen(parameters["textDocument"]!["uri"]!.GetValue<string>());
 
     /// <summary>A `.queen` feature at the request's position, over the document's current text.</summary>
-    private JsonNode? QueenAt(JsonObject parameters, Func<string, int, int, JsonNode?> feature)
+    private JsonNode? QueenAt(JsonObject parameters, Func<string, string, int, int, JsonNode?> feature)
     {
         string uri = parameters["textDocument"]!["uri"]!.GetValue<string>();
         if (!documents.TryGetValue(uri, out var text))
             return null;
         var position = parameters["position"]!;
-        return feature(text, position["line"]!.GetValue<int>(), position["character"]!.GetValue<int>());
+        return feature(PathOf(uri), text, position["line"]!.GetValue<int>(), position["character"]!.GetValue<int>());
     }
 
-    /// <summary>A `.queen` file: the project reader's diagnostics (QN…) for its current text, never a language's.</summary>
+    /// <summary>
+    /// A queen file: what its profile says of its current text (a project's: the project reader's diagnostics, QN…), or a
+    /// profile's template: its own problems (TQ…). Never a language's.
+    /// </summary>
     private void QueenChanged(string uri, string text)
     {
         string path = PathOf(uri);
         var problems = new List<Larva.Build.QueenDiagnostic>();
-        Larva.Build.QueenProject.LoadText(path, text, problems);
+        if (IsTemplate(uri))
+        {
+            // The profile is named after its folder; the profile it extends is the catalog's.
+            string name = Path.GetFileName(Path.GetDirectoryName(Path.GetFullPath(path))) ?? "";
+            Larva.Build.Profiles.ProfileParser.Parse(text, path, name, problems, Larva.Build.Profiles.ProfileCatalog.Get);
+        }
+        else if (Larva.Build.Profiles.ProfileCatalog.ForFile(path) is { } profile && !profile.Is("project"))
+        {
+            // A file of another profile: checked against it.
+            if (Larva.Build.QueenParser.Parse(text, path, problems) is { } document)
+                Larva.Build.Profiles.QueenValidator.Validate(document, profile, problems);
+        }
+        else
+            Larva.Build.QueenProject.LoadText(path, text, problems);
         var diagnostics = new JsonArray();
         var lines = text.Split('\n');
         foreach (var problem in problems)
@@ -757,7 +792,8 @@ internal sealed class LspServer
         if (IsQueen(uri))
         {
             QueenChanged(uri, text);
-            ProjectEdited(uri);
+            if (!IsTemplate(uri))
+                ProjectEdited(uri);
             return;
         }
         if (Analyze(uri) is { } diagnostics)

@@ -24,7 +24,7 @@ Larva is a language-independent compiler toolchain. A language plugs into Larva 
 
 - **Several back ends from one IR.** It compiles to native executables through LLVM or through Larva's own x86-64 code generator. It also targets WebAssembly, either directly or through LLVM, and a portable bytecode VM.
 - **Memory management chosen per project.** Tracing GC, reference counting, arenas, manual memory, or a collector you write yourself. Projects with different collectors link into one program, and the boundary between them is checked.
-- **Projects without boilerplate.** A small `.queen` file describes a project's build, dependencies, files and resources. `larva run` rebuilds only what changed.
+- **Projects without boilerplate.** A small `project.queen` file describes a project's build, dependencies, files and resources. `larva run` rebuilds only what changed.
 - **Hive, the package manager.** It handles signed packages, semantic version ranges, a local cache and publishing from the command line.
 - **Native bindings.** It reads a DLL's or shared object's exports, or a C header, and generates typed bindings. Structs, unions, callbacks and constants are supported, and binding profiles let you shape the result.
 - **Editor support for every language at once.** `larva lsp` is a Language Server Protocol server that serves every installed language pack. It reports diagnostics as you type, offers completion, hover and go-to-definition, and shows decompiled views of library types.
@@ -101,7 +101,7 @@ flowchart LR
 
 ## Projects
 
-A project is a folder with a `.queen` file. Every key is optional. Keys left out take the machine's defaults (`larva config`), then Larva's own.
+A project is a folder with a `project.queen` file at its top (the project's name is the folder's unless `PROJ` says another). Every key is optional. Keys left out take the machine's defaults (`larva config`), then Larva's own. Larva finds the project from a file or folder up, not above the repository's top.
 
 ```queen
 queen 1.0;
@@ -125,7 +125,27 @@ chunk FILES:
    copy: assets/**
 ```
 
-Other chunks cover source selection (`SOURCES`), embedded resources (`RESOURCES`) and publishing (`HIVE`).
+Other chunks cover source selection (`SOURCES`), embedded resources (`RESOURCES`), tools (`TOOLS`) and publishing (`HIVE`).
+
+### Queen profiles
+
+What a queen file may say comes from its **profile**, which the file's name chooses: `project.queen` is read with the `project` profile, a Hive package's `package.queen` with `package` (which extends `project`). A profile is a folder whose `template.tqueen` declares its chunks, the keys each takes, their types and defaults, what is required, and rules between them. Larva checks the file against it (errors and warnings `QN…`), and the editor completes and explains keys and values from it.
+
+```tqueen
+tqueen 1.0;
+profile project: "A Larva project"
+
+/// How the project is compiled.
+chunk BUILD:
+   gc: [default, tracing, manual, refcount, arena, custom] = default
+   gc.collector: NAME  required when gc == custom  only when gc == custom
+   optimization: INT(0..3) = 2
+
+rules:
+   error when BUILD.target == wasm and BUILD.backend == x64: "the x64 back end does not make WebAssembly"
+```
+
+Types: `TEXT`, `IDENTIFIER`, `NAME`, `INT(a..b)`, `NUMBER`, `BOOL`, `VERSION`, `PATH`/`RPATH`/`APATH`, `FILE(.ext…)`, `FOLDER`, `GLOB`, `URL`, `REGEX("…")`, `[a, b]`, `LIST(T)`, and `A | B`. Modifiers: `= default`, `required`, `many`, `only when …`, `required when …`, `deprecated "…"`, `example "…"`. Larva's own profiles are in [`Profiles/`](Profiles) (built into larva); a folder in `LARVA_PROFILES`, or `Profiles/` next to larva, adds profiles or replaces those.
 
 ## Platform support
 

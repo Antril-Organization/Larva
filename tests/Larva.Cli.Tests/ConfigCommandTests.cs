@@ -48,8 +48,8 @@ public sealed class ConfigCommandTests
         Assert.Equal(broken, File.ReadAllText(config));
 
         // Any other command goes on with the built-in defaults, saying so once (a project read: its BUILD defaults).
-        File.WriteAllText(Path.Combine(larva.WorkingDirectory, "x.queen"), "queen 1.0;\n\nchunk PROJ:\n   name: x\n");
-        (code, output) = larva.Run("hive", "install", "x.queen");
+        File.WriteAllText(Path.Combine(larva.WorkingDirectory, "project.queen"), "queen 1.0;\n\nchunk PROJ:\n   name: x\n");
+        (code, output) = larva.Run("hive", "install", "project.queen");
         Assert.Contains($"larva: {config}: ", output);
         Assert.Equal(1, output.Split("larva: " + config).Length - 1);
 

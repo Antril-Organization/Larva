@@ -184,7 +184,7 @@ internal static class HiveCommand
 
     internal static string FindQueen(string? path) =>
         QueenProject.Find(path ?? Directory.GetCurrentDirectory())
-        ?? throw new HiveException(path is null ? "no .queen project here" : $"no project at {path}");
+        ?? throw new HiveException(path is null ? "no project.queen here" : $"no project at {path}");
 
     private static QueenProject? TryLoadProject(string? path)
     {
