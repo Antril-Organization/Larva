@@ -13,6 +13,9 @@ namespace Hive
     {
         public const string ProjectFile = "package.queen";
 
+        /// <summary>The queen profiles a package brings: <c>profiles/&lt;name&gt;/template.tqueen</c>, from its project's own folder.</summary>
+        public const string ProfilesFolder = "profiles";
+
         /// <summary>The name a project publishes as: HIVE's <c>package</c>, else PROJ's <c>author</c> and <c>name</c>.</summary>
         public static PackageReference NameOf(QueenProject project)
         {
@@ -90,13 +93,27 @@ namespace Hive
                 Add(inPackage, native);
                 natives.Add(inPackage);
             }
+            // The queen profiles the project brings (its `profiles/<name>/template.tqueen`): a file of that name sees them
+            // where the package is a tool of its project, or one of the user's.
+            string profiles = Path.Combine(project.Folder, ProfilesFolder);
+            if (Directory.Exists(profiles))
+            {
+                foreach (string template in Directory.GetDirectories(profiles).Select(d => Path.Combine(d, Larva.Build.Profiles.ProfileCatalog.TemplateFile)).Where(File.Exists).Order(StringComparer.Ordinal))
+                {
+                    string profile = Path.GetFileName(Path.GetDirectoryName(template))!;
+                    if (Larva.Build.Profiles.ProfileCatalog.BuiltIn.Contains(profile))
+                        throw new HiveException($"profile `{profile}` is larva's own: a package cannot bring it (rename the folder)");
+                    Add($"{ProfilesFolder}/{profile}/{Larva.Build.Profiles.ProfileCatalog.TemplateFile}", template);
+                }
+            }
             var resources = new List<(string Key, string Path)>();
             foreach (var (resourceName, file) in project.AllResources())
             {
                 // A resource named by its path keeps it; one named by the project (`logo: …`) goes to named/.
                 bool byPath = resourceName.Contains('/') || resourceName.Contains('.');
                 string inPackage = byPath ? resourceName : $"named/{resourceName}";
-                if (inPackage.StartsWith("lib/", StringComparison.Ordinal) || inPackage.StartsWith("src/", StringComparison.Ordinal) || inPackage.StartsWith("native/", StringComparison.Ordinal) || inPackage == ProjectFile)
+                if (inPackage.StartsWith("lib/", StringComparison.Ordinal) || inPackage.StartsWith("src/", StringComparison.Ordinal) || inPackage.StartsWith("native/", StringComparison.Ordinal)
+                    || inPackage.StartsWith(ProfilesFolder + "/", StringComparison.Ordinal) || inPackage == ProjectFile)
                     throw new HiveException($"resource `{resourceName}` would collide with the package's own files: rename it");
                 Add(inPackage, file);
                 resources.Add((byPath ? "embed" : resourceName, inPackage));

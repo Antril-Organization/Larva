@@ -147,6 +147,10 @@ rules:
 
 Types: `TEXT`, `IDENTIFIER`, `NAME`, `INT(a..b)`, `NUMBER`, `BOOL`, `VERSION`, `PATH`/`RPATH`/`APATH`, `FILE(.ext…)`, `FOLDER`, `GLOB`, `URL`, `REGEX("…")`, `[a, b]`, `LIST(T)`, and `A | B`. Modifiers: `= default`, `required`, `many`, `only when …`, `required when …`, `deprecated "…"`, `example "…"`. Larva's own profiles are in [`Profiles/`](Profiles) (built into larva); a folder in `LARVA_PROFILES`, or `Profiles/` next to larva, adds profiles or replaces those.
 
+Tools bring profiles too: a tool's project keeps them in `profiles/<name>/template.tqueen`, `larva hive pack` puts them in its package, and a file sees the profiles of its project's tools (`TOOLS`) and of the user's (`larva tool install -g`). So Nest's `nest.queen` is checked and completed wherever Nest is installed. A repository can keep its own in `.larva/profiles/`. Larva's own names (`project`, `package`) cannot be replaced by a tool or a repository.
+
+`larva queen read <file.queen>` checks a file against its profile and writes it as JSON: every key with its value or its default, and the problems (exit code 1 on errors). Tools read their settings with it.
+
 ## Platform support
 
 | Platform | Status |

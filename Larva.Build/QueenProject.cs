@@ -376,7 +376,7 @@ namespace Larva.Build
             int errorsBefore = diagnostics.Count(d => d.IsError);
             // The file's name says its profile: a project is `project.queen` (or a file whose profile extends it, a Hive
             // package's `package.queen`).
-            if (Profiles.ProfileCatalog.ForFile(path) is not { } profile || !profile.Is("project"))
+            if (!Profiles.ProfileCatalog.IsProjectFile(path) || Profiles.ProfileCatalog.ForFile(path) is not { } profile)
             {
                 diagnostics.Add(new QueenDiagnostic("QN140", $"`{Path.GetFileName(path)}` is not a project file: a project is `{ProjectFile}` (rename it; `PROJ name` keeps the project's name)", path, 1, 1));
                 return null;
